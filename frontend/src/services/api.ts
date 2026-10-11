@@ -148,7 +148,12 @@ export const api = {
   // --- Agent ------------------------------------------------------------
   agentInfo: () => request<AgentInfo>('/agent/info'),
   agentChat: (message: string) =>
-    request<{ reply: string; model: string; usage: Record<string, number> }>(
+    request<{
+      reply: string
+      task: { task_id: string; status: string; title: string; priority: number } | null
+      model: string
+      usage: Record<string, number>
+    }>(
       '/agent/chat',
       { method: 'POST', body: JSON.stringify({ message }) },
     ),

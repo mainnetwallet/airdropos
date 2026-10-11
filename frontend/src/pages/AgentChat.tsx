@@ -11,6 +11,7 @@ interface Message {
   role: 'user' | 'agent'
   content: string
   at: string
+  taskId?: string
 }
 
 export default function AgentChat() {
@@ -29,6 +30,7 @@ export default function AgentChat() {
           role: 'agent',
           content: response.reply,
           at: new Date().toISOString(),
+          taskId: response.task?.task_id,
         },
       ])
     },
@@ -100,6 +102,11 @@ export default function AgentChat() {
                   }`}
                 >
                   {m.content}
+                  {m.taskId && (
+                    <div className="mt-2 inline-block rounded-md bg-emerald-500/15 px-2 py-1 font-mono text-xs text-emerald-300">
+                      {m.taskId}
+                    </div>
+                  )}
                 </div>
               </div>
             ))
