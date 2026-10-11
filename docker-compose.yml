@@ -10,7 +10,7 @@ services:
       POSTGRES_PASSWORD: airdropos_password
       POSTGRES_DB: airdropos_db
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -24,7 +24,7 @@ services:
     container_name: airdropos_redis
     restart: unless-stopped
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -47,8 +47,11 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://airdropos:airdropos_password@postgres:5432/airdropos_db
+      REDIS_URL: redis://redis:6379/0
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./backend:/app/backend
       - ./data:/app/data
@@ -70,6 +73,9 @@ services:
         condition: service_started
     env_file:
       - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://airdropos:airdropos_password@postgres:5432/airdropos_db
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./backend:/app/backend
       - ./data:/app/data
@@ -82,7 +88,7 @@ services:
     container_name: airdropos_frontend
     restart: unless-stopped
     ports:
-      - "5173:5173"
+      - "3000:80"
     depends_on:
       - backend
     environment:
