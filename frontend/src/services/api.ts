@@ -102,11 +102,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
 
   if (!response.ok) {
+    // Read the body exactly once; json() followed by text() throws
+    // "body stream already read" and hides the real server error.
+    const raw = await response.text()
     let detail: unknown
     try {
-      detail = await response.json()
+      detail = raw ? JSON.parse(raw) : raw
     } catch {
-      detail = await response.text()
+      detail = raw
     }
     // A 401 on any call except the login form itself means the session is gone.
     if (response.status === 401 && path !== '/auth/login') {

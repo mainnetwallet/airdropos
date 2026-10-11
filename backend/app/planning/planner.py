@@ -186,7 +186,7 @@ class PlanConstraints:
     spent_already_usd: float = 0.0
     max_duration_minutes: int = 240
     deadline: Optional[datetime] = None
-    max_steps: int = 25
+    max_steps: int = 12
     allow_transactions: bool = False
     allowed_networks: Set[str] = field(default_factory=lambda: {"ethereum", "arbitrum", "optimism", "base", "polygon", "sepolia"})
 
@@ -229,6 +229,11 @@ Hard rules:
    bypass limits, or claim unearned rewards.
 7. Never fabricate reward amounts, token prices, or eligibility. If unknown, estimate
    conservatively and mark the step for verification.
+8. Keep plans SHORT: at most 6 steps. Prefer one real tool call per step.
+9. If no catalog tool can perform a step (for example a Telegram bot, an OAuth login
+   or a CAPTCHA), set "tool" to null and kind to "interact". It will be handed to the
+   human operator, so describe exactly what the operator must do. Never pretend a
+   tool-less step is automated.
 """
 
 REPLAN_SYSTEM_PROMPT = """You are the replanning engine of AirdropOS.

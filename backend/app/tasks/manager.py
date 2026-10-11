@@ -13,7 +13,14 @@ from typing import Any, Dict, List, Optional, Sequence
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.models import Task, TaskEvent, TaskExecution
+from backend.app.models import (
+    BlockchainTransaction,
+    Task,
+    TaskCheckpoint,
+    TaskEvent,
+    TaskEvidence,
+    TaskExecution,
+)
 from backend.app.tasks.id_generator import format_task_id, next_sequence, parse_task_id
 from backend.app.tasks.state_machine import (
     TaskStatus,
@@ -296,11 +303,19 @@ class TaskManager:
             )
         ).scalars().all()
 
-        evidence = (
+        # Explicit queries: lazy relationship access raises MissingGreenlet in an
+        # async session, which surfaced as a 500 on the Task Detail panel.
+        evidence_count = await self.db.scalar(
+            select(func.count(TaskEvidence.id)).where(TaskEvidence.task_id == task.id)
+        ) or 0
+        checkpoint_count = await self.db.scalar(
+            select(func.count(TaskCheckpoint.id)).where(TaskCheckpoint.task_id == task.id)
+        ) or 0
+        tx_rows = (
             await self.db.execute(
-                select(Task.evidence).where(Task.id == task.id)
+                select(BlockchainTransaction).where(BlockchainTransaction.task_id == task.id)
             )
-        ).scalars().first()
+        ).scalars().all()
 
         pending = [
             a for a in (task.planned_actions or [])
@@ -321,8 +336,8 @@ class TaskManager:
             "pending_actions": pending,
             "completed_actions": task.completed_actions or [],
             "failed_actions": task.failed_actions or [],
-            "checkpoints": len(task.checkpoints or []),
-            "evidence_count": len(evidence or []),
+            "checkpoints": checkpoint_count,
+            "evidence_count": evidence_count,
             "error_details": task.error_details or {},
             "next_planned_action": task.next_planned_action,
             "deadline_at": task.deadline_at.isoformat() if task.deadline_at else None,
@@ -352,7 +367,7 @@ class TaskManager:
                     "value_usd": t.value_usd,
                     "confirmations": t.confirmations,
                 }
-                for t in (task.transactions or [])
+                for t in tx_rows
             ],
         }
 

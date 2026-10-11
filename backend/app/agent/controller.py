@@ -45,6 +45,8 @@ from backend.app.tools.registry import AuthorizationPolicy, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+MAX_REPLANS_PER_TASK = 2
+
 from backend.app.agent.prompts import AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
 
 
@@ -325,17 +327,43 @@ class AgentController:
 
         # --- ACT ---------------------------------------------------------
         if not step.tool:
-            # analyze / notify / wait steps need no tool invocation.
+            passive = step.kind in (StepKind.ANALYZE, StepKind.NOTIFY, StepKind.WAIT)
+            if not passive:
+                # No catalog tool can do this research/interact/transact step.
+                # It must NOT be reported as done: hand it to the operator.
+                reason = (
+                    f"No catalog tool can perform this {step.kind.value} step; "
+                    f"the operator must do it manually: {action}"
+                )
+                step.status = "blocked"
+                step.failure_reason = reason
+                await self.planner.update_step_status(
+                    task, step.index, "blocked", failure_reason=reason
+                )
+                report.blockers.append(reason)
+                await self.tasks.transition(
+                    task,
+                    TaskStatus.NEEDS_USER_ACTION,
+                    reason=reason,
+                    next_planned_action=f"Operator: {action}",
+                )
+                return (
+                    StepResult(iteration, action, None, None, False, reason, 0),
+                    True,
+                    LoopOutcome.NEEDS_USER_ACTION,
+                )
+
+            # analyze / notify / wait steps need no tool, but they produce no
+            # authoritative evidence either, so they are never counted as verified.
             step.status = "completed"
             await self.planner.update_step_status(
-                task, step.index, "completed", result={"note": "Completed without a tool call"}
+                task, step.index, "completed", result={"note": "Passive step; no evidence produced"}
             )
             await self.tasks.record_action(
                 task, {"id": f"step-{step.index}", "description": action}, "completed"
             )
-            report.verified_completions.append(action)
             return (
-                StepResult(iteration, action, None, {"note": "no tool"}, True, reasoning, 0),
+                StepResult(iteration, action, None, {"note": "no tool"}, False, reasoning, 0),
                 False,
                 LoopOutcome.PARTIALLY_COMPLETED,
             )
@@ -553,6 +581,24 @@ class AgentController:
         outcome: LoopOutcome,
     ) -> tuple[StepResult, bool, LoopOutcome]:
         """Ask the planner for a new revision and continue with it."""
+        # Every replan is an LLM call. Cap them so one task cannot burn calls forever.
+        current_plan = await self.planner.current_plan(task)
+        if current_plan is not None and current_plan.revision > MAX_REPLANS_PER_TASK:
+            msg = (
+                f"Replan limit ({MAX_REPLANS_PER_TASK}) reached. Stopping instead of "
+                f"spending more LLM calls. Last problem: {reason[:200]}"
+            )
+            report.blockers.append(msg)
+            await self.tasks.transition(
+                task, TaskStatus.PARTIALLY_COMPLETED, reason=msg,
+                next_planned_action="Operator review needed",
+            )
+            return (
+                StepResult(iteration, "replan limit reached", None, None, False, msg, 0),
+                True,
+                LoopOutcome.PARTIALLY_COMPLETED,
+            )
+
         # Budget pressure is a distinct trigger worth reporting accurately.
         if trigger is ReplanTrigger.FAILURE and plan.total_cost() > settings.MAX_TRANSACTION_VALUE_USD:
             trigger = ReplanTrigger.BUDGET
@@ -608,7 +654,8 @@ class AgentController:
         unverified = [s for s in plan.steps if s.status == "failed"]
         skipped = [s for s in plan.steps if s.status == "skipped"]
         blocked = [s for s in plan.steps if s.status == "blocked"]
-        verified_count = sum(1 for s in plan.steps if s.status == "completed")
+        # Only steps that ran a real tool and passed verification count as evidence.
+        verified_count = sum(1 for s in plan.steps if s.status == "completed" and s.tool)
 
         if not unverified and not skipped and not blocked and verified_count > 0:
             await self.tasks.transition(
@@ -627,6 +674,11 @@ class AgentController:
                 ),
                 True,
                 LoopOutcome.COMPLETED,
+            )
+
+        if verified_count == 0 and not (unverified or skipped or blocked):
+            report.unverified_claims.append(
+                "No tool-backed step produced evidence, so nothing was actually verified."
             )
 
         # Anything skipped, blocked, or unverified means the objective is NOT complete.
