@@ -25,10 +25,17 @@ import {
   X,
 } from 'lucide-react'
 import { api } from '@/services/api'
-import { Alert, Card, EmptyState, ErrorState, Loading } from '@/components/ui'
+import clsx from 'clsx'
+import { Alert, Card, Chips, EmptyState, ErrorState, IconTile, Loading } from '@/components/ui'
 import type { WalletView } from '@/types'
 
 type FormMode = 'create' | 'import' | 'watch' | null
+type WalletFilter = 'all' | 'active' | 'watch'
+
+/** 0x3a4…7f2e: enough to recognise a wallet on a narrow screen. */
+function shortAddress(address: string): string {
+  return address.length > 14 ? `${address.slice(0, 6)}…${address.slice(-4)}` : address
+}
 
 const EMPTY_FORM = { label: '', secret: '', address: '', notes: '' }
 
@@ -52,6 +59,8 @@ export default function Wallets() {
   const [actionError, setActionError] = useState<string | null>(null)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [showAdd, setShowAdd] = useState(false)
+  const [filter, setFilter] = useState<WalletFilter>('all')
 
   // Never leave key material in state after the form goes away.
   useEffect(() => {
@@ -63,6 +72,9 @@ export default function Wallets() {
   if (error) return <ErrorState error={error} onRetry={() => refetch()} />
 
   const wallets = data?.wallets ?? []
+  const visibleWallets = wallets.filter((w) =>
+    filter === 'active' ? w.is_active : filter === 'watch' ? !w.has_key_material : true,
+  )
 
   const openForm = (next: Exclude<FormMode, null>) => {
     setMode(mode === next ? null : next)
@@ -141,11 +153,28 @@ export default function Wallets() {
   return (
     <div className="space-y-6">
       <header className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-100">Wallet Manager</h1>
-          <p className="mt-1 text-sm text-slate-400">Configured accounts and their networks</p>
+        <div className="flex w-full items-start justify-between gap-3 lg:w-auto">
+          <div className="min-w-0">
+            <h1 className="text-[26px] font-bold leading-tight text-slate-100 lg:text-2xl">
+              <span className="lg:hidden">Wallets</span>
+              <span className="hidden lg:inline">Wallet Manager</span>
+            </h1>
+            <p className="mt-1 text-sm text-slate-400">
+              <span className="lg:hidden">Manage your wallets securely</span>
+              <span className="hidden lg:inline">Configured accounts and their networks</span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowAdd((v) => !v)}
+            aria-expanded={showAdd}
+            className="btn-primary shrink-0 rounded-xl lg:hidden"
+          >
+            <Plus className="h-4 w-4" />
+            Add Wallet
+          </button>
         </div>
-        <div className="flex flex-wrap gap-2">
+        <div className={clsx('flex flex-wrap gap-2 max-lg:w-full', !showAdd && 'max-lg:hidden')}>
           <button onClick={() => openForm('create')} className="btn-primary">
             <Plus className="h-4 w-4" />
             Create
@@ -170,6 +199,19 @@ export default function Wallets() {
         never sent back to the browser, the LLM, or the logs. This view shows public addresses
         only. Watch-only addresses hold no key and can never sign.
       </Alert>
+
+      {wallets.length > 0 && (
+        <Chips
+          className="lg:hidden"
+          value={filter}
+          onChange={setFilter}
+          items={[
+            { id: 'all', label: 'All', count: wallets.length },
+            { id: 'active', label: 'Active', count: wallets.filter((w) => w.is_active).length },
+            { id: 'watch', label: 'Watch-only', count: wallets.filter((w) => !w.has_key_material).length },
+          ]}
+        />
+      )}
 
       {notice && <Alert kind="success">{notice}</Alert>}
       {actionError && <Alert kind="error">{actionError}</Alert>}
@@ -280,20 +322,33 @@ export default function Wallets() {
           icon={<WalletIcon className="h-8 w-8" />}
         />
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {wallets.map((wallet) => {
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3 lg:gap-4">
+          {visibleWallets.length === 0 && (
+            <p className="col-span-full py-8 text-center text-sm text-slate-500">
+              No wallets match this filter.
+            </p>
+          )}
+          {visibleWallets.map((wallet) => {
             const busy = busyId === wallet.id
             const open = expanded === wallet.id
             return (
               <Card key={wallet.id}>
                 <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0">
-                    <h3 className="truncate font-medium text-slate-100">{wallet.label}</h3>
-                    <p className="font-mono text-xs text-slate-500">{wallet.chain_type}</p>
+                  <div className="flex min-w-0 items-center gap-3">
+                    <IconTile tone={wallet.has_key_material ? 'blue' : 'slate'} className="lg:hidden">
+                      <WalletIcon />
+                    </IconTile>
+                    <div className="min-w-0">
+                      <h3 className="truncate font-medium text-slate-100">{wallet.label}</h3>
+                      <p className="font-mono text-xs text-slate-500">
+                        <span className="lg:hidden">{shortAddress(wallet.address)}</span>
+                        <span className="hidden lg:inline">{wallet.chain_type}</span>
+                      </p>
+                    </div>
                   </div>
                   <div className="flex shrink-0 flex-wrap justify-end gap-1">
                     {!wallet.has_key_material && (
-                      <span className="badge bg-surface-300 text-slate-300">watch-only</span>
+                      <span className="badge bg-surface-300 capitalize text-slate-300">watch-only</span>
                     )}
                     {wallet.is_locked && (
                       <span className="badge bg-yellow-900 text-yellow-300">locked</span>
@@ -308,7 +363,7 @@ export default function Wallets() {
                   </div>
                 </div>
 
-                <p className="mt-3 break-all rounded bg-surface-200 px-2 py-1.5 font-mono text-xs text-slate-400">
+                <p className="mt-3 break-all rounded bg-surface-200 px-2 py-1.5 font-mono text-xs text-slate-400 max-lg:hidden">
                   {wallet.address}
                 </p>
 
@@ -336,6 +391,10 @@ export default function Wallets() {
 
                 {open && (
                   <dl className="mt-2 space-y-1 text-xs">
+                    <div className="lg:hidden">
+                      <dt className="text-slate-500">Address</dt>
+                      <dd className="break-all font-mono text-slate-300">{wallet.address}</dd>
+                    </div>
                     <div className="flex justify-between gap-2">
                       <dt className="text-slate-500">Can sign</dt>
                       <dd className="text-slate-300">{wallet.can_sign ? 'yes' : 'no'}</dd>

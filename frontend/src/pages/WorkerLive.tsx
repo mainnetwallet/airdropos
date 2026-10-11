@@ -2,10 +2,10 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AlertTriangle, CheckCircle2, Copy, XCircle } from 'lucide-react'
+import { AlertTriangle, Bot, CheckCircle2, Copy, Send, XCircle } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '@/services/api'
-import { Card, ErrorState, Loading } from '@/components/ui'
+import { Card, ErrorState, IconTile, Loading, PageHeader, Pill, SegmentedTabs } from '@/components/ui'
 import type { WorkerLogLine, WorkerStatus } from '@/types'
 
 const LEVEL_TONE: Record<string, string> = {
@@ -98,7 +98,8 @@ function LogView({ logs }: { logs: WorkerLogLine[] }) {
               checked={problemsOnly}
               onChange={(e) => setProblemsOnly(e.target.checked)}
             />
-            Warnings & errors only
+            <span className="lg:hidden">Problems only</span>
+            <span className="hidden lg:inline">Warnings & errors only</span>
           </label>
           <button onClick={copy} className="btn-ghost flex items-center gap-1.5 px-2 py-1">
             <Copy className="h-3.5 w-3.5" />
@@ -113,7 +114,7 @@ function LogView({ logs }: { logs: WorkerLogLine[] }) {
           const el = e.currentTarget
           stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40
         }}
-        className="h-96 overflow-auto rounded-lg bg-surface-200 p-3 font-mono text-xs leading-relaxed"
+        className="h-[50dvh] overflow-auto rounded-lg bg-surface-200 p-3 font-mono text-xs leading-relaxed lg:h-96"
       >
         {visible.length === 0 ? (
           <p className="text-slate-500">
@@ -137,16 +138,16 @@ function LogView({ logs }: { logs: WorkerLogLine[] }) {
 function Banner({ data }: { data: WorkerStatus }) {
   if (!data.alive) {
     return (
-      <div className="rounded-xl border border-red-900 bg-red-950/40 p-4">
-        <div className="flex items-center gap-2 font-semibold text-red-300">
+      <div className="rounded-xl border border-status-error/40 bg-status-error/10 p-4">
+        <div className="flex items-center gap-2 font-semibold text-status-error">
           <XCircle className="h-5 w-5" /> Worker is offline
         </div>
-        <p className="mt-1 text-sm text-red-200/80">
+        <p className="mt-1 text-sm text-slate-300">
           {data.heartbeat_age_seconds === null
             ? 'It has never reported in, so queued tasks will not run.'
             : `Last heartbeat ${formatDuration(data.heartbeat_age_seconds)} ago, so queued tasks will not run.`}
         </p>
-        <p className="mt-2 text-xs text-red-200/70">
+        <p className="mt-2 text-xs text-slate-400">
           Start everything with <code className="font-mono">py run.py</code>, or the worker alone with{' '}
           <code className="font-mono">python -m backend.app.scheduler.worker</code>, then watch the terminal for errors.
         </p>
@@ -155,11 +156,11 @@ function Banner({ data }: { data: WorkerStatus }) {
   }
   const worker = data.worker
   return (
-    <div className="rounded-xl border border-green-900 bg-green-950/30 p-4">
-      <div className="flex items-center gap-2 font-semibold text-green-300">
+    <div className="rounded-xl border border-status-success/40 bg-status-success/10 p-4">
+      <div className="flex items-center gap-2 font-semibold text-status-success">
         <CheckCircle2 className="h-5 w-5" /> Worker is running
       </div>
-      <p className="mt-1 text-sm text-green-100/80">
+      <p className="mt-1 text-sm text-slate-300">
         {worker.current_task
           ? `Working on ${worker.current_task.task_id}: ${worker.current_task.title}`
           : (worker.note ?? 'idle')}
@@ -168,7 +169,10 @@ function Banner({ data }: { data: WorkerStatus }) {
   )
 }
 
+type WorkerTab = 'overview' | 'workers' | 'logs'
+
 export default function WorkerLive() {
+  const [tab, setTab] = useState<WorkerTab>('overview')
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['worker-status'],
     queryFn: api.workerStatus,
@@ -179,24 +183,49 @@ export default function WorkerLive() {
   if (error || !data) return <ErrorState error={error} onRetry={() => refetch()} />
 
   const { worker, queue, telegram } = data
+  // On phones one tab shows at a time; on desktop every section is stacked as before.
+  const show = (id: WorkerTab) => clsx(tab !== id && 'hidden lg:block')
+  const uptime = formatDuration(uptimeSeconds(worker.started_at))
 
   return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold text-slate-100">Live Worker</h1>
-        <p className="mt-1 text-sm text-slate-400">
-          The worker is a separate process that actually runs tasks. This page refreshes every 3 seconds.
-        </p>
-      </header>
+    <div className="space-y-4 pt-1 lg:space-y-6 lg:pt-0">
+      <PageHeader
+        title={
+          <>
+            <span className="lg:hidden">Worker Live</span>
+            <span className="hidden lg:inline">Live Worker</span>
+          </>
+        }
+        subtitle={
+          <>
+            <span className="lg:hidden">Monitor all system workers</span>
+            <span className="hidden lg:inline">
+              The worker is a separate process that actually runs tasks. This page refreshes every 3 seconds.
+            </span>
+          </>
+        }
+      />
 
-      <Banner data={data} />
+      <SegmentedTabs
+        value={tab}
+        onChange={setTab}
+        items={[
+          { id: 'overview', label: 'Overview' },
+          { id: 'workers', label: 'Workers' },
+          { id: 'logs', label: 'Logs' },
+        ]}
+      />
+
+      <div className={show('overview')}>
+        <Banner data={data} />
+      </div>
 
       {data.problems.length > 0 && (
-        <div className="rounded-xl border border-amber-900 bg-amber-950/30 p-4">
-          <div className="flex items-center gap-2 font-semibold text-amber-300">
+        <div className={clsx('rounded-xl border border-status-warning/40 bg-status-warning/10 p-4', show('overview'))}>
+          <div className="flex items-center gap-2 font-semibold text-status-warning">
             <AlertTriangle className="h-5 w-5" /> What is wrong
           </div>
-          <ul className="mt-2 space-y-1.5 text-sm text-amber-100/90">
+          <ul className="mt-2 space-y-1.5 text-sm text-slate-300">
             {data.problems.map((problem, i) => (
               <li key={i}>• {problem}</li>
             ))}
@@ -204,8 +233,36 @@ export default function WorkerLive() {
         </div>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-3">
-        <Card title="Task queue">
+      {/* Phone summary of the processes this dashboard can actually see */}
+      {tab === 'workers' && (
+        <Card className="lg:hidden">
+          <ul className="divide-y divide-surface-300/70">
+            <li className="flex items-center gap-3 pb-3">
+              <IconTile tone="green">
+                <Bot />
+              </IconTile>
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold text-slate-100">Task worker</p>
+                <p className="text-xs text-slate-500">Uptime: {uptime}</p>
+              </div>
+              <Pill tone={data.alive ? 'green' : 'red'}>{data.alive ? 'Running' : 'Offline'}</Pill>
+            </li>
+            <li className="flex items-center gap-3 pt-3">
+              <IconTile tone="blue">
+                <Send />
+              </IconTile>
+              <div className="min-w-0 flex-1">
+                <p className="font-semibold text-slate-100">Telegram client</p>
+                <p className="text-xs text-slate-500">{worker.telegram_tools?.length ?? 0} tools registered</p>
+              </div>
+              <Pill tone={telegram.ready ? 'green' : 'amber'}>{telegram.ready ? 'Ready' : 'Not ready'}</Pill>
+            </li>
+          </ul>
+        </Card>
+      )}
+
+      <div className={clsx('grid gap-4 lg:grid-cols-3', tab === 'logs' && 'hidden lg:grid')}>
+        <Card title="Task queue" className={show('overview')}>
           <div className="space-y-2">
             <Row label="Ready (waiting)" value={queue.ready} />
             <Row label="In progress" value={queue.in_progress} />
@@ -215,10 +272,10 @@ export default function WorkerLive() {
           </div>
         </Card>
 
-        <Card title="Worker">
+        <Card title="Worker" className={show('workers')}>
           <div className="space-y-2">
             <Row label="ID" value={<span className="font-mono text-xs">{worker.worker_id ?? '—'}</span>} />
-            <Row label="Uptime" value={formatDuration(uptimeSeconds(worker.started_at))} />
+            <Row label="Uptime" value={uptime} />
             <Row label="Last heartbeat" value={data.heartbeat_age_seconds === null ? '—' : `${data.heartbeat_age_seconds}s ago`} />
             <Row label="Last poll" value={formatTime(worker.last_poll_at)} />
             <Row label="Claimed / finished" value={`${worker.claimed ?? 0} / ${worker.finished ?? 0}`} />
@@ -229,7 +286,7 @@ export default function WorkerLive() {
           </div>
         </Card>
 
-        <Card title="Tools & Telegram">
+        <Card title="Tools & Telegram" className={show('workers')}>
           <div className="space-y-2">
             <Row label="Tools loaded" value={worker.tool_count ?? 0} />
             <Row label="Telegram tools" value={worker.telegram_tools?.length ?? 0} />
@@ -246,8 +303,8 @@ export default function WorkerLive() {
       </div>
 
       {worker.last_error && (
-        <Card title="Last worker error">
-          <p className="font-mono text-xs text-status-error">
+        <Card title="Last worker error" className={show('overview')}>
+          <p className="break-words font-mono text-xs text-status-error">
             {worker.last_error.type}: {worker.last_error.message}
           </p>
           <p className="mt-1 text-[11px] text-slate-500">
@@ -257,7 +314,9 @@ export default function WorkerLive() {
         </Card>
       )}
 
-      <LogView logs={data.logs} />
+      <div className={show('logs')}>
+        <LogView logs={data.logs} />
+      </div>
     </div>
   )
 }

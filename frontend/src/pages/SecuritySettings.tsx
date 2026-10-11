@@ -1,10 +1,72 @@
 /** Security & Settings: emergency stop, limits, LLM configuration, integrations. */
 
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, PlayCircle, Power } from 'lucide-react'
-import { api } from '@/services/api'
-import { Alert, Card, Loading } from '@/components/ui'
+import { AlertTriangle, ChevronRight, KeyRound, LogOut, PlayCircle, Plug, Power, ShieldAlert } from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
+import { api, UNAUTHORIZED_EVENT } from '@/services/api'
+import { Alert, Card, IconTile, Loading, PageHeader } from '@/components/ui'
+import { NAV_SECTIONS } from '@/layouts/navigation'
+
+/** Pages that are not in the bottom tab bar; the phone's "More" list links to them. */
+const MORE_ROUTES = new Set([
+  '/goals',
+  '/tools',
+  '/transactions',
+  '/worker',
+  '/diagnostics',
+  '/memory',
+  '/evidence',
+  '/social',
+  '/automation',
+  '/browser',
+  '/telegram',
+  '/improvements',
+])
+
+function SettingsRow({
+  icon: Icon,
+  tone,
+  title,
+  subtitle,
+  to,
+  onClick,
+}: {
+  icon: LucideIcon
+  tone: 'blue' | 'green' | 'purple' | 'orange' | 'red' | 'cyan' | 'slate'
+  title: string
+  subtitle?: string
+  to?: string
+  onClick?: () => void
+}) {
+  const content = (
+    <>
+      <IconTile tone={tone}>
+        <Icon />
+      </IconTile>
+      <span className="min-w-0 flex-1 text-left">
+        <span className="block truncate text-[15px] font-semibold text-slate-100">{title}</span>
+        {subtitle && <span className="block truncate text-xs text-slate-500">{subtitle}</span>}
+      </span>
+      <ChevronRight className="h-5 w-5 shrink-0 text-slate-500" />
+    </>
+  )
+  const cls = 'flex w-full items-center gap-3 border-b border-surface-300/60 px-3 py-3 last:border-b-0'
+  return to ? (
+    <Link to={to} className={cls}>
+      {content}
+    </Link>
+  ) : (
+    <button type="button" onClick={onClick} className={cls}>
+      {content}
+    </button>
+  )
+}
+
+function jumpTo(id: string) {
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 export default function SecuritySettings() {
   const queryClient = useQueryClient()
@@ -36,19 +98,70 @@ export default function SecuritySettings() {
 
   const stopped = stop?.emergency_stop_enabled ?? false
 
-  return (
-    <div className="space-y-6">
-      <header>
-        <h1 className="text-2xl font-bold text-slate-100">Security & Settings</h1>
-        <p className="mt-1 text-sm text-slate-400">
-          Deterministic controls that the agent cannot modify or disable
-        </p>
-      </header>
+  const moreItems = NAV_SECTIONS.flatMap((section) => section.items).filter((item) => MORE_ROUTES.has(item.to))
 
-      {/* Emergency Stop */}
+  return (
+    <div className="flex flex-col gap-4 pt-1 lg:gap-6 lg:pt-0">
+      <PageHeader
+        title={
+          <>
+            <span className="lg:hidden">Settings</span>
+            <span className="hidden lg:inline">Security & Settings</span>
+          </>
+        }
+        subtitle={
+          <>
+            <span className="lg:hidden">Manage your application</span>
+            <span className="hidden lg:inline">
+              Deterministic controls that the agent cannot modify or disable
+            </span>
+          </>
+        }
+      />
+
+      {/* Phone: shortcuts into this page, then every page that is not in the tab bar */}
+      <div className="space-y-4 lg:hidden">
+        <div className="overflow-hidden rounded-2xl border border-surface-300/60 bg-surface-100 shadow-card">
+          <SettingsRow
+            icon={KeyRound}
+            tone="slate"
+            title="Fixed LLM configuration"
+            subtitle="Model and service settings (read-only)"
+            onClick={() => jumpTo('llm')}
+          />
+          <SettingsRow
+            icon={Plug}
+            tone="blue"
+            title="Integrations"
+            subtitle="Telegram, browser, RPC and scheduler"
+            onClick={() => jumpTo('integrations')}
+          />
+        </div>
+
+        <div>
+          <p className="mb-2 px-1 text-[11px] font-semibold uppercase tracking-widest text-slate-500">More</p>
+          <div className="overflow-hidden rounded-2xl border border-surface-300/60 bg-surface-100 shadow-card">
+            {moreItems.map(({ to, label, icon }) => (
+              <SettingsRow key={to} icon={icon} tone="blue" title={label} to={to} />
+            ))}
+            <SettingsRow
+              icon={LogOut}
+              tone="slate"
+              title="Log out"
+              onClick={async () => {
+                await api.logout()
+                window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Emergency Stop (last on phones, as in the design) */}
+      <div id="emergency-stop" className="scroll-mt-4 max-lg:order-last">
       <Card
         title="Emergency Stop"
-        className={stopped ? 'border-status-error/50' : ''}
+        className={stopped ? 'border-status-error/50' : 'max-lg:border-status-error/30 max-lg:bg-status-error/5'}
         action={
           <span className={`badge ${stopped ? 'bg-red-700 text-white' : 'bg-green-900 text-green-300'}`}>
             {stopped ? 'ACTIVE' : 'INACTIVE'}
@@ -103,9 +216,11 @@ export default function SecuritySettings() {
           )}
         </div>
       </Card>
+      </div>
 
       {/* Fixed model */}
       {agent && (
+        <div id="llm" className="scroll-mt-4">
         <Card title="Fixed LLM Configuration">
           <div className="grid gap-3 sm:grid-cols-2">
             {[
@@ -131,9 +246,11 @@ export default function SecuritySettings() {
             is display-only.
           </p>
         </Card>
+        </div>
       )}
 
       {/* Integrations */}
+      <div id="integrations" className="scroll-mt-4">
       <Card title="Integrations">
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           {[
@@ -158,6 +275,7 @@ export default function SecuritySettings() {
           never silently weakened to make an integration work.
         </p>
       </Card>
+      </div>
     </div>
   )
 }

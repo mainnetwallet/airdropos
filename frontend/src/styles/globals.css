@@ -4,12 +4,105 @@
 
 :root {
   color-scheme: dark;
+
+  /* Desktop theme (dark). Channels are "R G B" so Tailwind opacity modifiers work. */
+  --surface-50: 11 15 22;
+  --surface-100: 17 24 35;
+  --surface-200: 24 33 46;
+  --surface-300: 33 45 61;
+  --slate-50: 248 250 252;
+  --slate-100: 241 245 249;
+  --slate-200: 226 232 240;
+  --slate-300: 203 213 225;
+  --slate-400: 148 163 184;
+  --slate-500: 100 116 139;
+  --slate-600: 71 85 105;
+  --slate-700: 51 65 85;
+  --slate-800: 30 41 59;
+  --slate-900: 15 23 42;
+  --slate-950: 2 6 23;
+}
+
+/* Mobile and tablet (below the desktop sidebar layout): light theme from the design reference. */
+@media (max-width: 1023px) {
+  :root {
+    color-scheme: light;
+    --surface-50: 238 243 251;
+    --surface-100: 255 255 255;
+    --surface-200: 241 245 249;
+    --surface-300: 226 232 240;
+    --slate-50: 15 23 42;
+    --slate-100: 15 23 42;
+    --slate-200: 30 41 59;
+    --slate-300: 51 65 85;
+    --slate-400: 71 85 105;
+    --slate-500: 100 116 139;
+    --slate-600: 113 128 150;
+    --slate-700: 226 232 240;
+    --slate-800: 241 245 249;
+    --slate-900: 248 250 252;
+    --slate-950: 255 255 255;
+  }
+
+  /* Screens the reference draws dark (Agent Chat) switch the same tokens back. */
+  .mobile-dark {
+    color-scheme: dark;
+    --surface-50: 7 14 28;
+    --surface-100: 15 27 48;
+    --surface-200: 22 38 66;
+    --surface-300: 36 56 92;
+    --slate-50: 248 250 252;
+    --slate-100: 241 245 249;
+    --slate-200: 226 232 240;
+    --slate-300: 203 213 225;
+    --slate-400: 148 163 184;
+    --slate-500: 120 136 160;
+    --slate-600: 100 116 139;
+    --slate-700: 51 65 85;
+    --slate-800: 30 41 59;
+    --slate-900: 15 23 42;
+    --slate-950: 2 6 23;
+  }
+
+  .app-shell {
+    background: linear-gradient(180deg, rgb(226 236 252) 0%, rgb(240 245 252) 35%, rgb(246 248 252) 100%);
+  }
+  .app-shell.mobile-dark {
+    background: linear-gradient(180deg, #060e1d 0%, #0a1830 60%, #0b1b36 100%);
+  }
+}
+
+@media (min-width: 1024px) {
+  .app-shell {
+    background: rgb(var(--surface-50));
+  }
 }
 
 html,
 body,
 #root {
   height: 100%;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+}
+
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Keeps content clear of the fixed bottom navigation (and the home indicator). Mobile/tablet only. */
+@media (max-width: 1023px) {
+  .pb-nav {
+    padding-bottom: calc(6.5rem + env(safe-area-inset-bottom, 0px));
+  }
+}
+.pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
 }
 
 body {
@@ -95,7 +188,51 @@ body {
 }
 
 .skeleton {
-  background: linear-gradient(90deg, #18212e 25%, #212d3d 50%, #18212e 75%);
+  background: linear-gradient(
+    90deg,
+    rgb(var(--surface-200)) 25%,
+    rgb(var(--surface-300)) 50%,
+    rgb(var(--surface-200)) 75%
+  );
   background-size: 200% 100%;
   animation: shimmer 1.5s infinite;
+}
+
+/* ------------------------------------------------------------------ mobile surfaces */
+/* In the components layer so utility classes (max-lg:p-0, ...) can still override them. */
+@layer components {
+  @media (max-width: 1023px) {
+    .card {
+      @apply rounded-2xl border-surface-300/70 p-4 shadow-card;
+    }
+    .btn {
+      @apply min-h-[40px];
+    }
+    .input {
+      @apply rounded-xl text-base;
+    }
+    .badge {
+      @apply rounded-md px-2 py-1 text-[11px];
+    }
+    .card-title {
+      @apply text-[17px] font-bold normal-case tracking-normal text-slate-100;
+    }
+    .mobile-dark .card {
+      @apply border-surface-300/60 shadow-none;
+    }
+  }
+}
+
+/* The dark-tinted status badges become the reference's pastel pills (mobile/tablet only). */
+@media (max-width: 1023px) {
+  .badge.bg-green-900, .badge.bg-green-700 { background: #dcfce7; color: #15803d; }
+  .badge.bg-amber-900 { background: #fef3c7; color: #b45309; }
+  .badge.bg-red-900, .badge.bg-red-800 { background: #fee2e2; color: #b91c1c; }
+  .badge.bg-blue-900, .badge.bg-blue-600 { background: #dbeafe; color: #1d4ed8; }
+  .badge.bg-cyan-900 { background: #cffafe; color: #0e7490; }
+  .badge.bg-indigo-900 { background: #e0e7ff; color: #4338ca; }
+  .badge.bg-purple-900 { background: #f3e8ff; color: #7e22ce; }
+  .badge.bg-teal-900 { background: #ccfbf1; color: #0f766e; }
+  .badge.bg-yellow-900, .badge.bg-yellow-800 { background: #fef9c3; color: #a16207; }
+  .badge.bg-orange-600 { background: #ffedd5; color: #c2410c; }
 }
