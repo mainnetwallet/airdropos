@@ -126,10 +126,17 @@ export interface WalletView {
   label: string
   address: string
   chain_type: string
+  derivation_path?: string | null
   supported_networks: string[]
   is_active: boolean
   is_locked: boolean
+  /** True when an encrypted key is stored. The key itself is never sent. */
+  has_key_material: boolean
+  /** Capability flag: key present, wallet active and unlocked. Watch-only is always false. */
+  can_sign: boolean
   total_spent_usd: number
+  notes?: string | null
+  created_at?: string | null
 }
 
 export interface Overview {
