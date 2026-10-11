@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useState } from 'react'
 import { createBrowserRouter, RouterProvider } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import DashboardLayout from '@/layouts/DashboardLayout'
@@ -7,6 +8,9 @@ import TaskManagerPage from '@/pages/TaskManager'
 import ToolsPage from '@/pages/ToolsPage'
 import Wallets from '@/pages/Wallets'
 import SecuritySettings from '@/pages/SecuritySettings'
+import Login from '@/pages/Login'
+import { ErrorState } from '@/components/ui'
+import { api, ApiError, UNAUTHORIZED_EVENT } from '@/services/api'
 import {
   Airdrops,
   Automation,
@@ -53,10 +57,67 @@ const router = createBrowserRouter([
   },
 ])
 
+type AuthState = 'checking' | 'login' | 'ready' | 'down'
+
+/** Shows the login page when the backend answers 401; works unchanged if auth is disabled. */
+function AuthGate() {
+  const [state, setState] = useState<AuthState>('checking')
+  const [problem, setProblem] = useState<unknown>(null)
+
+  const check = useCallback(async () => {
+    setState('checking')
+    try {
+      await api.overview()
+      setState('ready')
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 401) {
+        setState('login')
+      } else {
+        setProblem(
+          e instanceof TypeError ? new Error('Cannot reach the backend. Is `python run.py` running?') : e,
+        )
+        setState('down')
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    check()
+    const onUnauthorized = () => {
+      queryClient.clear()
+      setState('login')
+    }
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized)
+  }, [check])
+
+  if (state === 'checking') {
+    return <div className="flex min-h-full items-center justify-center text-sm text-slate-500">Loading...</div>
+  }
+  if (state === 'down') {
+    return (
+      <div className="flex min-h-full items-center justify-center">
+        <ErrorState error={problem} onRetry={check} />
+      </div>
+    )
+  }
+  if (state === 'login') {
+    return (
+      <Login
+        onSuccess={() => {
+          queryClient.clear()
+          setState('ready')
+        }}
+      />
+    )
+  }
+  return <RouterProvider router={router} />
+}
+
 export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <AuthGate />
     </QueryClientProvider>
   )
 }

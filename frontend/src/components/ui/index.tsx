@@ -107,7 +107,18 @@ export function EmptyState({
 }
 
 export function ErrorState({ error, onRetry }: { error: unknown; onRetry?: () => void }) {
-  const message = error instanceof Error ? error.message : String(error)
+  let message: string
+  if (error instanceof Error) {
+    message = error.message
+  } else if (typeof error === 'string') {
+    message = error
+  } else {
+    try {
+      message = JSON.stringify(error)
+    } catch {
+      message = 'Unknown error'
+    }
+  }
   return (
     <div className="flex flex-col items-center gap-3 py-10 text-center">
       <XCircle className="h-8 w-8 text-status-error" />

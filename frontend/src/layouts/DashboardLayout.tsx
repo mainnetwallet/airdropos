@@ -11,6 +11,7 @@ import {
   HardDrive,
   Layers,
   LifeBuoy,
+  LogOut,
   Radio,
   Settings,
   ShieldAlert,
@@ -22,7 +23,7 @@ import {
 import clsx from 'clsx'
 import { useLiveEvents } from '@/hooks'
 import { useQuery } from '@tanstack/react-query'
-import { api } from '@/services/api'
+import { api, getEmail, UNAUTHORIZED_EVENT } from '@/services/api'
 
 const NAV_SECTIONS = [
   {
@@ -125,6 +126,21 @@ export default function DashboardLayout() {
               {connected ? 'Live' : 'Disconnected'}
             </span>
           </div>
+          {getEmail() && (
+            <p className="mt-2 truncate text-[11px] text-slate-500" title={getEmail()}>
+              {getEmail()}
+            </p>
+          )}
+          <button
+            onClick={async () => {
+              await api.logout()
+              window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+            }}
+            className="mt-2 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-slate-400 transition-colors hover:bg-surface-200 hover:text-slate-200"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+            Log out
+          </button>
         </div>
       </aside>
 
