@@ -132,14 +132,20 @@ async def agent_info(
     return llm.describe()
 
 
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=8000)
+
+
 @router.post("/agent/chat", tags=["agent"])
 async def agent_chat(
     request: Request,
-    message: str,
+    payload: ChatRequest,
     principal: Principal = Depends(require_agent_chat),
 ) -> Dict[str, Any]:
     """Route natural language to the single fixed LLM with a guarded system prompt."""
     from backend.app.llm.client import LLMError, Message
+
+    message = payload.message
 
     enforce_rate_limit(request, "chat")
 

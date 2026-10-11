@@ -11,7 +11,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 
 class SideEffect(str, Enum):
@@ -98,8 +98,11 @@ class BaseTool(ABC):
     }
     output_schema: Dict[str, Any] = {"type": "object"}
 
-    required_permissions: List[str] = field(default_factory=list)
-    supported_networks: List[str] = field(default_factory=list)
+    # BaseTool is not a dataclass, so dataclasses.field() here would leave a raw
+    # Field object on every subclass that does not override it (which broke
+    # GET /tools serialization). Immutable tuples are safe shared defaults.
+    required_permissions: Sequence[str] = ()
+    supported_networks: Sequence[str] = ()
     side_effect: SideEffect = SideEffect.NONE
     timeout_seconds: int = 60
     max_retries: int = 2
@@ -178,8 +181,8 @@ class BaseTool(ABC):
             "description": self.description,
             "input_schema": self.input_schema,
             "output_schema": self.output_schema,
-            "required_permissions": self.required_permissions,
-            "supported_networks": self.supported_networks,
+            "required_permissions": list(self.required_permissions),
+            "supported_networks": list(self.supported_networks),
             "side_effect": self.side_effect.value,
             "timeout_seconds": self.timeout_seconds,
             "is_idempotent": self.is_idempotent,
