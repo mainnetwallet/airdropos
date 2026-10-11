@@ -76,12 +76,22 @@ def create_env_file(env_file: Path) -> None:
     set_env_value(env_file, "WALLET_VAULT_MASTER_KEY", secrets.token_hex(32))
 
 
+MIN_PASSWORD_LEN = 12  # must match hash_password() in backend/app/security/auth.py
+
+
 def set_password(env_file: Path) -> None:
-    pw = getpass.getpass("New operator password: ")
-    if len(pw) < 8:
-        die("Password must be at least 8 characters.")
-    if pw != getpass.getpass("Repeat password: "):
-        die("Passwords do not match.")
+    pw = ""
+    for _ in range(3):
+        pw = getpass.getpass(f"New operator password (at least {MIN_PASSWORD_LEN} characters): ")
+        if len(pw) < MIN_PASSWORD_LEN:
+            print(f"[run] Too short: use at least {MIN_PASSWORD_LEN} characters. Try again.", flush=True)
+            continue
+        if pw != getpass.getpass("Repeat password: "):
+            print("[run] Passwords do not match. Try again.", flush=True)
+            continue
+        break
+    else:
+        die("No valid password entered. Run: py run.py --set-password")
     code = "import sys; from backend.app.security.auth import hash_password; print(hash_password(sys.stdin.read()))"
     r = subprocess.run(
         [str(VENV_PY), "-c", code], cwd=ROOT, input=pw, capture_output=True, text=True,
