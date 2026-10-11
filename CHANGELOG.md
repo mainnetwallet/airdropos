@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 ### Added
+- Mobile/tablet UI redesign (frontend only): light theme tokens, top header with slide-in menu, and a route-driven bottom tab bar (Home, Airdrops, centre Chat, Tasks, Wallets). Desktop sidebar layout is unchanged.
+- New routes `/telegram` (Telegram client readiness from worker status) and `/browser` (browser-capable tools from the registry).
 - New Wallet Management API (`/api/v1/wallets/*`) with full CRUD operations.
 - EVM Chain Adapter (`app/blockchain/chains.py`) centralizing supported networks.
 - Knowledge Graph Service (`app/knowledge/graph.py`) with typed, weighted, directed edges.

@@ -1,71 +1,27 @@
-/** Dashboard shell: sidebar navigation, header, and emergency-stop banner. */
+/**
+ * Dashboard shell.
+ *  - Desktop (lg and up): sidebar navigation, unchanged.
+ *  - Mobile / tablet: top header, slide-in menu and the bottom tab bar with the centre Chat button.
+ * Both share the emergency-stop banner and the same routed content.
+ */
 
-import { NavLink, Outlet } from 'react-router-dom'
-import {
-  Activity,
-  Bot,
-  Brain,
-  Compass,
-  Gauge,
-  GitBranch,
-  HardDrive,
-  Layers,
-  LifeBuoy,
-  LogOut,
-  Radio,
-  Settings,
-  ShieldAlert,
-  Target,
-  Wallet,
-  Wrench,
-  Zap,
-} from 'lucide-react'
+import { useCallback, useState } from 'react'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { LogOut, ShieldAlert } from 'lucide-react'
 import clsx from 'clsx'
 import { useLiveEvents } from '@/hooks'
 import { useQuery } from '@tanstack/react-query'
 import { api, getEmail, UNAUTHORIZED_EVENT } from '@/services/api'
-
-const NAV_SECTIONS = [
-  {
-    label: 'Command',
-    items: [
-      { to: '/', label: 'Mission Control', icon: Gauge, end: true },
-      { to: '/agent', label: 'AI Agent Console', icon: Bot },
-      { to: '/worker', label: 'Live Worker', icon: Activity },
-      { to: '/goals', label: 'Goals & Strategy', icon: Target },
-      { to: '/automation', label: '24/7 Automation', icon: Zap },
-    ],
-  },
-  {
-    label: 'Intelligence',
-    items: [
-      { to: '/airdrops', label: 'Airdrop Explorer', icon: Compass },
-      { to: '/tasks', label: 'Task Manager', icon: Layers },
-      { to: '/evidence', label: 'Evidence & Changes', icon: HardDrive },
-      { to: '/memory', label: 'Memory & Learning', icon: Brain },
-      { to: '/social', label: 'Social Monitors', icon: Radio },
-    ],
-  },
-  {
-    label: 'Assets',
-    items: [
-      { to: '/wallets', label: 'Wallets', icon: Wallet },
-      { to: '/transactions', label: 'Transactions', icon: Activity },
-      { to: '/tools', label: 'Tool Registry', icon: Wrench },
-    ],
-  },
-  {
-    label: 'System',
-    items: [
-      { to: '/diagnostics', label: 'Diagnostics', icon: LifeBuoy },
-      { to: '/improvements', label: 'Self-Improvement', icon: GitBranch },
-      { to: '/settings', label: 'Security & Settings', icon: Settings },
-    ],
-  },
-]
+import { NAV_SECTIONS } from '@/layouts/navigation'
+import { BottomNav, MobileDrawer, MobileHeader, useKeyboardOpen } from '@/components/mobile/MobileChrome'
 
 export default function DashboardLayout() {
   const { connected } = useLiveEvents()
+  const { pathname } = useLocation()
+  const [menuOpen, setMenuOpen] = useState(false)
+  const closeMenu = useCallback(() => setMenuOpen(false), [])
+  const keyboardOpen = useKeyboardOpen()
+
   const { data: stop } = useQuery({
     queryKey: ['emergency-stop'],
     queryFn: api.stopStatus,
@@ -82,10 +38,26 @@ export default function DashboardLayout() {
   })
   const workerAlive = worker?.alive === true
 
+  // Shared with the Home screen (same key) so it costs no extra request.
+  const { data: overview } = useQuery({
+    queryKey: ['overview'],
+    queryFn: api.overview,
+    refetchInterval: 10000,
+  })
+
+  const logout = async () => {
+    await api.logout()
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
+
+  const isChat = pathname.startsWith('/agent')
+  const isHome = pathname === '/'
+  const stopActive = stop?.emergency_stop_enabled === true
+
   return (
-    <div className="flex h-screen overflow-hidden">
-      {/* Sidebar */}
-      <aside className="flex w-60 shrink-0 flex-col border-r border-surface-300 bg-surface-100">
+    <div className={clsx('app-shell flex h-dvh overflow-hidden', isChat && 'mobile-dark')}>
+      {/* Sidebar (desktop) */}
+      <aside className="hidden w-60 shrink-0 flex-col border-r border-surface-300 bg-surface-100 lg:flex">
         <div className="flex items-center gap-2 border-b border-surface-300 px-5 py-4">
           <ShieldAlert className="h-6 w-6 text-accent" />
           <div>
@@ -133,9 +105,7 @@ export default function DashboardLayout() {
                 connected ? 'animate-pulse bg-status-success' : 'bg-status-idle',
               )}
             />
-            <span className="text-slate-400">
-              {connected ? 'Live' : 'Disconnected'}
-            </span>
+            <span className="text-slate-400">{connected ? 'Live' : 'Disconnected'}</span>
           </div>
           <NavLink to="/worker" className="mt-1.5 flex items-center gap-2">
             <span
@@ -158,10 +128,7 @@ export default function DashboardLayout() {
             </p>
           )}
           <button
-            onClick={async () => {
-              await api.logout()
-              window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
-            }}
+            onClick={logout}
             className="mt-2 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-slate-400 transition-colors hover:bg-surface-200 hover:text-slate-200"
           >
             <LogOut className="h-3.5 w-3.5" />
@@ -171,19 +138,45 @@ export default function DashboardLayout() {
       </aside>
 
       {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col">
-        {stop?.emergency_stop_enabled && (
-          <div className="border-b border-status-error/40 bg-status-error/10 px-6 py-2">
-            <p className="text-sm font-medium text-status-error">
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        {stopActive && (
+          <div className="pt-safe border-b border-status-error/40 bg-status-error/10 lg:pt-0">
+            <p className="px-4 py-2 text-sm font-medium text-status-error lg:px-6">
               EMERGENCY STOP ACTIVE — new execution, signing, and transaction submission are
               blocked. {stop.disclaimer}
             </p>
           </div>
         )}
-        <main className="flex-1 overflow-y-auto p-6">
-          <Outlet />
+
+        <MobileHeader
+          onMenu={() => setMenuOpen(true)}
+          overHero={isHome && !stopActive}
+          insetTop={!stopActive}
+          alerts={overview?.needs_user_action ?? 0}
+        />
+
+        <main
+          className={clsx(
+            'flex-1 overflow-y-auto lg:p-6',
+            isChat || isHome ? 'px-0 pt-0' : 'px-4 pt-1',
+            !keyboardOpen && 'pb-nav',
+          )}
+        >
+          <div
+            className={clsx(
+              'mx-auto w-full lg:max-w-none',
+              isChat && 'h-full',
+              !isHome && 'max-w-3xl',
+            )}
+          >
+            <Outlet />
+          </div>
         </main>
+
+        <BottomNav hidden={keyboardOpen} />
       </div>
+
+      <MobileDrawer open={menuOpen} onClose={closeMenu} onLogout={logout} />
     </div>
   )
 }

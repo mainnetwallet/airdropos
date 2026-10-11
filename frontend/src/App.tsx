@@ -9,6 +9,8 @@ import ToolsPage from '@/pages/ToolsPage'
 import WorkerLive from '@/pages/WorkerLive'
 import Wallets from '@/pages/Wallets'
 import SecuritySettings from '@/pages/SecuritySettings'
+import Telegram from '@/pages/Telegram'
+import BrowserAutomation from '@/pages/BrowserAutomation'
 import Login from '@/pages/Login'
 import { ErrorState } from '@/components/ui'
 import { api, ApiError, UNAUTHORIZED_EVENT } from '@/services/api'
@@ -44,6 +46,8 @@ const router = createBrowserRouter([
       { path: 'worker', element: <WorkerLive /> },
       { path: 'goals', element: <Goals /> },
       { path: 'automation', element: <Automation /> },
+      { path: 'browser', element: <BrowserAutomation /> },
+      { path: 'telegram', element: <Telegram /> },
       { path: 'airdrops', element: <Airdrops /> },
       { path: 'tasks', element: <TaskManagerPage /> },
       { path: 'evidence', element: <Evidence /> },
