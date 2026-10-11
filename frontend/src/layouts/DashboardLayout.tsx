@@ -31,6 +31,7 @@ const NAV_SECTIONS = [
     items: [
       { to: '/', label: 'Mission Control', icon: Gauge, end: true },
       { to: '/agent', label: 'AI Agent Console', icon: Bot },
+      { to: '/worker', label: 'Live Worker', icon: Activity },
       { to: '/goals', label: 'Goals & Strategy', icon: Target },
       { to: '/automation', label: '24/7 Automation', icon: Zap },
     ],
@@ -70,6 +71,16 @@ export default function DashboardLayout() {
     queryFn: api.stopStatus,
     refetchInterval: 15000,
   })
+
+  // "Live" above only means the browser reached the API. Whether tasks actually
+  // run depends on the separate worker process, so show that on its own.
+  const { data: worker } = useQuery({
+    queryKey: ['worker-status-mini'],
+    queryFn: api.workerStatus,
+    refetchInterval: 5000,
+    retry: false,
+  })
+  const workerAlive = worker?.alive === true
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -126,6 +137,21 @@ export default function DashboardLayout() {
               {connected ? 'Live' : 'Disconnected'}
             </span>
           </div>
+          <NavLink to="/worker" className="mt-1.5 flex items-center gap-2">
+            <span
+              className={clsx(
+                'h-2 w-2 rounded-full',
+                worker === undefined
+                  ? 'bg-status-idle'
+                  : workerAlive
+                    ? 'animate-pulse bg-status-success'
+                    : 'bg-status-error',
+              )}
+            />
+            <span className={workerAlive ? 'text-slate-400' : 'text-status-error'}>
+              {worker === undefined ? 'Worker: checking' : workerAlive ? 'Worker running' : 'Worker offline'}
+            </span>
+          </NavLink>
           {getEmail() && (
             <p className="mt-2 truncate text-[11px] text-slate-500" title={getEmail()}>
               {getEmail()}

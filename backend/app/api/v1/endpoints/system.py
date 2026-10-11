@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -45,6 +46,7 @@ from backend.app.security.auth import (
 )
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
+from backend.app.scheduler.worker_status import STALE_AFTER_SECONDS, WORKER_SUBSYSTEM
 from backend.app.tasks.state_machine import TaskStatus
 from backend.app.tools.registry import registry
 
@@ -762,9 +764,16 @@ async def diagnostics(
 
     subsystems: Dict[str, Any] = {}
     for row in persisted:
+        status_value = row.status
+        detail = row.detail
+        if row.subsystem == WORKER_SUBSYSTEM:
+            # The worker row is a heartbeat: old means the process is not running.
+            if _heartbeat_age(row) > STALE_AFTER_SECONDS:
+                status_value = "OFFLINE"
+            detail = {k: v for k, v in (detail or {}).items() if k not in ("logs", "tools")}
         subsystems[row.subsystem] = {
-            "status": row.status,
-            "detail": row.detail,
+            "status": status_value,
+            "detail": detail,
             "latency_ms": row.latency_ms,
             "last_checked_at": row.last_checked_at.isoformat() if row.last_checked_at else None,
         }
@@ -787,4 +796,135 @@ async def diagnostics(
             "A stale last_checked_at means the watchdog job is not running. "
             "One responding endpoint does not mean the whole system is healthy."
         ),
+    }
+
+
+# ======================================================================
+# Live worker status
+# ======================================================================
+def _heartbeat_age(row: IntegrationHealth) -> float:
+    """Seconds since the worker last reported. Infinite when it never did."""
+    stamp = row.last_checked_at
+    if stamp is None:
+        return float("inf")
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - stamp).total_seconds())
+
+
+def _telegram_readiness() -> Dict[str, Any]:
+    """What the Telegram user-client needs, checked from configuration only."""
+    try:
+        import telethon  # type: ignore  # noqa: F401
+
+        telethon_installed = True
+    except Exception:
+        telethon_installed = False
+
+    session_file = Path(f"{settings.TELEGRAM_SESSION_PATH}.session")
+    checks = {
+        "enabled": bool(settings.TELEGRAM_USER_ENABLED),
+        "api_id_set": bool(settings.TELEGRAM_API_ID),
+        "api_hash_set": bool(settings.TELEGRAM_API_HASH),
+        "telethon_installed": telethon_installed,
+        "session_file_exists": session_file.exists(),
+    }
+    hint: Optional[str] = None
+    if not checks["enabled"]:
+        hint = "Set TELEGRAM_USER_ENABLED=true in .env, then restart."
+    elif not (checks["api_id_set"] and checks["api_hash_set"]):
+        hint = "Set TELEGRAM_API_ID and TELEGRAM_API_HASH in .env, then restart."
+    elif not checks["telethon_installed"]:
+        hint = "Telethon is not installed. Run: pip install telethon"
+    elif not checks["session_file_exists"]:
+        hint = "Not logged in yet. Run scripts/telegram_login.py once in a terminal."
+    return {**checks, "ready": hint is None, "hint": hint}
+
+
+@router.get("/worker/status", tags=["system"])
+async def worker_status(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    """Is the background worker alive, what is it doing, and why might tasks be stuck."""
+    enforce_rate_limit(request, "read")
+
+    row = await db.scalar(
+        select(IntegrationHealth).where(IntegrationHealth.subsystem == WORKER_SUBSYSTEM)
+    )
+    age = _heartbeat_age(row) if row is not None else float("inf")
+    alive = row is not None and age <= STALE_AFTER_SECONDS
+    reported: Dict[str, Any] = dict(row.detail or {}) if row is not None else {}
+
+    counts_rows = (
+        await db.execute(select(Task.status, func.count(Task.id)).group_by(Task.status))
+    ).all()
+    counts = {str(status_name): int(total) for status_name, total in counts_rows}
+    waiting = counts.get(TaskStatus.READY.value, 0) + counts.get(TaskStatus.RETRYING.value, 0)
+
+    oldest_waiting_seconds: Optional[int] = None
+    oldest = await db.scalar(
+        select(func.min(Task.created_at)).where(
+            Task.status.in_([TaskStatus.READY.value, TaskStatus.RETRYING.value])
+        )
+    )
+    if oldest is not None:
+        if oldest.tzinfo is None:
+            oldest = oldest.replace(tzinfo=timezone.utc)
+        oldest_waiting_seconds = int((datetime.now(timezone.utc) - oldest).total_seconds())
+
+    telegram = _telegram_readiness()
+    stop = emergency_stop.status()
+
+    problems: List[str] = []
+    if row is None:
+        problems.append(
+            "The worker has never reported in. It is not running, it crashed while starting, "
+            "or it uses a different database than the backend."
+        )
+    elif not alive:
+        problems.append(
+            f"The worker stopped reporting {int(age)}s ago, so it is not running. "
+            "Restart with `py run.py`, or run the worker alone: "
+            "`python -m backend.app.scheduler.worker`."
+        )
+    else:
+        if reported.get("tool_count", 0) == 0:
+            problems.append("The worker has no tools loaded, so it cannot perform task steps.")
+        last_error = reported.get("last_error")
+        if last_error:
+            problems.append(
+                f"Last worker error ({last_error.get('type')}): {last_error.get('message')}"
+            )
+        if (
+            waiting
+            and not reported.get("current_task")
+            and (oldest_waiting_seconds or 0) > 30
+        ):
+            problems.append(
+                f"{waiting} task(s) have been waiting {oldest_waiting_seconds}s but the worker "
+                "is not running any. Check the log below for errors."
+            )
+    if stop.get("emergency_stop_enabled"):
+        problems.append("Emergency stop is active in the API process. Resume it in Security & Settings.")
+    if reported.get("note", "").startswith("paused"):
+        problems.append("The worker is paused by the emergency stop.")
+
+    return {
+        "alive": alive,
+        "heartbeat_age_seconds": None if row is None else int(age),
+        "stale_after_seconds": STALE_AFTER_SECONDS,
+        "worker": {k: v for k, v in reported.items() if k != "logs"},
+        "queue": {
+            "ready": counts.get(TaskStatus.READY.value, 0),
+            "in_progress": counts.get(TaskStatus.IN_PROGRESS.value, 0),
+            "retrying": counts.get(TaskStatus.RETRYING.value, 0),
+            "needs_user_action": counts.get(TaskStatus.NEEDS_USER_ACTION.value, 0),
+            "oldest_waiting_seconds": oldest_waiting_seconds,
+        },
+        "telegram": telegram,
+        "emergency_stop": bool(stop.get("emergency_stop_enabled")),
+        "problems": problems,
+        "logs": list(reported.get("logs") or [])[-150:],
     }

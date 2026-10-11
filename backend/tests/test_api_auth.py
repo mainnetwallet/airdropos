@@ -173,6 +173,7 @@ PROTECTED_GETS = [
     "/api/v1/goals",
     "/api/v1/wallets",
     "/api/v1/tools",
+    "/api/v1/worker/status",
     "/api/v1/tools/catalog",
     "/api/v1/memory",
     "/api/v1/improvements",

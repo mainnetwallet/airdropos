@@ -17,6 +17,7 @@ import type {
   TaskSummary,
   ToolDescriptor,
   WalletView,
+  WorkerStatus,
 } from '@/types'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api/v1'
@@ -149,6 +150,7 @@ export const api = {
   health: () => request<Record<string, unknown>>('/health'),
   readiness: () => request<Record<string, unknown>>('/readiness'),
   diagnostics: () => request<DiagnosticsResponse>('/diagnostics'),
+  workerStatus: () => request<WorkerStatus>('/worker/status'),
 
   // --- Agent ------------------------------------------------------------
   agentInfo: () => request<AgentInfo>('/agent/info'),

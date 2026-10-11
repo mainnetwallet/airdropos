@@ -26,6 +26,7 @@ from backend.app.database.session import AsyncSessionLocal, engine
 from backend.app.models import IntegrationHealth
 from backend.app.notifications.dispatcher import Severity, dispatcher
 from backend.app.scheduler.scheduler import DEFAULT_JOBS, scheduler
+from backend.app.scheduler.worker_status import heartbeat_loop, state as worker_state
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
@@ -296,8 +297,10 @@ async def task_execution_loop() -> None:
     """Continuously claim and execute tasks."""
     logger.info("Task execution loop started for %s", WORKER_ID)
     while not _shutdown_event.is_set():
+        current_task_id = None
         try:
             if emergency_stop.is_stopped and not emergency_stop.can_execute_tasks():
+                worker_state.polled("paused: emergency stop is active")
                 await asyncio.sleep(5)
                 continue
 
@@ -306,14 +309,20 @@ async def task_execution_loop() -> None:
                 task = await manager.claim_next_task(WORKER_ID)
 
                 if task is None:
+                    worker_state.polled("idle: no runnable task")
                     await asyncio.sleep(3)
                     continue
+
+                current_task_id = task.task_id
+                worker_state.polled(f"running {task.task_id}")
+                worker_state.task_claimed(task.task_id, task.title)
 
                 controller = AgentController(db, registry=registry)
                 report = await controller.execute_task(task)
                 await db.commit()
 
                 logger.info("Task %s finished: %s", task.task_id, report.outcome.value)
+                worker_state.task_finished(task.task_id, report.outcome.value)
 
                 if report.outcome.value == "needs_user_action" and report.blockers:
                     await dispatcher.notify(
@@ -328,6 +337,7 @@ async def task_execution_loop() -> None:
             raise
         except Exception as exc:
             logger.exception("Task execution error: %s", exc)
+            worker_state.failed(exc, current_task_id)
             await asyncio.sleep(5)
 
 
@@ -359,7 +369,9 @@ async def recover_interrupted_tasks() -> int:
 async def main() -> None:
     # The worker is its own process with its own (initially empty) tool registry.
     # Without this, every planned step ran with no tools.
+    worker_state.attach_logging()
     bootstrap_tools()
+    worker_state.begin(WORKER_ID, list(registry._tools))
     logger.info("=" * 70)
     logger.info("AirdropOS Worker %s starting", WORKER_ID)
     logger.info("Fixed model: %s at %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
@@ -390,11 +402,15 @@ async def main() -> None:
         except (NotImplementedError, AttributeError):
             pass  # Windows does not support add_signal_handler.
 
+    # Heartbeat first, so the dashboard shows the worker even while a task runs.
+    heartbeat = asyncio.create_task(heartbeat_loop(_shutdown_event))
+
     await asyncio.create_task(task_execution_loop())
 
     await _shutdown_event.wait()
     logger.info("Shutdown signal received. Preserving state.")
 
+    heartbeat.cancel()
     await scheduler.stop()
     try:
         await engine.dispose()

@@ -217,3 +217,50 @@ export interface WsEvent {
   payload: Record<string, unknown>
   at: string
 }
+
+export interface WorkerLogLine {
+  t: string
+  level: string
+  source: string
+  message: string
+}
+
+export interface WorkerStatus {
+  alive: boolean
+  heartbeat_age_seconds: number | null
+  stale_after_seconds: number
+  worker: {
+    worker_id?: string
+    started_at?: string | null
+    tool_count?: number
+    tools?: string[]
+    telegram_tools?: string[]
+    note?: string
+    current_task?: { task_id: string; title: string; since: string } | null
+    last_task?: { task_id: string; outcome: string; at: string } | null
+    last_error?: { at: string; task_id: string | null; type: string; message: string } | null
+    last_poll_at?: string | null
+    polls?: number
+    claimed?: number
+    finished?: number
+  }
+  queue: {
+    ready: number
+    in_progress: number
+    retrying: number
+    needs_user_action: number
+    oldest_waiting_seconds: number | null
+  }
+  telegram: {
+    enabled: boolean
+    api_id_set: boolean
+    api_hash_set: boolean
+    telethon_installed: boolean
+    session_file_exists: boolean
+    ready: boolean
+    hint: string | null
+  }
+  emergency_stop: boolean
+  problems: string[]
+  logs: WorkerLogLine[]
+}

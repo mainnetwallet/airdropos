@@ -6,6 +6,7 @@ import Overview from '@/pages/Overview'
 import AgentChat from '@/pages/AgentChat'
 import TaskManagerPage from '@/pages/TaskManager'
 import ToolsPage from '@/pages/ToolsPage'
+import WorkerLive from '@/pages/WorkerLive'
 import Wallets from '@/pages/Wallets'
 import SecuritySettings from '@/pages/SecuritySettings'
 import Login from '@/pages/Login'
@@ -40,6 +41,7 @@ const router = createBrowserRouter([
     children: [
       { index: true, element: <Overview /> },
       { path: 'agent', element: <AgentChat /> },
+      { path: 'worker', element: <WorkerLive /> },
       { path: 'goals', element: <Goals /> },
       { path: 'automation', element: <Automation /> },
       { path: 'airdrops', element: <Airdrops /> },
