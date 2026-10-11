@@ -1,0 +1,101 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: #111823;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #212d3d;
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #2d3d52;
+}
+
+@layer components {
+  .card {
+    @apply bg-surface-100 border border-surface-300 rounded-xl p-5;
+  }
+
+  .card-title {
+    @apply text-sm font-semibold text-slate-300 uppercase tracking-wider;
+  }
+
+  .stat-value {
+    @apply text-3xl font-bold text-slate-50 tabular-nums;
+  }
+
+  .stat-label {
+    @apply text-xs text-slate-400 uppercase tracking-wide;
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium
+           transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn bg-accent hover:bg-accent-hover text-white;
+  }
+
+  .btn-danger {
+    @apply btn bg-status-error hover:bg-red-700 text-white;
+  }
+
+  .btn-ghost {
+    @apply btn bg-surface-200 hover:bg-surface-300 text-slate-300;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium;
+  }
+
+  .input {
+    @apply w-full bg-surface-200 border border-surface-300 rounded-lg px-3 py-2
+           text-sm text-slate-200 placeholder-slate-500 focus:outline-none
+           focus:border-accent;
+  }
+
+  .table-header {
+    @apply text-left text-xs font-semibold text-slate-400 uppercase tracking-wider
+           px-4 py-3 border-b border-surface-300;
+  }
+
+  .table-row {
+    @apply px-4 py-3 border-b border-surface-200 hover:bg-surface-200/50 transition-colors;
+  }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #18212e 25%, #212d3d 50%, #18212e 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}

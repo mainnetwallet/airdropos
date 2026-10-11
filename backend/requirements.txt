@@ -1,0 +1,45 @@
+# FastAPI & Web Core
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9
+
+# Database & ORM
+SQLAlchemy>=2.0.30
+asyncpg>=0.29.0
+alembic>=1.13.1
+psycopg2-binary>=2.9.9
+
+# Caching & Queue
+redis>=5.0.4
+
+# HTTP & API Clients
+httpx>=0.27.0
+aiohttp>=3.9.5
+
+# Web3 & Blockchain
+web3>=6.19.0
+eth-account>=0.12.3
+
+# Cryptography & Vault Security
+cryptography>=42.0.7
+
+# Browser Automation
+playwright>=1.44.0
+
+# Social Integrations
+python-telegram-bot>=21.1.1
+
+# HTML & Content Parsing
+beautifulsoup4>=4.12.3
+lxml>=5.2.2
+
+# Configuration & Utilities
+python-dotenv>=1.0.1
+pyyaml>=6.0.1
+
+# Future Test Dependencies (Created only, NOT executed during creation phase)
+pytest>=8.2.0
+pytest-asyncio>=0.23.6
+pytest-mock>=3.14.0
