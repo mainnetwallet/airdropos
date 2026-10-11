@@ -1,72 +1,75 @@
 /** AI Agent Console: natural-language chat with the central agent. */
 
-import { useState } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { Send, ShieldCheck } from 'lucide-react'
+import { Send, ShieldCheck, Trash2 } from 'lucide-react'
 import { api } from '@/services/api'
+import { agentChatStore } from '@/services/agentChatStore'
 import { Alert, Card } from '@/components/ui'
 
-interface Message {
-  id: string
-  role: 'user' | 'agent'
-  content: string
-  at: string
-  taskId?: string
-}
-
 export default function AgentChat() {
-  const [messages, setMessages] = useState<Message[]>([])
+  // Conversation lives in a persistent external store, not component state, so
+  // it survives navigating to another page and back.
+  const { messages, pending } = useSyncExternalStore(
+    agentChatStore.subscribe,
+    agentChatStore.getSnapshot,
+  )
   const [input, setInput] = useState('')
+  const bottomRef = useRef<HTMLDivElement>(null)
 
   const { data: info } = useQuery({ queryKey: ['agent-info'], queryFn: api.agentInfo })
 
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages.length, pending])
+
   const send = useMutation({
     mutationFn: (message: string) => api.agentChat(message),
+    onMutate: () => agentChatStore.setPending(true),
     onSuccess: (response) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: 'agent',
-          content: response.reply,
-          at: new Date().toISOString(),
-          taskId: response.task?.task_id,
-        },
-      ])
+      agentChatStore.add({
+        role: 'agent',
+        content: response.reply,
+        taskId: response.task?.task_id,
+      })
     },
     onError: (error: Error) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: 'agent',
-          content: `Request failed: ${error.message}`,
-          at: new Date().toISOString(),
-        },
-      ])
+      agentChatStore.add({ role: 'agent', content: `Request failed: ${error.message}` })
     },
+    onSettled: () => agentChatStore.setPending(false),
   })
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     const text = input.trim()
-    if (!text || send.isPending) return
+    if (!text || pending) return
 
-    setMessages((prev) => [
-      ...prev,
-      { id: crypto.randomUUID(), role: 'user', content: text, at: new Date().toISOString() },
-    ])
+    agentChatStore.add({ role: 'user', content: text })
     setInput('')
     send.mutate(text)
   }
 
   return (
     <div className="flex h-full flex-col gap-4">
-      <header>
-        <h1 className="text-2xl font-bold text-slate-100">AI Agent Console</h1>
-        <p className="mt-1 text-sm text-slate-400">
-          Natural-language control of the central autonomous agent
-        </p>
+      <header className="flex items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-100">AI Agent Console</h1>
+          <p className="mt-1 text-sm text-slate-400">
+            Natural-language control of the central autonomous agent
+          </p>
+        </div>
+        {messages.length > 0 && (
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() => {
+              if (window.confirm('Clear this conversation?')) agentChatStore.clear()
+            }}
+          >
+            <Trash2 className="h-4 w-4" />
+            Clear chat
+          </button>
+        )}
       </header>
 
       {info && (
@@ -111,13 +114,14 @@ export default function AgentChat() {
               </div>
             ))
           )}
-          {send.isPending && (
+          {pending && (
             <div className="flex justify-start">
               <div className="rounded-2xl bg-surface-200 px-4 py-2.5">
                 <span className="animate-pulse text-sm text-slate-400">Thinking…</span>
               </div>
             </div>
           )}
+          <div ref={bottomRef} />
         </div>
 
         <form onSubmit={handleSubmit} className="flex gap-2 border-t border-surface-300 pt-3">
@@ -126,9 +130,9 @@ export default function AgentChat() {
             placeholder="Send a message to the agent…"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            disabled={send.isPending}
+            disabled={pending}
           />
-          <button type="submit" className="btn-primary" disabled={!input.trim() || send.isPending}>
+          <button type="submit" className="btn-primary" disabled={!input.trim() || pending}>
             <Send className="h-4 w-4" />
             Send
           </button>

@@ -68,6 +68,8 @@ export function clearSession(): void {
   try {
     localStorage.removeItem(TOKEN_KEY)
     localStorage.removeItem(EMAIL_KEY)
+    // Never leave one operator's agent conversation behind for the next login.
+    localStorage.removeItem('airdropos.agentChat.v1')
   } catch {
     // ignore
   }
