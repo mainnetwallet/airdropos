@@ -184,6 +184,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  deleteTask: (taskId: string) =>
+    request<{ task_id: string; deleted: boolean }>(
+      `/tasks/${encodeURIComponent(taskId)}`,
+      { method: 'DELETE' },
+    ),
   cancelTask: (taskId: string) =>
     request<{ task_id: string; status: string }>(
       `/tasks/${encodeURIComponent(taskId)}/cancel`,

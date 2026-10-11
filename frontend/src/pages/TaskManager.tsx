@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { RefreshCw, Search, XCircle } from 'lucide-react'
+import { RefreshCw, Search, Trash2, XCircle } from 'lucide-react'
 import { api } from '@/services/api'
 import {
   Card,
@@ -52,6 +52,20 @@ export default function TaskManagerPage() {
       queryClient.invalidateQueries({ queryKey: ['task', selected] })
     },
   })
+
+  const remove = useMutation({
+    mutationFn: (id: string) => api.deleteTask(id),
+    onSuccess: () => {
+      setSelected(null)
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
+    },
+  })
+
+  const handleDelete = (id: string) => {
+    if (window.confirm(`Delete task ${id} permanently? This cannot be undone.`)) {
+      remove.mutate(id)
+    }
+  }
 
   const retry = useMutation({
     mutationFn: (id: string) => api.retryTask(id),
@@ -242,7 +256,18 @@ export default function TaskManagerPage() {
                   <XCircle className="h-4 w-4" />
                   Cancel
                 </button>
+                <button
+                  onClick={() => handleDelete(selected)}
+                  disabled={remove.isPending}
+                  className="btn-danger flex-1"
+                >
+                  <Trash2 className="h-4 w-4" />
+                  Delete
+                </button>
               </div>
+              {remove.error && (
+                <p className="text-xs text-status-error">{(remove.error as Error).message}</p>
+              )}
             </div>
           )}
         </Card>

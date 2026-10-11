@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.browser.controller import controller as browser_controller
@@ -20,6 +20,7 @@ from backend.app.learning.engine import LearningEngine
 from backend.app.llm.client import llm
 from backend.app.models import (
     AirdropCampaign,
+    BlockchainTransaction,
     Goal,
     ImprovementProposal,
     IntegrationHealth,
@@ -365,6 +366,54 @@ async def retry_task(
                       after_state={"retry_count": task.retry_count})
     await db.commit()
     return {"task_id": task.task_id, "status": task.status, "retry_count": task.retry_count}
+
+
+@router.delete("/tasks/{task_id}", tags=["tasks"])
+async def delete_task(
+    task_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_task_write),
+) -> Dict[str, Any]:
+    """Permanently delete a task and its plans, executions, events and evidence.
+
+    Refused while a worker may be running it (cancel first) and when the task
+    owns blockchain transactions (those are financial records and are kept).
+    """
+    enforce_rate_limit(request, "write")
+    manager = TaskManager(db)
+    task = await manager.get_by_task_id(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    if task.status in (TaskStatus.IN_PROGRESS.value, TaskStatus.RETRYING.value):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task {task.task_id} is {task.status}. Cancel it first, then delete it.",
+        )
+
+    tx_count = await db.scalar(
+        select(func.count(BlockchainTransaction.id)).where(
+            BlockchainTransaction.task_id == task.id
+        )
+    )
+    if tx_count:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task {task.task_id} has {tx_count} blockchain transaction record(s). "
+                "Transaction history is kept for auditing, so this task cannot be deleted."
+            ),
+        )
+
+    before = {"title": task.title, "status": task.status}
+    public_id = task.task_id
+    # Core DELETE: the database cascades to plans, executions, checkpoints, events
+    # and evidence. (ORM delete would lazy-load relationships, which fails in async.)
+    await db.execute(delete(type(task)).where(type(task).id == task.id))
+    await write_audit(db, principal, "TASK_DELETE", "task", public_id, before_state=before)
+    await db.commit()
+    return {"task_id": public_id, "deleted": True}
 
 
 # ======================================================================
