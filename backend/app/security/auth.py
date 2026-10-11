@@ -80,8 +80,8 @@ class AuthError(Exception):
 # ======================================================================
 def hash_password(password: str, salt: Optional[bytes] = None) -> str:
     """Hash a password with PBKDF2-HMAC-SHA256. Format: pbkdf2$rounds$salt$hash."""
-    if len(password) < 12:
-        raise ValueError("Operator password must be at least 12 characters.")
+    if len(password) < 4:
+        raise ValueError("Operator password must be at least 4 characters.")
     salt = salt or os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
     return f"pbkdf2${PBKDF2_ROUNDS}${salt.hex()}${digest.hex()}"

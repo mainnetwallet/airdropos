@@ -76,7 +76,7 @@ def create_env_file(env_file: Path) -> None:
     set_env_value(env_file, "WALLET_VAULT_MASTER_KEY", secrets.token_hex(32))
 
 
-MIN_PASSWORD_LEN = 12  # must match hash_password() in backend/app/security/auth.py
+MIN_PASSWORD_LEN = 4  # must match hash_password() in backend/app/security/auth.py
 
 
 def set_password(env_file: Path) -> None:
