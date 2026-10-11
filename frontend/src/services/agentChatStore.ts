@@ -12,6 +12,8 @@ export interface ChatMessage {
   content: string
   at: string
   taskId?: string
+  /** Failed requests are shown to the operator but never sent to the model. */
+  error?: boolean
 }
 
 interface ChatState {

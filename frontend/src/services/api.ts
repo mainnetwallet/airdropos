@@ -152,7 +152,10 @@ export const api = {
 
   // --- Agent ------------------------------------------------------------
   agentInfo: () => request<AgentInfo>('/agent/info'),
-  agentChat: (message: string) =>
+  agentChat: (
+    message: string,
+    history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
+  ) =>
     request<{
       reply: string
       task: { task_id: string; status: string; title: string; priority: number } | null
@@ -160,7 +163,7 @@ export const api = {
       usage: Record<string, number>
     }>(
       '/agent/chat',
-      { method: 'POST', body: JSON.stringify({ message }) },
+      { method: 'POST', body: JSON.stringify({ message, history }) },
     ),
 
   // --- Tasks ------------------------------------------------------------

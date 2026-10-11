@@ -24,7 +24,13 @@ export default function AgentChat() {
   }, [messages.length, pending])
 
   const send = useMutation({
-    mutationFn: (message: string) => api.agentChat(message),
+    mutationFn: ({
+      message,
+      history,
+    }: {
+      message: string
+      history: Array<{ role: 'user' | 'assistant'; content: string }>
+    }) => api.agentChat(message, history),
     onMutate: () => agentChatStore.setPending(true),
     onSuccess: (response) => {
       agentChatStore.add({
@@ -34,7 +40,11 @@ export default function AgentChat() {
       })
     },
     onError: (error: Error) => {
-      agentChatStore.add({ role: 'agent', content: `Request failed: ${error.message}` })
+      agentChatStore.add({
+        role: 'agent',
+        content: `Request failed: ${error.message}`,
+        error: true,
+      })
     },
     onSettled: () => agentChatStore.setPending(false),
   })
@@ -44,9 +54,19 @@ export default function AgentChat() {
     const text = input.trim()
     if (!text || pending) return
 
+    // Everything said so far (before this message) is sent along so the agent
+    // remembers the conversation. Failed requests are not part of it.
+    const history = agentChatStore
+      .getSnapshot()
+      .messages.filter((m) => !m.error)
+      .map((m) => ({
+        role: m.role === 'user' ? ('user' as const) : ('assistant' as const),
+        content: m.content,
+      }))
+
     agentChatStore.add({ role: 'user', content: text })
     setInput('')
-    send.mutate(text)
+    send.mutate({ message: text, history })
   }
 
   return (
