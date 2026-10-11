@@ -32,11 +32,71 @@ export class ApiError extends Error {
   }
 }
 
+// --- Session token -------------------------------------------------------
+// The backend requires a bearer token on every route. The token is kept in
+// localStorage (wrapped in try/catch because storage can be unavailable).
+const TOKEN_KEY = 'airdropos.token'
+const EMAIL_KEY = 'airdropos.email'
+export const UNAUTHORIZED_EVENT = 'airdropos:unauthorized'
+
+export function getToken(): string {
+  try {
+    return localStorage.getItem(TOKEN_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+export function getEmail(): string {
+  try {
+    return localStorage.getItem(EMAIL_KEY) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+function saveSession(token: string, email: string): void {
+  try {
+    localStorage.setItem(TOKEN_KEY, token)
+    localStorage.setItem(EMAIL_KEY, email)
+  } catch {
+    // Storage blocked: the session then lasts only until the page reloads.
+  }
+}
+
+export function clearSession(): void {
+  try {
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(EMAIL_KEY)
+  } catch {
+    // ignore
+  }
+}
+
+/** Turn the backend's error body ({detail: string | {error, hint}}) into readable text. */
+function errorMessage(body: unknown, status: number): string {
+  const detail = (body as { detail?: unknown } | undefined)?.detail ?? body
+  if (typeof detail === 'string' && detail) return detail
+  if (detail && typeof detail === 'object') {
+    const d = detail as { error?: unknown; hint?: unknown; message?: unknown }
+    const main = [d.error, d.message].find((v) => typeof v === 'string') as string | undefined
+    if (main) return typeof d.hint === 'string' ? `${main} ${d.hint}` : main
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      // fall through
+    }
+  }
+  return `Request failed with ${status}`
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getToken()
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers: {
       'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...(init?.headers ?? {}),
     },
   })
@@ -48,9 +108,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       detail = await response.text()
     }
-    const message =
-      (detail as { detail?: string })?.detail ?? `Request failed with ${response.status}`
-    throw new ApiError(message, response.status, detail)
+    // A 401 on any call except the login form itself means the session is gone.
+    if (response.status === 401 && path !== '/auth/login') {
+      clearSession()
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
+    throw new ApiError(errorMessage(detail, response.status), response.status, detail)
   }
 
   if (response.status === 204) return undefined as T
@@ -58,6 +121,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  // --- Auth -------------------------------------------------------------
+  login: async (email: string, password: string) => {
+    const session = await request<{ token: string; email: string; expires_at: string }>(
+      '/auth/login',
+      { method: 'POST', body: JSON.stringify({ email, password }) },
+    )
+    saveSession(session.token, session.email)
+    return session
+  },
+  logout: async () => {
+    try {
+      await request<unknown>('/auth/logout', { method: 'POST' })
+    } catch {
+      // Even if the server call fails, forget the token locally.
+    }
+    clearSession()
+  },
+
   // --- System -----------------------------------------------------------
   overview: () => request<Overview>('/overview'),
   health: () => request<Record<string, unknown>>('/health'),
@@ -143,6 +224,14 @@ export const api = {
   releaseStop: () => request<Record<string, unknown>>('/emergency-stop/resume', { method: 'POST' }),
 }
 
-export const WS_URL =
+const WS_BASE =
   import.meta.env.VITE_WS_URL ??
-  `${API_BASE.replace(/^http/, 'ws')}/ws`
+  (API_BASE.startsWith('http')
+    ? `${API_BASE.replace(/^http/, 'ws')}/ws`
+    : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}${API_BASE}/ws`)
+
+/** WebSocket URL including the session token (the backend reads it from ?token=). */
+export function wsUrl(): string {
+  const token = getToken()
+  return token ? `${WS_BASE}?token=${encodeURIComponent(token)}` : WS_BASE
+}
