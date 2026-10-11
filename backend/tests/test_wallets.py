@@ -500,3 +500,99 @@ async def test_service_signing_is_blocked_by_state(db_session_factory):
         row.is_active = True
         row.encrypted_secret = None
         assert service.can_sign(row) is False
+
+# ======================================================================
+# Create wallet (server-generated key)
+# ======================================================================
+@pytest.mark.asyncio
+async def test_create_requires_wallet_write(client, db_session_factory):
+    unauthenticated = await client.post("/api/v1/wallets/create", json={"label": "x"})
+    assert unauthenticated.status_code in (401, 403)
+
+    headers = await _auth(db_session_factory, Scope.WALLET_READ.value)
+    response = await client.post(
+        "/api/v1/wallets/create", json={"label": "Escalation"}, headers=headers
+    )
+    assert response.status_code == 403
+
+    async with db_session_factory() as db:
+        rows = list((await db.execute(select(Wallet))).scalars().all())
+    assert rows == [], "a refused create must not have written a wallet"
+
+
+@pytest.mark.asyncio
+async def test_create_never_returns_or_audits_key_material(client, db_session_factory):
+    from backend.app.wallets.vault import vault
+
+    headers = await _auth(db_session_factory, *READ_WRITE)
+    response = await client.post(
+        "/api/v1/wallets/create", json={"label": "Fresh"}, headers=headers
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["has_key_material"] is True
+    assert body["can_sign"] is True
+    for forbidden in ("secret", "private_key", "mnemonic", "encrypted_secret"):
+        assert forbidden not in body
+
+    async with db_session_factory() as db:
+        row = await db.get(Wallet, uuid.UUID(body["id"]))
+        ciphertext, iv, tag = row.encrypted_secret, row.encryption_iv, row.encryption_tag
+        audit = (
+            await db.execute(select(AuditLog).where(AuditLog.entity_id == body["id"]))
+        ).scalars().all()
+
+    # The stored key is real: it decrypts to the key for the returned address,
+    # and that plaintext appears in neither the response nor the audit trail.
+    assert vault.public_address(ciphertext, iv, tag).lower() == body["address"]
+    plaintext = vault.decrypt(ciphertext, iv, tag)
+    assert plaintext not in response.text
+    assert ciphertext not in response.text
+    assert [a.action for a in audit] == ["WALLET_CREATED"]
+    serialized = str(audit[0].after_state) + str(audit[0].before_state)
+    assert plaintext not in serialized
+    assert plaintext[2:] not in serialized
+
+
+@pytest.mark.asyncio
+async def test_create_generates_distinct_wallets_and_validates_input(client, db_session_factory):
+    headers = await _auth(db_session_factory, *READ_WRITE)
+    first = await client.post("/api/v1/wallets/create", json={"label": "A"}, headers=headers)
+    second = await client.post("/api/v1/wallets/create", json={"label": "B"}, headers=headers)
+    assert first.status_code == second.status_code == 201
+    assert first.json()["address"] != second.json()["address"]
+
+    bad_chain = await client.post(
+        "/api/v1/wallets/create", json={"label": "C", "chain_type": "SOL"}, headers=headers
+    )
+    assert bad_chain.status_code == 400
+    bad_net = await client.post(
+        "/api/v1/wallets/create",
+        json={"label": "D", "supported_networks": ["nonexistent-net"]},
+        headers=headers,
+    )
+    assert bad_net.status_code == 400
+
+
+# ======================================================================
+# Watch-only wallets can never sign
+# ======================================================================
+@pytest.mark.asyncio
+async def test_watch_only_wallet_can_never_sign(client, db_session_factory):
+    headers = await _auth(db_session_factory, *READ_WRITE)
+    created = await client.post(
+        "/api/v1/wallets/watch",
+        json={"label": "Watch", "address": "0x" + "ab" * 20},
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    wallet_id = created.json()["id"]
+    assert created.json()["has_key_material"] is False
+    assert created.json()["can_sign"] is False
+
+    # Unlocking / reactivating a watch-only wallet must not grant signing.
+    await client.post(f"/api/v1/wallets/{wallet_id}/lock?locked=false", headers=headers)
+    reactivated = await client.post(
+        f"/api/v1/wallets/{wallet_id}/deactivate?active=true", headers=headers
+    )
+    assert reactivated.json()["can_sign"] is False

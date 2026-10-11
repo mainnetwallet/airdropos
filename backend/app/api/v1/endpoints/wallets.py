@@ -4,7 +4,7 @@ Read endpoints require `wallet_read`. Every mutating endpoint requires the
 separate `wallet_write` scope, so a read-only observer session can inspect
 addresses without being able to import or delete key material.
 
-Key material is accepted only on import, is encrypted before it reaches the
+Key material is accepted only on import (or generated server-side on create), is encrypted before it reaches the
 database, and is never returned by any endpoint. Responses expose
 `has_key_material` and `can_sign` as capability flags instead.
 """
@@ -61,6 +61,13 @@ class WalletImportRequest(BaseModel):
     secret: str = Field(min_length=1, description="Private key (0x…) or BIP-39 mnemonic")
     chain_type: str = Field(default="EVM", max_length=50)
     derivation_path: Optional[str] = Field(default=None, max_length=100)
+    supported_networks: Optional[List[str]] = None
+    notes: Optional[str] = None
+
+
+class WalletCreateRequest(BaseModel):
+    label: str = Field(min_length=1, max_length=255)
+    chain_type: str = Field(default="EVM", max_length=50)
     supported_networks: Optional[List[str]] = None
     notes: Optional[str] = None
 
@@ -144,6 +151,45 @@ async def get_wallet(
 # ----------------------------------------------------------------------
 # Write
 # ----------------------------------------------------------------------
+@router.post("/wallets/create", status_code=201, tags=["wallets"])
+async def create_wallet(
+    payload: WalletCreateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_wallet_write),
+) -> Dict[str, Any]:
+    """Generate a new wallet whose key lives only in the encrypted vault.
+
+    The generated key is never returned, logged, or audited; only the public
+    address is. The wallet therefore cannot be exported.
+    """
+    enforce_rate_limit(request, "write")
+    service = _service(db)
+    try:
+        row = await service.create_wallet(
+            label=payload.label,
+            chain_type=payload.chain_type,
+            supported_networks=payload.supported_networks,
+            notes=payload.notes,
+        )
+    except WalletValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except WalletError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    await write_audit(
+        db,
+        principal,
+        "WALLET_CREATED",
+        "wallet",
+        str(row.id),
+        after_state={"label": row.label, "address": row.address},
+        ip_address=request.client.host if request.client else None,
+    )
+    await db.commit()
+    return service.to_dict(row)
+
+
 @router.post("/wallets/import", status_code=201, tags=["wallets"])
 async def import_wallet(
     payload: WalletImportRequest,

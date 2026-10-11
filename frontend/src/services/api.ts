@@ -216,6 +216,28 @@ export const api = {
 
   // --- Wallets ----------------------------------------------------------
   listWallets: () => request<{ wallets: WalletView[] }>('/wallets'),
+  getWallet: (id: string) => request<WalletView>(`/wallets/${encodeURIComponent(id)}`),
+  /** Generate a new wallet server-side. The key stays in the vault and is never returned. */
+  createWallet: (payload: { label: string; notes?: string }) =>
+    request<WalletView>('/wallets/create', { method: 'POST', body: JSON.stringify(payload) }),
+  /**
+   * Import a private key or mnemonic. The secret is sent once over the request body
+   * and is never returned. Callers must not store it in query/mutation caches or storage.
+   */
+  importWallet: (payload: { label: string; secret: string; notes?: string }) =>
+    request<WalletView>('/wallets/import', { method: 'POST', body: JSON.stringify(payload) }),
+  watchWallet: (payload: { label: string; address: string; notes?: string }) =>
+    request<WalletView>('/wallets/watch', { method: 'POST', body: JSON.stringify(payload) }),
+  setWalletLocked: (id: string, locked: boolean) =>
+    request<WalletView>(`/wallets/${encodeURIComponent(id)}/lock?locked=${locked}`, {
+      method: 'POST',
+    }),
+  setWalletActive: (id: string, active: boolean) =>
+    request<WalletView>(`/wallets/${encodeURIComponent(id)}/deactivate?active=${active}`, {
+      method: 'POST',
+    }),
+  deleteWallet: (id: string) =>
+    request<void>(`/wallets/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
   // --- Tools ------------------------------------------------------------
   listTools: () =>

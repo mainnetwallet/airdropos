@@ -15,6 +15,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
+from eth_account import Account
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -144,6 +145,61 @@ class WalletService:
 
         logger.info("Imported wallet '%s' at %s (%s)", wallet_row.label, address, wallet_row.id)
         return wallet_row
+
+    async def create_wallet(
+        self,
+        *,
+        label: str,
+        chain_type: str = "EVM",
+        supported_networks: Optional[List[str]] = None,
+        notes: Optional[str] = None,
+    ) -> Wallet:
+        """Generate a brand-new EVM key and store it encrypted.
+
+        The key comes from `eth_account` (OS CSPRNG) and goes straight into the
+        AES-256-GCM vault. It is never returned, logged, or audited: the caller
+        only ever receives the public address. Because the secret cannot be read
+        back, the wallet is custodied by the vault and is not exportable.
+        """
+        if not label or not label.strip():
+            raise WalletValidationError("A wallet label is required.")
+        if chain_type.upper() != "EVM":
+            raise WalletValidationError(
+                f"Unsupported chain_type '{chain_type}'. Only EVM is supported."
+            )
+        networks = validate_networks(supported_networks)
+
+        account = Account.create()
+        try:
+            address = account.address.lower()
+            key_hex = account.key.hex()
+            # Newer hexbytes drops the 0x prefix; the vault treats an unprefixed
+            # secret as a mnemonic, so the prefix must be explicit.
+            if not key_hex.startswith("0x"):
+                key_hex = "0x" + key_hex
+            ciphertext, iv_b64, tag_b64 = self.vault.encrypt(key_hex)
+        finally:
+            key_hex = ""
+            del account
+
+        existing = await self.db.scalar(select(Wallet).where(Wallet.address == address))
+        if existing is not None:  # pragma: no cover - 2^-160 collision
+            raise WalletError("Generated address collided with an existing wallet; retry.")
+
+        row = Wallet(
+            label=label.strip()[:255],
+            address=address,
+            chain_type="EVM",
+            encrypted_secret=ciphertext,
+            encryption_iv=iv_b64,
+            encryption_tag=tag_b64,
+            supported_networks=networks,
+            notes=notes,
+        )
+        self.db.add(row)
+        await self.db.flush()
+        logger.info("Created wallet '%s' at %s (%s)", row.label, address, row.id)
+        return row
 
     async def watch_address(
         self,
