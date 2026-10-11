@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { RefreshCw, Search, Trash2, XCircle } from 'lucide-react'
 import { api } from '@/services/api'
 import {
+  Alert,
   Card,
   EmptyState,
   ErrorState,
@@ -193,6 +194,31 @@ export default function TaskManagerPage() {
                 </div>
               </div>
 
+              {detailQuery.data.status === 'NEEDS_USER_ACTION' && (
+                <Alert kind="warning" title="Operator action needed">
+                  <p>
+                    {detailQuery.data.blocker ??
+                      'The agent stopped because a human step is required.'}
+                  </p>
+                  {detailQuery.data.next_planned_action && (
+                    <p className="mt-1 font-medium">
+                      Next: {detailQuery.data.next_planned_action}
+                    </p>
+                  )}
+                  <p className="mt-1 text-[11px] opacity-80">
+                    Do the step yourself, then press Retry to let the agent continue.
+                  </p>
+                </Alert>
+              )}
+
+              {detailQuery.data.status !== 'NEEDS_USER_ACTION' &&
+                detailQuery.data.next_planned_action && (
+                  <p className="text-xs text-slate-400">
+                    <span className="font-semibold uppercase text-slate-500">Next: </span>
+                    {detailQuery.data.next_planned_action}
+                  </p>
+                )}
+
               <div className="grid grid-cols-2 gap-2 text-center">
                 <div className="rounded-lg bg-surface-200 p-2">
                   <p className="text-lg font-bold text-slate-100">{detailQuery.data.evidence_count}</p>
@@ -220,6 +246,23 @@ export default function TaskManagerPage() {
                   </ul>
                 )}
               </div>
+
+              {detailQuery.data.recent_events.length > 0 && (
+                <div>
+                  <p className="mb-1 text-xs font-semibold uppercase text-slate-500">Activity</p>
+                  <ul className="space-y-1.5">
+                    {detailQuery.data.recent_events.slice(0, 6).map((ev, i) => (
+                      <li key={i} className="text-xs text-slate-400">
+                        <span className="text-slate-500">
+                          {new Date(ev.at).toLocaleTimeString()}{' '}
+                        </span>
+                        <span className="text-slate-300">{ev.type.replace(/_/g, ' ')}</span>
+                        {ev.reason && <span className="block text-slate-500">{ev.reason}</span>}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               {detailQuery.data.transactions.length > 0 && (
                 <div>

@@ -62,6 +62,7 @@ export interface TaskReport {
   evidence_count: number
   error_details: Record<string, unknown>
   next_planned_action: string | null
+  blocker: string | null
   deadline_at: string | null
   next_execution_at: string | null
   last_updated: string | null
@@ -74,7 +75,7 @@ export interface TaskReport {
     error: string | null
     at: string
   }>
-  recent_events: Array<{ type: string; severity: string; at: string }>
+  recent_events: Array<{ type: string; severity: string; reason: string | null; at: string }>
   transactions: Array<{
     hash: string | null
     status: string

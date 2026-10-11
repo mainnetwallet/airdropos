@@ -317,6 +317,16 @@ class TaskManager:
             )
         ).scalars().all()
 
+        # Why the task is parked. The reason is stored on the status-transition
+        # event; surface it so the operator can see what they must do.
+        blocker: Optional[str] = None
+        if task.status == TaskStatus.NEEDS_USER_ACTION.value:
+            for e in events:  # newest first
+                payload = e.payload or {}
+                if e.event_type == "STATUS_TRANSITION" and payload.get("to") == task.status:
+                    blocker = str(payload.get("reason") or "") or None
+                    break
+
         pending = [
             a for a in (task.planned_actions or [])
             if not any(c.get("id") == a.get("id") for c in (task.completed_actions or []))
@@ -340,6 +350,7 @@ class TaskManager:
             "evidence_count": evidence_count,
             "error_details": task.error_details or {},
             "next_planned_action": task.next_planned_action,
+            "blocker": blocker,
             "deadline_at": task.deadline_at.isoformat() if task.deadline_at else None,
             "next_execution_at": task.next_execution_at.isoformat() if task.next_execution_at else None,
             "last_updated": task.updated_at.isoformat() if task.updated_at else None,
@@ -356,7 +367,12 @@ class TaskManager:
                 for e in executions
             ],
             "recent_events": [
-                {"type": e.event_type, "severity": e.severity, "at": e.created_at.isoformat()}
+                {
+                    "type": e.event_type,
+                    "severity": e.severity,
+                    "reason": str((e.payload or {}).get("reason") or "")[:500] or None,
+                    "at": e.created_at.isoformat(),
+                }
                 for e in events
             ],
             "transactions": [
