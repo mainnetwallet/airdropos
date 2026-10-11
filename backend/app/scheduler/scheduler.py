@@ -15,6 +15,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import settings
+from backend.app.database.session import AsyncSessionLocal
 from backend.app.models import AutomationSchedule, ScheduledRun
 from backend.app.security.emergency_stop import emergency_stop
 
@@ -82,13 +83,16 @@ class Scheduler:
         logger.info("Scheduler stopped")
 
     # ------------------------------------------------------------------
-    async def _loop(self, db: AsyncSession) -> None:
+    async def _loop(self, db: Optional[AsyncSession] = None) -> None:
+        # The loop outlives the session passed to start(), which the caller closes
+        # right away. Each tick therefore opens its own short-lived session.
         while self._running:
             try:
                 if not emergency_stop.can_run_jobs():
                     logger.debug("Scheduler idle: emergency stop active.")
                 else:
-                    await self._tick(db)
+                    async with AsyncSessionLocal() as session:
+                        await self._tick(session)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

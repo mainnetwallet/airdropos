@@ -23,18 +23,22 @@ Full step-by-step guide for Windows CMD, PowerShell, Ubuntu and VPS: **[RUNNING.
 ```bash
 git clone https://github.com/mainnetwallet/airdropos.git
 cd airdropos
-# Start PostgreSQL, Redis, and all services (if using docker-compose)
-./scripts/start_backend.sh
 
-# Run backend tests (passes)
-.venv/Scripts/python.exe -m pytest backend/tests/ -q
+# One command starts backend + worker + dashboard (Windows: py run.py)
+python run.py --set-password   # first time only: creates .env, sets your login password
+python run.py                  # start everything
 
-# Development frontend
-npm run dev
-
-# Production build
-npm run build
+# Or everything in Docker (recommended for a VPS)
+docker compose up -d --build
 ```
+
+Dashboard: http://localhost:5173 (`run.py`) or http://localhost:3000 (Docker). API docs: http://localhost:8000/docs
+
+```bash
+# Run backend tests
+python -m pytest backend/tests/ -q
+```
+
 
 ## Architecture
 
