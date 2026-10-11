@@ -138,37 +138,35 @@ def port_open(host: str, port: int) -> bool:
 
 
 def ensure_infra(env_vals: dict[str, str]) -> None:
-    """Make sure PostgreSQL and Redis are reachable; start them with Docker if local."""
-    targets = []
-    for name, default in (
-        ("DATABASE_URL", "postgresql+asyncpg://x@localhost:5432/x"),
-        ("REDIS_URL", "redis://localhost:6379/0"),
-    ):
-        url = urlparse(env_vals.get(name, default))
-        if url.scheme.startswith("sqlite"):
-            continue
-        targets.append((name, url.hostname or "localhost", url.port or (6379 if "redis" in url.scheme else 5432)))
+    """Make sure the database is reachable; start PostgreSQL with Docker if it is local.
 
-    missing = [t for t in targets if not port_open(t[1], t[2])]
-    if not missing:
+    SQLite needs nothing. Redis is not used by the code, so it is not checked.
+    """
+    url = urlparse(env_vals.get("DATABASE_URL", "postgresql+asyncpg://x@localhost:5432/x"))
+    if url.scheme.startswith("sqlite"):
+        return
+    host, port = url.hostname or "localhost", url.port or 5432
+    if port_open(host, port):
         return
 
-    local_only = all(host in ("localhost", "127.0.0.1", "::1") for _, host, _ in missing)
-    if local_only and shutil.which("docker"):
-        log("PostgreSQL/Redis not running. Starting them with Docker...")
-        run_checked(["docker", "compose", "up", "-d", "postgres", "redis"])
+    if host in ("localhost", "127.0.0.1", "::1") and shutil.which("docker"):
+        log("PostgreSQL is not running. Starting it with Docker...")
+        r = subprocess.run(["docker", "compose", "up", "-d", "postgres"], cwd=ROOT)
+        if r.returncode != 0:
+            die(
+                "Docker could not start PostgreSQL.\n"
+                "       - Open Docker Desktop and wait until it says 'Engine running', then run this command again.\n"
+                "       - Or run without Docker: py run.py --sqlite"
+            )
         deadline = time.time() + 60
         while time.time() < deadline:
-            missing = [t for t in missing if not port_open(t[1], t[2])]
-            if not missing:
+            if port_open(host, port):
                 time.sleep(2)  # let Postgres finish its first init
                 return
             time.sleep(1)
-    for name, host, port in missing:
-        print(f"[run] {name}: cannot reach {host}:{port}", file=sys.stderr)
     die(
-        "PostgreSQL and Redis must be running. Install Docker (then re-run this command), "
-        "or start them yourself, or use: docker compose up -d --build"
+        f"Cannot reach the database at {host}:{port}.\n"
+        "       Start Docker Desktop and run again, or run without Docker: py run.py --sqlite"
     )
 
 
@@ -250,6 +248,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run AirdropOS backend + worker + frontend.")
     ap.add_argument("--no-worker", action="store_true", help="do not start the background worker")
     ap.add_argument("--no-frontend", action="store_true", help="do not start the dashboard")
+    ap.add_argument("--sqlite", action="store_true", help="use a local SQLite file instead of PostgreSQL (no Docker needed); saved in .env")
     ap.add_argument("--no-infra", action="store_true", help="do not check/start PostgreSQL and Redis")
     ap.add_argument("--skip-install", action="store_true", help="skip pip/npm install steps")
     ap.add_argument("--update", action="store_true", help="git pull the newest commits, refresh dependencies, then start")
@@ -276,6 +275,9 @@ def main() -> None:
         set_password(env_file, hidden=args.hide_password)
         return
 
+    if args.sqlite:
+        set_env_value(env_file, "DATABASE_URL", "sqlite+aiosqlite:///./airdropos.db")
+        log("DATABASE_URL set to SQLite file ./airdropos.db (saved in .env).")
     env_vals = read_env(env_file)
     if not env_vals.get("OPERATOR_PASSWORD_HASH") and env_vals.get("AUTH_ENABLED", "true").lower() != "false":
         log("WARNING: OPERATOR_PASSWORD_HASH is empty in .env. Run: python run.py --set-password")

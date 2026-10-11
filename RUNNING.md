@@ -4,7 +4,7 @@ Two ways. Both start **backend + worker + frontend with one command.**
 
 | | Command | Needs |
 |---|---|---|
-| **A. Without Docker for the app** (Windows / Ubuntu) | `python run.py` | Python 3.10+, Node.js 20+, Docker (only for PostgreSQL + Redis) |
+| **A. Without Docker for the app** (Windows / Ubuntu) | `python run.py` | Python 3.10+, Node.js 20+, and either Docker Desktop (for PostgreSQL) **or** `--sqlite` (no Docker) |
 | **B. Docker** (Windows / Ubuntu / **VPS**) | `docker compose up -d --build` | Docker with Compose v2 |
 
 Clone first:
@@ -53,7 +53,7 @@ Edit `.env` once and set `LLM_API_KEY` (and `LLM_BASE_URL`, `LLM_MODEL_ID` if no
 ### What `run.py` does
 
 1. Creates `.env` (random keys) if missing.
-2. Starts PostgreSQL + Redis with Docker if they are not already running.
+2. Starts PostgreSQL with Docker if it is not already running (not needed with `--sqlite`).
 3. Creates `.venv`, installs Python packages, installs Playwright Chromium (first run only).
 4. Runs `npm install` for the dashboard (first run only).
 5. Initialises the database.
@@ -73,7 +73,8 @@ Options:
 | `--set-password` | Set the operator login password, then exit (password is shown while typing; add `--hide-password` to hide it) |
 | `--no-worker` | Do not start the background worker |
 | `--no-frontend` | Backend + worker only (no Node.js needed) |
-| `--no-infra` | Do not check/start PostgreSQL and Redis (use your own, or SQLite in `DATABASE_URL`) |
+| `--sqlite` | Use a local SQLite file (`airdropos.db`) instead of PostgreSQL, so Docker is not needed. Saved in `.env`, so you only pass it once |
+| `--no-infra` | Do not check/start PostgreSQL (use your own) |
 | `--skip-install` | Skip pip install |
 | `--reload` | Auto-reload backend on code changes (development) |
 | `--host 0.0.0.0` | Bind backend to all interfaces (default `127.0.0.1`) |
@@ -87,6 +88,16 @@ python run.py --update        # Windows: py run.py --update
 ```
 
 This runs `git pull --ff-only`, reinstalls Python and npm packages, and starts everything again. Your `.env` and data are not touched. If `git pull` refuses because you edited tracked files, run `git stash` (or commit your change) first.
+
+### No Docker (SQLite)
+
+If Docker Desktop is not installed or not running:
+
+```powershell
+py run.py --sqlite
+```
+
+This stores data in the file `airdropos.db` in the project folder and needs no Docker. SQLite is fine for one person on one PC. For a VPS or heavy use, use PostgreSQL (Docker method).
 
 ### First login
 
@@ -213,7 +224,7 @@ python -m pytest backend/tests/ -q
 | Problem | Fix |
 |---|---|
 | `Node.js/npm not found` | Install Node.js 20+ from https://nodejs.org, or use `--no-frontend` |
-| `PostgreSQL and Redis must be running` | Install Docker, or start them yourself, or use Method B |
+| `Docker could not start PostgreSQL` / `Cannot reach the database` | Start Docker Desktop and wait for "Engine running", or run `py run.py --sqlite` |
 | Cannot log in / bootstrap returns 503 | Run `python run.py --set-password` (Docker: set `OPERATOR_PASSWORD_HASH` in `.env`) |
 | `ModuleNotFoundError: backend` | Run from the repository root (the folder with `run.py`) |
 | `WALLET_VAULT_MASTER_KEY must be exactly 64 hex characters` | Use `openssl rand -hex 32` |
