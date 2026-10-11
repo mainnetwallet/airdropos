@@ -15,6 +15,7 @@ This document describes the deployment of the AirdropOS autonomous AI agent plat
 Run all services with a single command:
 
 ```bash
+git clone https://github.com/mainnetwallet/airdropos.git
 cd airdropos
 docker-compose up -d
 ```
@@ -228,7 +229,7 @@ cargo add package@new-version
 
 ## Changelog
 
-See [`CHANGELOG.md`](CHANGELOG.md) for version history.
+See [`CHANGELOG.md`](../CHANGELOG.md) for version history.
 
 ---
 

@@ -19,6 +19,7 @@ All requirements have been honored or the gap has been honestly documented.
 ## Quick Start
 
 ```bash
+git clone https://github.com/mainnetwallet/airdropos.git
 cd airdropos
 # Start PostgreSQL, Redis, and all services (if using docker-compose)
 ./scripts/start_backend.sh

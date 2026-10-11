@@ -30,7 +30,6 @@ RUN playwright install --with-deps chromium
 
 # Copy application source code
 COPY backend/ /app/backend/
-COPY airdropos/ /app/airdropos/ 2>/dev/null || true
 
 # Target: Backend API Server
 FROM base AS backend

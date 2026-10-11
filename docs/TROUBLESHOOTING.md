@@ -3,7 +3,7 @@
 ## Startup
 
 **`ModuleNotFoundError: No module named 'backend'`**
-Run from the `airdropos/` directory, not from inside `backend/`.
+Run from the repository root (the folder containing `backend/`), not from inside `backend/`.
 
 **`WALLET_VAULT_MASTER_KEY must be exactly 64 hex characters`**
 Generate one: `openssl rand -hex 32`.
