@@ -28,8 +28,12 @@ cd airdropos
 python run.py --set-password   # first time only: creates .env, sets your login password
 python run.py                  # start everything
 
+# Update to the newest commits
+python run.py --update
+
 # Or everything in Docker (recommended for a VPS)
 docker compose up -d --build
+git pull && docker compose up -d --build     # Docker update
 ```
 
 Dashboard: http://localhost:5173 (`run.py`) or http://localhost:3000 (Docker). API docs: http://localhost:8000/docs

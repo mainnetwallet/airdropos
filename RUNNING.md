@@ -69,6 +69,7 @@ Options:
 
 | Option | Meaning |
 |---|---|
+| `--update` | `git pull` the newest commits, refresh pip/npm packages, then start |
 | `--set-password` | Set the operator login password, then exit |
 | `--no-worker` | Do not start the background worker |
 | `--no-frontend` | Backend + worker only (no Node.js needed) |
@@ -76,6 +77,16 @@ Options:
 | `--skip-install` | Skip pip install |
 | `--reload` | Auto-reload backend on code changes (development) |
 | `--host 0.0.0.0` | Bind backend to all interfaces (default `127.0.0.1`) |
+
+### Update to the newest version (new commits)
+
+Stop the running app (Ctrl+C), then:
+
+```bash
+python run.py --update        # Windows: py run.py --update
+```
+
+This runs `git pull --ff-only`, reinstalls Python and npm packages, and starts everything again. Your `.env` and data are not touched. If `git pull` refuses because you edited tracked files, run `git stash` (or commit your change) first.
 
 ### First login
 
@@ -146,7 +157,11 @@ Useful:
 docker compose ps
 docker compose logs -f backend worker
 docker compose down                # stop (data is kept)
-git pull && docker compose up -d --build   # update
+```
+
+Update to the newest commits (Docker, VPS):
+```bash
+git pull && docker compose up -d --build
 ```
 
 ---

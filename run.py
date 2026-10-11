@@ -93,6 +93,24 @@ def set_password(env_file: Path) -> None:
     log("Saved OPERATOR_PASSWORD_HASH to .env. Log in with OPERATOR_EMAIL and this password.")
 
 
+def update_code() -> None:
+    """git pull the newest commits, then restart this script so new code and deps are used."""
+    git = shutil.which("git")
+    if not git:
+        die("git not found. Install git first.")
+    if not (ROOT / ".git").exists():
+        die("This folder is not a git clone, so it cannot be updated with git pull.")
+    log("Updating: git pull --ff-only")
+    run_checked([git, "pull", "--ff-only"])
+    cmd = [sys.executable, str(ROOT / "run.py")] + [a for a in sys.argv[1:] if a != "--update"]
+    log("Update done. Refreshing dependencies and starting...")
+    env = {**os.environ, "AIRDROPOS_UPDATED": "1"}
+    try:
+        sys.exit(subprocess.run(cmd, cwd=ROOT, env=env).returncode)
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+
 def run_checked(cmd: list[str], cwd: Path = ROOT, env: dict | None = None) -> None:
     log("$ " + " ".join(cmd))
     result = subprocess.run(cmd, cwd=cwd, env=env)
@@ -148,7 +166,11 @@ def ensure_python_env(skip_install: bool) -> None:
         log("Creating virtual environment (.venv)...")
         run_checked([sys.executable, "-m", "venv", str(VENV)])
     req = ROOT / "backend" / "requirements.txt"
-    stale = not STAMP.exists() or STAMP.stat().st_mtime < req.stat().st_mtime
+    stale = (
+        not STAMP.exists()
+        or STAMP.stat().st_mtime < req.stat().st_mtime
+        or bool(os.environ.get("AIRDROPOS_UPDATED"))
+    )
     if stale and not skip_install:
         log("Installing Python dependencies (first run takes a few minutes)...")
         run_checked([str(VENV_PY), "-m", "pip", "install", "-q", "--upgrade", "pip"])
@@ -164,7 +186,7 @@ def ensure_node() -> str:
     npm = shutil.which("npm")
     if not npm:
         die("Node.js/npm not found. Install Node.js 20+ from https://nodejs.org, or run with --no-frontend.")
-    if not (FRONTEND / "node_modules").exists():
+    if not (FRONTEND / "node_modules").exists() or os.environ.get("AIRDROPOS_UPDATED"):
         log("Installing frontend dependencies (npm install)...")
         run_checked([npm, "install"], cwd=FRONTEND)
     return npm
@@ -219,6 +241,7 @@ def main() -> None:
     ap.add_argument("--no-frontend", action="store_true", help="do not start the dashboard")
     ap.add_argument("--no-infra", action="store_true", help="do not check/start PostgreSQL and Redis")
     ap.add_argument("--skip-install", action="store_true", help="skip pip/npm install steps")
+    ap.add_argument("--update", action="store_true", help="git pull the newest commits, refresh dependencies, then start")
     ap.add_argument("--set-password", action="store_true", help="set the operator login password in .env, then exit")
     ap.add_argument("--host", default="127.0.0.1", help="backend bind address (default 127.0.0.1)")
     ap.add_argument("--reload", action="store_true", help="auto-reload backend on code changes")
@@ -226,6 +249,9 @@ def main() -> None:
 
     if sys.version_info < (3, 10):
         die("Python 3.10+ is required (3.11 recommended).")
+
+    if args.update and not os.environ.get("AIRDROPOS_UPDATED"):
+        update_code()
 
     env_file = ROOT / ".env"
     if not env_file.exists():
