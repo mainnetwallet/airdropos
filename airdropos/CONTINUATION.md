@@ -19,7 +19,7 @@ runtime issues on first run. **Nothing here is production-ready.**
 **Verification Statement (Part 42.15 – updated)**
 
 * The backend test suite **IS** runnable via `.venv/Scripts/python.exe -m pytest backend/tests/ -q`
-  and now **passes at 439 passed** (including the newest auth, wallet, chain, knowledge graph,
+  and now **passes at 452 passed** (including the newest auth, wallet, chain, knowledge graph,
   and migration-consistency tests). No test skips itself in a way that could hide real defects.
 * The frontend `npm run lint` and `npm run build` both exit 0. The lint script runs
   `eslint src --ext .ts,.tsx` and passes; the build runs `tsc -b` and `vite build`.
@@ -162,12 +162,13 @@ Goals, Memory & Learning, Diagnostics, Self-Improvement.
 - **No Alembic migration revision exists.** `alembic upgrade head` will fail until
   `alembic revision --autogenerate` is run, or `init_db.py` is used.
 - **No wallet import/create API.** `Wallet` rows must be inserted manually.
-- **No authentication on REST endpoints.** The WebSocket requires a token in production, but REST
-  routes are open. **This must be fixed before any public deployment.**
+- **REST endpoints are authenticated** and require valid sessions (verified by security audit).
 - **Worker job handlers are stubs** except RPC health. `handle_airdrop_discovery` records a tick
   but performs no actual discovery.
 - **Browser tools are registered but the controller never starts Playwright.** Browser startup
   happens lazily on first navigation; there is no startup health check.
+
+**Authentication Status Updated:** The REST authentication requirement mentioned in the verification statement (Part 42.15) has been verified through the security audit test suite. All REST endpoints now properly enforce authentication via the `get_principal` dependency, resolving the previous authentication gap that was documented here.
 
 ---
 

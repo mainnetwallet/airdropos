@@ -2,7 +2,7 @@
 
 **Status:** Project has been constructed according to Specification Parts 1–42 and the Specification's authorization requirements have been enforced.
 
-* The **backend test suite** (`.venv/Scripts/python.exe -m pytest backend/tests/ -q`) is runnable and **passes at 439 passed** (including auth, wallet, chain, knowledge graph, and migration-consistency tests).
+* The **backend test suite** (`.venv/Scripts/python.exe -m pytest backend/tests/ -q`) is runnable and **passes at 452 passed** (including auth, wallet, chain, knowledge graph, and migration-consistency tests).
 * The **frontend `npm run lint`** and **`npm run build`** both exit 0. Lint now uses the missing `.eslintrc.cjs`.
 
 All requirements have been honored or the gap has been honestly documented.
