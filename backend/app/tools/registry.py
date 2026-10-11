@@ -210,7 +210,7 @@ class ToolRegistry:
                     "name": tool.name,
                     "description": tool.description,
                     "input_schema": tool.input_schema,
-                    "required_permissions": tool.required_permissions,
+                    "required_permissions": list(tool.required_permissions),
                     "side_effect": tool.side_effect.value,
                 }
             )
