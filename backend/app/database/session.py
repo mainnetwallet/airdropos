@@ -8,7 +8,8 @@ from typing import AsyncGenerator
 import uuid
 
 from sqlalchemy import DateTime
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -18,13 +19,29 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from backend.app.core.config import settings
 
-# Initialize async engine
+
+
+@compiles(JSONB, "sqlite")
+def _render_jsonb_as_json_on_sqlite(type_, compiler, **kw):
+    """Models use PostgreSQL JSONB. SQLite (run.py --sqlite) has no JSONB, so use JSON there.
+
+    Registered explicitly because not every SQLAlchemy version does this fallback itself.
+    """
+    return "JSON"
+
+
+_IS_SQLITE = settings.DATABASE_URL.startswith("sqlite")
+
+# Initialize async engine. SQLite uses its own pool, which rejects pool_size/max_overflow.
+_engine_kwargs = {} if _IS_SQLITE else {
+    "pool_size": settings.DB_POOL_SIZE,
+    "max_overflow": settings.DB_MAX_OVERFLOW,
+}
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.LOG_LEVEL.upper() == "DEBUG",
-    pool_size=settings.DB_POOL_SIZE,
-    max_overflow=settings.DB_MAX_OVERFLOW,
     pool_pre_ping=True,
+    **_engine_kwargs,
 )
 
 # Async session factory
