@@ -15,52 +15,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.app.api.v1.router import api_router
-from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
 from backend.app.security.emergency_stop import emergency_stop
-from backend.app.tools.blockchain_tools import register_blockchain_tools
-from backend.app.tools.browser_tools import register_browser_tools
-from backend.app.tools.notification_tools import register_notification_tools
-from backend.app.tools.registry import AuthorizationPolicy, registry
-from backend.app.tools.web_tools import register_web_tools
+from backend.app.tools.bootstrap import bootstrap_tools
+from backend.app.tools.registry import registry  # noqa: F401  (re-exported for callers)
 
 logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("airdropos.api")
-
-
-def bootstrap_tools() -> None:
-    """Register every tool the agent may invoke, then apply authorization.
-
-    Permissions are granted by the operator at startup. The agent cannot grant
-    itself access to anything not listed here.
-    """
-    register_web_tools(registry)
-    register_blockchain_tools(registry)
-    register_browser_tools(registry)
-    register_notification_tools(registry)
-
-    registry.policy = AuthorizationPolicy(
-        enabled_permissions=[
-            "web.read",
-            "blockchain.read",
-            "browser.read",
-            "browser.navigate",
-            "browser.interact",
-            "notify.send",
-            "report.generate",
-            "social.read",
-        ],
-        allowed_networks=known_networks(),
-        allow_web_interaction=True,
-        # Value-moving permissions are intentionally NOT granted by default.
-        # Enabling them is an explicit operator decision.
-        allow_transaction_submission=False,
-        allow_wallet_signing=False,
-    )
-    logger.info("Registered %s tools with restricted authorization policy", len(registry._tools))
 
 
 @asynccontextmanager

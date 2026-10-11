@@ -144,6 +144,16 @@ class Settings(BaseSettings):
     TELEGRAM_AUTHORIZED_USER_IDS: List[int] = Field(default=[])
     TELEGRAM_WEBHOOK_URL: Optional[str] = None
 
+    # Telegram USER client (the agent acts through the operator's own Telegram
+    # account: joins channels, starts bots, clicks buttons). Off by default.
+    # Create the session once with:  python scripts/telegram_login.py
+    TELEGRAM_USER_ENABLED: bool = False
+    TELEGRAM_API_ID: Optional[int] = None
+    TELEGRAM_API_HASH: Optional[str] = None
+    TELEGRAM_SESSION_PATH: str = "./data/telegram/agent"
+    TELEGRAM_USER_MIN_ACTION_DELAY_SECONDS: float = 3.0
+    TELEGRAM_USER_DAILY_ACTION_LIMIT: int = 60
+
     DISCORD_BOT_TOKEN: Optional[str] = None
     DISCORD_AUTHORIZED_USER_IDS: List[int] = Field(default=[])
     DISCORD_MONITORED_CHANNELS: List[str] = Field(default=[])

@@ -30,6 +30,7 @@ playwright>=1.44.0
 
 # Social Integrations
 python-telegram-bot>=21.1.1
+telethon>=1.36.0
 
 # HTML & Content Parsing
 beautifulsoup4>=4.12.3

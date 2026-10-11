@@ -29,6 +29,7 @@ from backend.app.scheduler.scheduler import DEFAULT_JOBS, scheduler
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
+from backend.app.tools.bootstrap import bootstrap_tools
 from backend.app.tools.registry import registry
 
 logging.basicConfig(
@@ -356,6 +357,9 @@ async def recover_interrupted_tasks() -> int:
 # Lifecycle
 # ----------------------------------------------------------------------
 async def main() -> None:
+    # The worker is its own process with its own (initially empty) tool registry.
+    # Without this, every planned step ran with no tools.
+    bootstrap_tools()
     logger.info("=" * 70)
     logger.info("AirdropOS Worker %s starting", WORKER_ID)
     logger.info("Fixed model: %s at %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
