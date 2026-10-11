@@ -79,14 +79,15 @@ def create_env_file(env_file: Path) -> None:
 MIN_PASSWORD_LEN = 4  # must match hash_password() in backend/app/security/auth.py
 
 
-def set_password(env_file: Path) -> None:
+def set_password(env_file: Path, hidden: bool = False) -> None:
+    ask = getpass.getpass if hidden else input
     pw = ""
     for _ in range(3):
-        pw = getpass.getpass(f"New operator password (at least {MIN_PASSWORD_LEN} characters): ")
+        pw = ask(f"New operator password (at least {MIN_PASSWORD_LEN} characters): ")
         if len(pw) < MIN_PASSWORD_LEN:
             print(f"[run] Too short: use at least {MIN_PASSWORD_LEN} characters. Try again.", flush=True)
             continue
-        if pw != getpass.getpass("Repeat password: "):
+        if pw != ask("Repeat password: "):
             print("[run] Passwords do not match. Try again.", flush=True)
             continue
         break
@@ -253,6 +254,7 @@ def main() -> None:
     ap.add_argument("--skip-install", action="store_true", help="skip pip/npm install steps")
     ap.add_argument("--update", action="store_true", help="git pull the newest commits, refresh dependencies, then start")
     ap.add_argument("--set-password", action="store_true", help="set the operator login password in .env, then exit")
+    ap.add_argument("--hide-password", action="store_true", help="with --set-password: do not show the password while typing")
     ap.add_argument("--host", default="127.0.0.1", help="backend bind address (default 127.0.0.1)")
     ap.add_argument("--reload", action="store_true", help="auto-reload backend on code changes")
     args = ap.parse_args()
@@ -271,7 +273,7 @@ def main() -> None:
 
     if args.set_password:
         ensure_python_env(args.skip_install)
-        set_password(env_file)
+        set_password(env_file, hidden=args.hide_password)
         return
 
     env_vals = read_env(env_file)

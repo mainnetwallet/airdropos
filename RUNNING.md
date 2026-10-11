@@ -70,7 +70,7 @@ Options:
 | Option | Meaning |
 |---|---|
 | `--update` | `git pull` the newest commits, refresh pip/npm packages, then start |
-| `--set-password` | Set the operator login password, then exit |
+| `--set-password` | Set the operator login password, then exit (password is shown while typing; add `--hide-password` to hide it) |
 | `--no-worker` | Do not start the background worker |
 | `--no-frontend` | Backend + worker only (no Node.js needed) |
 | `--no-infra` | Do not check/start PostgreSQL and Redis (use your own, or SQLite in `DATABASE_URL`) |
