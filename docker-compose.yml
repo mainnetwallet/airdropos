@@ -97,7 +97,7 @@ services:
     container_name: airdropos_frontend
     restart: unless-stopped
     ports:
-      # Reachable on all interfaces by default (RUNNING.md VPS setup). The UI is plain HTTP, so
+      # Reachable on all interfaces by default (DEVELOPMENT.md VPS setup). The UI is plain HTTP, so
       # prefer FRONTEND_BIND=127.0.0.1 in .env with a TLS reverse proxy or an SSH tunnel.
       - "${FRONTEND_BIND:-0.0.0.0}:3000:80"
     depends_on:

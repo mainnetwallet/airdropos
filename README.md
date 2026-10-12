@@ -18,7 +18,7 @@ All requirements have been honored or the gap has been honestly documented.
 
 ## Quick Start
 
-Full step-by-step guide for Windows CMD, PowerShell, Ubuntu and VPS: **[RUNNING.md](RUNNING.md)**
+Full step-by-step guide for Windows CMD, PowerShell, Ubuntu and VPS: **[DEVELOPMENT.md](DEVELOPMENT.md)**
 
 ```bash
 git clone https://github.com/mainnetwallet/airdropos.git

@@ -12,7 +12,7 @@ This document describes the deployment of the AirdropOS autonomous AI agent plat
 
 ## Quick Start (Docker)
 
-Without Docker for the app, a single `python run.py` starts backend, worker and dashboard. See [`RUNNING.md`](../RUNNING.md) for Windows, Ubuntu and VPS steps.
+Without Docker for the app, a single `python run.py` starts backend, worker and dashboard. See [`DEVELOPMENT.md`](../DEVELOPMENT.md) for Windows, Ubuntu and VPS steps.
 
 Run all services with a single command:
 
