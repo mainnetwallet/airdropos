@@ -42,7 +42,7 @@ python3 run.py
 
 What the two commands do:
 
-1. **`run.py --set-password`** (once): creates `.env` with fresh random `SECRET_KEY` and `WALLET_VAULT_MASTER_KEY`, installs Python packages, asks for your login password (at least 12 characters) and saves its hash into `.env`.
+1. **`run.py --set-password`** (once): creates `.env` with fresh random `SECRET_KEY` and `WALLET_VAULT_MASTER_KEY`, installs Python packages, asks for your login password (at least 4 characters) and saves its hash into `.env`.
 2. **`run.py`**: starts everything.
 
 After the first time, you only ever run `python run.py` (Windows: `py run.py`).

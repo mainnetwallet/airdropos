@@ -226,7 +226,7 @@ def test_websocket_refused_in_production_when_auth_disabled(ws_client, monkeypat
 # 5. Password validation and hashing
 # ======================================================================
 def test_short_passwords_are_rejected():
-    for pw in ("", "abcd", "x" * (MIN_PASSWORD_LENGTH - 1)):
+    for pw in ("", "abc", "x" * (MIN_PASSWORD_LENGTH - 1)):
         with pytest.raises(ValueError):
             hash_password(pw)
 

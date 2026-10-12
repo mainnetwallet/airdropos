@@ -81,7 +81,7 @@ def create_env_file(env_file: Path) -> None:
     set_env_value(env_file, "DATABASE_URL", f"postgresql+asyncpg://airdropos:{db_password}@localhost:5432/airdropos_db")
 
 
-MIN_PASSWORD_LEN = 12  # must match MIN_PASSWORD_LENGTH in backend/app/security/auth.py
+MIN_PASSWORD_LEN = 4  # must match MIN_PASSWORD_LENGTH in backend/app/security/auth.py
 
 
 def set_password(env_file: Path, hidden: bool = False) -> None:
