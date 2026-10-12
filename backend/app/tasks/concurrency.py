@@ -146,12 +146,22 @@ class LeaseManager:
     async def break_stale_leases(self, limit: int = 100) -> Dict[str, int]:
         """Recover tasks abandoned by dead workers.
 
-        A task with a completed irreversible step is NOT auto-resumed. Its step
-        may already have moved value, and blind resubmission is exactly what
-        this system must never do. Such tasks are parked for operator review.
+        A task whose side effect may have happened is NOT auto-resumed: a transact step that was
+        running or completed, or an interact step that was running, has an unknown real-world
+        outcome, and blind resubmission is exactly what this system must never do. Such tasks are
+        parked as NEEDS_USER_ACTION for operator review. Everything else is bounded by
+        ``max_retries``. Status changes go through ``TaskManager.transition`` so they are
+        validated and leave an audit event.
+
+        Not currently scheduled: worker start-up recovery (``recover_interrupted_tasks``) covers
+        crashes. If this is ever wired to a timer, the lease TTL must comfortably exceed the longest
+        single step, or a live run could be broken.
         """
+        from backend.app.tasks.manager import TaskManager
+
+        manager = TaskManager(self.db)
         stale = await self.find_stale_leases(limit)
-        recovered, parked = 0, 0
+        recovered, parked, failed = 0, 0, 0
 
         for lease in stale:
             task = await self.db.get(Task, lease.task_id)
@@ -161,7 +171,7 @@ class LeaseManager:
                 await self.db.flush()
                 continue
 
-            has_irreversible_completed = await self._has_completed_irreversible(task)
+            uncertain = await self._uncertain_side_effects(task)
 
             lease.released_at = self._now()
             lease.broken_reason = (
@@ -169,42 +179,70 @@ class LeaseManager:
             )
             await self.db.flush()
 
-            if has_irreversible_completed:
-                task.status = TaskStatus.NEEDS_USER_ACTION.value
-                task.next_planned_action = (
-                    "Reconcile an irreversible step that was in flight when the worker died. "
-                    "Verify on-chain state before any further action."
+            if task.status != TaskStatus.IN_PROGRESS.value:
+                # Only a task that was executing is abandoned. RETRYING/READY/parked/terminal
+                # tasks just had a leftover lease released; do not consume another retry.
+                logger.debug("Stale lease on %s in state %s; released only", task.task_id, task.status)
+                continue
+
+            if uncertain:
+                # Copy: the JSONB column has no mutation tracking, so editing the stored dict in
+                # place would not be persisted.
+                details = dict(task.error_details or {})
+                details["lease_recovery"] = (
+                    "Stale lease broken while a side-effecting step may have been in flight. "
+                    f"Parked for operator review to prevent duplicate execution. {uncertain}"
+                )[:900]
+                await manager.transition(
+                    task,
+                    TaskStatus.NEEDS_USER_ACTION,
+                    reason=f"stale lease broken. {uncertain}"[:500],
+                    progress=task.progress,
+                    error_details=details,
+                    next_planned_action=(
+                        "Operator: verify the outcome of the interrupted step (check on-chain "
+                        "state / the target site) before any further action."
+                    ),
                 )
-                error = task.error_details or {}
-                error["lease_recovery"] = (
-                    "Stale lease broken, but an irreversible step had already completed. "
-                    "Parked for operator review to prevent duplicate submission."
-                )
-                task.error_details = error
                 parked += 1
-                logger.warning(
-                    "Task %s parked for operator review: irreversible step completed under a stale lease.",
-                    task.task_id,
+                logger.warning("Task %s parked for operator review under a stale lease.", task.task_id)
+            elif task.retry_count < task.max_retries:
+                await manager.transition(
+                    task, TaskStatus.RETRYING,
+                    reason=f"stale lease held by '{lease.worker_id}' broken",
+                    progress=task.progress,
                 )
-            elif task.status in (TaskStatus.IN_PROGRESS.value, TaskStatus.RETRYING.value):
-                task.status = TaskStatus.RETRYING.value
-                task.retry_count += 1
                 recovered += 1
                 logger.info(
                     "Recovered task %s from stale lease held by '%s' (attempt %s)",
                     task.task_id, lease.worker_id, task.retry_count,
                 )
             else:
-                logger.debug("Stale lease on %s in terminal state %s; no action", task.task_id, task.status)
+                await manager.transition(
+                    task, TaskStatus.FAILED,
+                    reason="stale lease broken (retries exhausted)",
+                    progress=task.progress,
+                )
+                failed += 1
 
             await self.db.flush()
 
-        if recovered or parked:
-            logger.info("Lease recovery complete: %s recovered, %s parked", recovered, parked)
-        return {"recovered": recovered, "parked_for_review": parked, "stale_found": len(stale)}
+        if recovered or parked or failed:
+            logger.info(
+                "Lease recovery complete: %s recovered, %s parked, %s failed", recovered, parked, failed
+            )
+        return {
+            "recovered": recovered,
+            "parked_for_review": parked,
+            "failed": failed,
+            "stale_found": len(stale),
+        }
 
-    async def _has_completed_irreversible(self, task: Task) -> bool:
-        """True when the current plan has a completed transact step."""
+    async def _uncertain_side_effects(self, task: Task) -> Optional[str]:
+        """Describe steps whose real-world outcome is unknown, or None when it is safe to retry.
+
+        transact: running or completed. interact: running. Read-only steps never block recovery.
+        """
         plan = await self.db.scalar(
             select(ExecutionPlan).where(
                 ExecutionPlan.task_id == task.id,
@@ -212,11 +250,15 @@ class LeaseManager:
             )
         )
         if plan is None:
-            return False
-        return any(
-            raw.get("kind") == "transact" and raw.get("status") == "completed"
-            for raw in (plan.steps or [])
-        )
+            return None
+        found: List[str] = []
+        for raw in plan.steps or []:
+            kind, status = raw.get("kind"), raw.get("status")
+            if (kind == "transact" and status in ("running", "completed")) or (
+                kind == "interact" and status == "running"
+            ):
+                found.append(f"step {raw.get('index')} ({kind}) was {status}")
+        return "; ".join(found) if found else None
 
     # ------------------------------------------------------------------
     async def reconcile_transactions(self) -> Dict[str, Any]:
