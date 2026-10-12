@@ -56,6 +56,56 @@ class RpcError(ChainError):
         super().__init__(message, category=category)
 
 
+class RpcAuthError(RpcError):
+    """The endpoint rejected our credentials (HTTP 401/403).
+
+    Split out from a generic transport failure because the operator action is
+    different: an unreachable node is retried, a rejected key is not. It was
+    silently flattened into "connection failed", which made a missing or
+    expired RPC key look like an outage.
+    """
+
+    def __init__(self, message: str, category: str = "RPC_AUTH") -> None:
+        super().__init__(message, category=category)
+
+
+class RpcRateLimited(RpcError):
+    """The provider is throttling us (HTTP 429). Retryable, unlike an auth failure."""
+
+    def __init__(self, message: str, category: str = "RPC_RATE_LIMITED") -> None:
+        super().__init__(message, category=category)
+
+
+def classify_rpc_http_status(status_code: int, network: str) -> Optional[RpcError]:
+    """Turn an HTTP status into a categorised error, or None when the status is fine.
+
+    Shared by the chain adapter and the transaction engine so both report the same
+    category for the same condition. The endpoint URL is never included: it usually
+    carries the provider API key.
+    """
+    if status_code < 400:
+        return None
+    if status_code in (401, 403):
+        return RpcAuthError(
+            f"RPC endpoint for '{network}' rejected the credentials (HTTP {status_code}). "
+            f"The configured endpoint requires a valid API key; check the RPC_* setting for "
+            f"'{network}'. This is a configuration problem, not a transient outage.",
+        )
+    if status_code == 429:
+        return RpcRateLimited(
+            f"RPC provider for '{network}' is rate limiting this client (HTTP 429).",
+        )
+    if status_code >= 500:
+        return RpcError(
+            f"RPC endpoint for '{network}' returned HTTP {status_code}.",
+            category="RPC_SERVER_ERROR",
+        )
+    return RpcError(
+        f"RPC endpoint for '{network}' returned HTTP {status_code}.",
+        category="RPC_HTTP_ERROR",
+    )
+
+
 @dataclass(frozen=True)
 class EvmChain:
     """An EVM-compatible chain the platform knows how to read.
@@ -232,12 +282,24 @@ class EvmChainAdapter:
         try:
             client = await self._get_client()
             response = await client.post(url, json=payload)
-            body = response.json()
         except Exception as exc:
             # The endpoint URL is not echoed: it usually carries an API key.
             raise RpcError(
                 f"RPC call '{method}' to '{self.chain.name}' failed: {type(exc).__name__}",
                 category="RPC_FAILURE",
+            ) from exc
+
+        http_error = classify_rpc_http_status(response.status_code, self.chain.name)
+        if http_error is not None:
+            raise http_error
+
+        try:
+            body = response.json()
+        except Exception as exc:
+            raise RpcError(
+                f"RPC endpoint for '{self.chain.name}' returned a non-JSON body for {method} "
+                f"(HTTP {response.status_code}).",
+                category="RPC_MALFORMED",
             ) from exc
 
         if not isinstance(body, dict):

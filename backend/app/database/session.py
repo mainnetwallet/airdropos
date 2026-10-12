@@ -3,6 +3,7 @@
 Provides SQLAlchemy 2.0 AsyncEngine, async_sessionmaker, and dependency injection helpers.
 """
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import AsyncGenerator
 import uuid
@@ -106,6 +107,21 @@ class Base(DeclarativeBase):
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding an async database session with automatic cleanup."""
+    async with session_scope() as session:
+        yield session
+
+
+@asynccontextmanager
+async def session_scope() -> AsyncGenerator[AsyncSession, None]:
+    """A committed-on-success, rolled-back-on-error session for non-request code.
+
+    Registered tools run in two different processes (the API when the operator chats,
+    the worker when it executes a task) and are invoked from contexts that already
+    hold a session - the agent controller's loop, for instance. Handing them that
+    session would mean two coroutines sharing one transaction, which is exactly the
+    concurrency fault the diagnostics watchdog used to trip over. Tools therefore
+    take a short-lived session of their own.
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session

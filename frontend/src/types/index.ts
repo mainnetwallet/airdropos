@@ -97,6 +97,61 @@ export interface AgentInfo {
   policy: string
 }
 
+/**
+ * One tool the agent actually ran, as reported by the backend.
+ *
+ * Every field here came from a real `ToolRegistry.invoke` call: the status is the
+ * result status, `data` is the service's own output, and `evidence` is whatever the
+ * tool attached. The UI renders this rather than deciding for itself what happened.
+ */
+export interface AgentToolCall {
+  tool: string
+  status: 'success' | 'failure' | 'needs_user_action' | 'not_authorized' | 'unavailable'
+  arguments: Record<string, unknown>
+  data: Record<string, unknown>
+  error?: string
+  error_category?: string
+  retryable?: boolean
+  duration_ms: number
+  evidence?: { authoritative?: boolean; kind?: string } & Record<string, unknown>
+}
+
+/** A value-moving operation that is prepared but still needs the operator. */
+export interface AgentApprovalRequest {
+  proposal_id: string
+  kind: string
+  network: string
+  chain_id: number
+  wallet: string
+  to: string
+  asset: string
+  amount: string
+  estimated_fee_native: string
+  warnings: string[]
+  approval_fields: Record<string, unknown>
+  state: string
+}
+
+export interface AgentChatResponse {
+  reply: string
+  tool_calls: AgentToolCall[]
+  task: {
+    task_id: string
+    status: string
+    title: string
+    priority: number
+    worker_will_execute?: boolean
+  } | null
+  approvals_required: AgentApprovalRequest[]
+  blockers: string[]
+  needs_user_action: string[]
+  verified: Array<{ tool: string; evidence: Record<string, unknown> }>
+  usage: Record<string, number>
+  model?: string
+  truncated: boolean
+  note?: string
+}
+
 export interface ToolDescriptor {
   name: string
   version: string

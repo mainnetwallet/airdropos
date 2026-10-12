@@ -580,13 +580,37 @@ class TestSubmitRawGuards:
         assert eng.daily_spend_usd == 0.0
 
     def test_no_tool_or_api_exposes_submit_raw_without_authorization(self):
-        """submit_raw's only callers must be explicit; nothing in app/ calls it today."""
+        """Every caller of submit_raw must supply a SubmissionAuthorization.
+
+        The original assertion was "nothing in app/ calls it". That is no longer the
+        invariant worth protecting: the transfer tool deliberately calls it, which is
+        the capability the engine existed to be called through. What must stay true is
+        that no caller can reach the RPC with a hand-rolled payload and no
+        authorization - so the test now checks the *shape* of every call site.
+        """
+        import ast
         import pathlib
 
         offenders = []
+        callers = []
         for path in pathlib.Path(REPO_ROOT, "backend", "app").rglob("*.py"):
             if path.name == "engine.py":
                 continue
-            if ".submit_raw(" in path.read_text(encoding="utf-8"):
-                offenders.append(str(path))
+            source = path.read_text(encoding="utf-8")
+            if ".submit_raw(" not in source:
+                continue
+            callers.append(str(path))
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (isinstance(func, ast.Attribute) and func.attr == "submit_raw"):
+                    continue
+                if not any(kw.arg == "authorization" for kw in node.keywords):
+                    offenders.append(f"{path}:{node.lineno} (no authorization= keyword)")
+
+        # The tool registry and the transfer tool are the only sanctioned callers.
         assert offenders == []
+        assert len(callers) == 1, f"unexpected submit_raw call sites: {callers}"
+        assert callers[0].endswith("transfer_tools.py")

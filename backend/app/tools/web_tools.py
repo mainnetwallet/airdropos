@@ -105,6 +105,69 @@ def extract_dates(text: str) -> List[str]:
     return [m.group(0) for m in DATE_PATTERN.finditer(text)]
 
 
+def http_error_result(url: str, status_code: int, retryable: Optional[bool] = None) -> ToolResult:
+    """Turn an HTTP status into a categorised, actionable tool failure.
+
+    `site_search` and `read_documentation` previously called `raise_for_status()`
+    inside a bare `except Exception`, so every HTTP status collapsed into
+    `NETWORK_ERROR` with `retryable=True`. A 403 from an anti-bot-protected source
+    (CoinGecko's airdrop page is one) is permanent: retrying it just burns the
+    retry budget and then the task is reported as "network trouble" when the real
+    cause is that the source refuses automated access. The category now says which.
+    """
+    if status_code in (401, 403):
+        category, default_retryable = "SOURCE_FORBIDDEN", False
+    elif status_code == 429:
+        category, default_retryable = "SOURCE_RATE_LIMITED", True
+    elif status_code == 404 or status_code == 410:
+        category, default_retryable = "SOURCE_NOT_FOUND", False
+    elif status_code >= 500:
+        category, default_retryable = "SOURCE_SERVER_ERROR", True
+    else:
+        category, default_retryable = "SOURCE_HTTP_ERROR", False
+    return ToolResult.failure(
+        f"HTTP {status_code} fetching {url}",
+        category=category,
+        retryable=default_retryable if retryable is None else retryable,
+        evidence={
+            "authoritative": True,
+            "kind": "http_status",
+            "status_code": status_code,
+        },
+    )
+
+
+async def _guarded_html_fetch(url: str, timeout: float) -> tuple[Optional[str], Optional[ToolResult]]:
+    """Fetch `url` through the SSRF-guarded client and return the raw HTML.
+
+    Returns `(html, None)` on success or `(None, failure)` on any HTTP or transport
+    problem, with the status classified by :func:`http_error_result` instead of being
+    flattened into a generic network error.
+    """
+    try:
+        response = await guarded_get(url, timeout)
+    except DestinationBlocked as exc:
+        return None, ToolResult.failure(
+            f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False
+        )
+    except httpx.TooManyRedirects as exc:
+        return None, ToolResult.failure(
+            f"Redirect loop: {exc}", category="REDIRECT_LOOP", retryable=False
+        )
+    except httpx.TimeoutException:
+        return None, ToolResult.failure(
+            f"Timeout fetching {url}", category="NETWORK_TIMEOUT", retryable=True
+        )
+    except httpx.HTTPError as exc:
+        return None, ToolResult.failure(
+            f"Fetch failed: {type(exc).__name__}", category="NETWORK_ERROR", retryable=True
+        )
+
+    if response.status_code >= 400:
+        return None, http_error_result(url, response.status_code)
+    return response.text, None
+
+
 class WebFetchTool(BaseTool):
     """Fetch a URL and return its text content with provenance."""
 
@@ -129,33 +192,20 @@ class WebFetchTool(BaseTool):
         if parsed.scheme not in ("http", "https"):
             return ToolResult.failure(f"Unsupported URL scheme: {parsed.scheme}", "INVALID_INPUT")
 
-        try:
-            response = await guarded_get(url, self.timeout_seconds)
-        except DestinationBlocked as exc:
-            return ToolResult.failure(f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False)
-        except httpx.TooManyRedirects as exc:
-            return ToolResult.failure(f"Redirect loop: {exc}", category="REDIRECT_LOOP", retryable=False)
-        except httpx.TimeoutException:
-            return ToolResult.failure(f"Timeout fetching {url}", category="NETWORK_TIMEOUT", retryable=True)
-        except httpx.HTTPError as exc:
-            return ToolResult.failure(f"Fetch failed: {exc}", category="NETWORK_ERROR", retryable=True)
+        html, failure = await _guarded_html_fetch(url, self.timeout_seconds)
+        if failure is not None:
+            return failure
 
-        if response.status_code >= 400:
-            return ToolResult.failure(
-                f"HTTP {response.status_code} fetching {url}", category="HTTP_ERROR",
-                retryable=response.status_code >= 500,
-            )
-
-        html = response.text
+        html = html or ""
         text = _html_to_text(html)
         sanitized = sanitize_external_text(text, params.get("max_chars", 12000))
 
         return ToolResult.success(
             data={
                 "url": url,
-                "final_url": str(response.url),
-                "status_code": response.status_code,
-                "content_type": response.headers.get("content-type", ""),
+                "final_url": url,
+                "status_code": 200,
+                "content_type": "text/html",
                 "text": sanitized["text"],
                 "dates_detected": extract_dates(text),
                 "injection_flagged": sanitized["is_flagged"],
@@ -193,15 +243,11 @@ class SiteSearchTool(BaseTool):
         keywords = [k.lower() for k in (params.get("keywords") or ANNOUNCEMENT_PATTERNS)]
         keywords = [re.sub(r"\\b|\\s", "", k) if k.startswith("\\") else k for k in keywords]
 
-        try:
-            response = await guarded_get(url, self.timeout_seconds)
-            response.raise_for_status()
-        except DestinationBlocked as exc:
-            return ToolResult.failure(f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False)
-        except Exception as exc:
-            return ToolResult.failure(f"Site scan failed: {exc}", category="NETWORK_ERROR", retryable=True)
+        html, failure = await _guarded_html_fetch(url, self.timeout_seconds)
+        if failure is not None:
+            return failure
 
-        text = _html_to_text(response.text)
+        text = _html_to_text(html or "")
         matches = []
         for line in text.splitlines():
             lowered = line.lower()
@@ -218,7 +264,13 @@ class SiteSearchTool(BaseTool):
                 "match_count": len(matches),
                 "matches": matches,
                 "dates_detected": extract_dates(text),
-            }
+            },
+            evidence={
+                "authoritative": True,
+                "kind": "source_scan",
+                "url": url,
+                "match_count": len(matches),
+            },
         )
 
 
@@ -248,15 +300,11 @@ class DocumentationReaderTool(BaseTool):
         url = params["url"]
         sections = [s.lower() for s in (params.get("sections") or ["eligib", "require", "claim", "deadline", "snapshot"])]
 
-        try:
-            response = await guarded_get(url, self.timeout_seconds)
-            response.raise_for_status()
-        except DestinationBlocked as exc:
-            return ToolResult.failure(f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False)
-        except Exception as exc:
-            return ToolResult.failure(f"Documentation read failed: {exc}", category="NETWORK_ERROR", retryable=True)
+        html, failure = await _guarded_html_fetch(url, self.timeout_seconds)
+        if failure is not None:
+            return failure
 
-        text = _html_to_text(response.text)
+        text = _html_to_text(html or "")
         sanitized = sanitize_external_text(text, 20000)
 
         lines = sanitized["text"].splitlines()

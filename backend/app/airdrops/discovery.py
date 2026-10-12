@@ -237,12 +237,18 @@ def assess_risk(campaign: DiscoveredCampaign, text: str = "") -> List[str]:
 async def discover_from_sources(
     source_urls: List[str],
     source_type: SourceReliability = SourceReliability.COMMUNITY,
-    network: Optional[str] = None
+    network: Optional[str] = None,
+    failures: Optional[List[Dict[str, Any]]] = None,
 ) -> List[DiscoveredCampaign]:
     """Discover airdrop campaigns from a list of source URLs.
 
     This is the main discovery workflow that uses web tools to fetch and
     analyze content for airdrop-related information.
+
+    `failures`, when supplied, collects one entry per source that could not be
+    read. Sources used to disappear silently: a 403 or a DNS failure was logged
+    and skipped, so a cycle that checked three sources and found nothing was
+    indistinguishable from a cycle that found three sources and found nothing.
     """
     if not source_urls:
         return []
@@ -251,6 +257,16 @@ async def discover_from_sources(
     site_search_tool = registry.get("site_search")
     if not site_search_tool:
         logger.warning("SiteSearchTool not available in registry")
+        if failures is not None:
+            failures.append(
+                {
+                    "url": None,
+                    "source_type": source_type.value,
+                    "error": "site_search tool is not registered",
+                    "category": "TOOL_UNAVAILABLE",
+                    "retryable": False,
+                }
+            )
         return []
 
     campaigns: List[DiscoveredCampaign] = []
@@ -266,6 +282,16 @@ async def discover_from_sources(
 
             if not result.ok:
                 logger.warning("Failed to search %s: %s", url, result.error)
+                if failures is not None:
+                    failures.append(
+                        {
+                            "url": url,
+                            "source_type": source_type.value,
+                            "error": result.error,
+                            "category": result.error_category or "TOOL_FAILURE",
+                            "retryable": bool(result.retryable),
+                        }
+                    )
                 continue
 
             matches = result.data.get("matches", [])
@@ -323,12 +349,14 @@ async def discover_from_sources(
 
 async def discover_from_documentation(
     doc_urls: List[str],
-    source_type: SourceReliability = SourceReliability.OFFICIAL
+    source_type: SourceReliability = SourceReliability.OFFICIAL,
+    failures: Optional[List[Dict[str, Any]]] = None,
 ) -> List[DiscoveredCampaign]:
     """Discover campaigns from official documentation pages.
 
     This workflow focuses on extracting eligibility, requirements, and
-    deadline information from official docs.
+    deadline information from official docs. Unreadable sources are collected into
+    `failures` for the same reason as in :func:`discover_from_sources`.
     """
     if not doc_urls:
         return []
@@ -337,6 +365,16 @@ async def discover_from_documentation(
     doc_tool = registry.get("read_documentation")
     if not doc_tool:
         logger.warning("DocumentationReaderTool not available in registry")
+        if failures is not None:
+            failures.append(
+                {
+                    "url": None,
+                    "source_type": source_type.value,
+                    "error": "read_documentation tool is not registered",
+                    "category": "TOOL_UNAVAILABLE",
+                    "retryable": False,
+                }
+            )
         return []
 
     campaigns: List[DiscoveredCampaign] = []
@@ -351,6 +389,16 @@ async def discover_from_documentation(
 
             if not result.ok:
                 logger.warning("Failed to read documentation %s: %s", url, result.error)
+                if failures is not None:
+                    failures.append(
+                        {
+                            "url": url,
+                            "source_type": source_type.value,
+                            "error": result.error,
+                            "category": result.error_category or "TOOL_FAILURE",
+                            "retryable": bool(result.retryable),
+                        }
+                    )
                 continue
 
             sections = result.data.get("sections", {})
@@ -498,29 +546,34 @@ async def run_discovery_cycle(
     start_time = datetime.now(timezone.utc)
     all_campaigns: List[DiscoveredCampaign] = []
     results_by_source: Dict[str, Any] = {}
+    # Sources that could not be read. Reported to the caller so a partial cycle is
+    # never presented as a complete one.
+    failures: List[Dict[str, Any]] = []
 
     # Discover from official sources
     if discovery_sources.get("official"):
         official_campaigns = await discover_from_documentation(
             discovery_sources["official"],
-            SourceReliability.OFFICIAL
+            SourceReliability.OFFICIAL,
+            failures=failures,
         )
         all_campaigns.extend(official_campaigns)
         results_by_source["official"] = {
             "count": len(official_campaigns),
-            "sources_checked": len(discovery_sources["official"])
+            "sources_checked": len(discovery_sources["official"]),
         }
 
     # Discover from community sources
     if discovery_sources.get("community"):
         community_campaigns = await discover_from_sources(
             discovery_sources["community"],
-            SourceReliability.COMMUNITY
+            SourceReliability.COMMUNITY,
+            failures=failures,
         )
         all_campaigns.extend(community_campaigns)
         results_by_source["community"] = {
             "count": len(community_campaigns),
-            "sources_checked": len(discovery_sources["community"])
+            "sources_checked": len(discovery_sources["community"]),
         }
 
     # TODO: Add discovery from social media, forums, etc.
@@ -528,10 +581,12 @@ async def run_discovery_cycle(
     end_time = datetime.now(timezone.utc)
 
     return {
-        "status": "completed",
+        "status": "completed" if not failures else "completed_with_source_failures",
         "campaigns_discovered": len(all_campaigns),
         "campaigns": [camp.to_dict() for camp in all_campaigns[:50]],  # Limit response size
         "results_by_source": results_by_source,
+        "source_failures": failures,
+        "sources_failed": len(failures),
         "duration_seconds": (end_time - start_time).total_seconds(),
         "timestamp": end_time.isoformat()
     }

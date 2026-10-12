@@ -4,7 +4,14 @@
  * Lives outside React so the chat survives navigating to another page (the
  * page component unmounts) and a browser reload (localStorage). A reply that
  * arrives while the operator is on another page is still saved.
+ *
+ * Each agent message keeps the backend's structured report - the tools that ran,
+ * the approvals now outstanding, the blockers - alongside the prose. The UI renders
+ * what the backend actually did; it never decides on its own that something
+ * succeeded, and the prose alone is never treated as a result.
  */
+
+import type { AgentApprovalRequest, AgentToolCall } from '@/types'
 
 export interface ChatMessage {
   id: string
@@ -12,8 +19,19 @@ export interface ChatMessage {
   content: string
   at: string
   taskId?: string
+  taskStatus?: string
   /** Failed requests are shown to the operator but never sent to the model. */
   error?: boolean
+  /** Tools the backend really executed for this message. */
+  toolCalls?: AgentToolCall[]
+  /** Prepared value-moving operations still awaiting the operator's approval. */
+  approvals?: AgentApprovalRequest[]
+  /** Things that blocked the request, verbatim from the backend. */
+  blockers?: string[]
+  /** Questions the operator has to answer before the agent can continue. */
+  needsUserAction?: string[]
+  /** True when a bound was hit, so the turn stopped early rather than completing. */
+  truncated?: boolean
 }
 
 interface ChatState {
@@ -23,6 +41,25 @@ interface ChatState {
 
 export const CHAT_STORAGE_KEY = 'airdropos.agentChat.v1'
 const MAX_MESSAGES = 200
+
+/**
+ * Drop the bulky parts before persisting.
+ *
+ * A `web_fetch` result carries a page of text, and keeping 200 of those in
+ * localStorage would blow the quota and start throwing on every message. The
+ * tool name, status and error are what the operator needs on reload; the payload
+ * is re-fetchable from the backend if it is ever needed.
+ */
+function slim(message: ChatMessage): ChatMessage {
+  if (!message.toolCalls) return message
+  return {
+    ...message,
+    toolCalls: message.toolCalls.map((call) => ({
+      ...call,
+      data: {},
+    })),
+  }
+}
 
 function load(): ChatMessage[] {
   try {
@@ -41,7 +78,7 @@ const listeners = new Set<() => void>()
 function commit(next: ChatState): void {
   state = next
   try {
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(state.messages))
+    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(state.messages.map(slim)))
   } catch {
     // Storage full or blocked: keep working in memory.
   }

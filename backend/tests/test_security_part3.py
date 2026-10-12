@@ -362,7 +362,7 @@ class TestAlembicConfig:
         cfg = Config(str(REPO / "backend" / "alembic.ini"))
         script = ScriptDirectory.from_config(cfg)
         assert Path(script.dir) == REPO / "backend" / "app" / "migrations"
-        assert script.get_heads() == ["2_reconcile_schema_with_models"]
+        assert script.get_heads() == ["3_transaction_approvals"]
 
     def test_stale_duplicate_directory_is_marked_and_not_referenced(self):
         stale = REPO / "backend" / "migrations"

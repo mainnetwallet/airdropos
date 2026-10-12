@@ -114,24 +114,36 @@ class AuthorizationPolicy:
 
         Applies to any tool whose schema declares a `network`, `wallet_id` or
         `wallet_ids` parameter, so a new tool cannot opt out by forgetting a check.
+
+        An OPTIONAL parameter is only checked when the caller actually supplied it.
+        Treating presence in the schema as presence in the call was a real defect: it
+        refused `get_wallet_address` with no `network` (a perfectly valid lookup of a
+        locally stored address) with "A network must be specified", and would have
+        refused every optional-network tool the same way.
         """
         props = (tool.input_schema or {}).get("properties", {})
-        if "network" in props:
+        required = set((tool.input_schema or {}).get("required", []))
+
+        if "network" in props and params.get("network") is not None:
             ok, reason = self.permits_network(params.get("network"))
             if not ok:
                 return False, reason
-        if "wallet_id" in props:
+        if "wallet_id" in props and params.get("wallet_id") is not None:
             ok, reason = self.permits_wallet(params.get("wallet_id"))
             if not ok:
                 return False, reason
         if "wallet_ids" in props:
             ids = params.get("wallet_ids")
-            if not isinstance(ids, (list, tuple)) or not ids:
-                return False, "At least one wallet id must be specified."
-            for wallet_id in ids:
-                ok, reason = self.permits_wallet(wallet_id)
-                if not ok:
-                    return False, reason
+            if ids is None:
+                if "wallet_ids" in required:
+                    return False, "At least one wallet id must be specified."
+            else:
+                if not isinstance(ids, (list, tuple)) or not ids:
+                    return False, "At least one wallet id must be specified."
+                for wallet_id in ids:
+                    ok, reason = self.permits_wallet(wallet_id)
+                    if not ok:
+                        return False, reason
         return True, ""
 
     def describe(self) -> Dict[str, Any]:

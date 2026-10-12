@@ -430,8 +430,13 @@ class TaskManager:
                     "hash": t.tx_hash,
                     "status": t.status,
                     "network": t.network,
-                    "value_usd": t.value_usd,
-                    "confirmations": t.confirmations,
+                    # Column names, not the shorter aliases used here before. The
+                    # aliases do not exist on the model, so any task that had
+                    # actually sent a transaction raised AttributeError here and the
+                    # whole status report - the "what happened to my task" endpoint -
+                    # returned a 500 exactly when there was something to report.
+                    "value_usd": t.usd_value_transacted,
+                    "confirmations": t.confirmation_count,
                 }
                 for t in tx_rows
             ],

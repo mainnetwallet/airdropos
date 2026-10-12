@@ -6,6 +6,7 @@
  */
 
 import type {
+  AgentChatResponse,
   AgentInfo,
   DiagnosticsResponse,
   EmergencyStopStatus,
@@ -163,16 +164,15 @@ export const api = {
 
   // --- Agent ------------------------------------------------------------
   agentInfo: () => request<AgentInfo>('/agent/info'),
+  /**
+   * Send one operator message. The backend runs any tools the model selected and
+   * returns their real results, so the response is a report, not just prose.
+   */
   agentChat: (
     message: string,
     history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
   ) =>
-    request<{
-      reply: string
-      task: { task_id: string; status: string; title: string; priority: number } | null
-      model: string
-      usage: Record<string, number>
-    }>(
+    request<AgentChatResponse>(
       '/agent/chat',
       { method: 'POST', body: JSON.stringify({ message, history }) },
     ),

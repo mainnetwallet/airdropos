@@ -64,6 +64,60 @@ class BlockchainTransaction(Base):
     )
 
 
+class TransactionApproval(Base):
+    """A human decision to sign and broadcast exactly one specific transaction.
+
+    `TransactionEngine.submit_raw` refuses to broadcast without a server-side proof
+    of approval, and deliberately refuses to accept a caller-supplied "yes I approved
+    this" flag. This table is that proof: a row is written when a named human
+    approves a *specific, fully specified* transfer, it expires, it can be consumed
+    exactly once, and `ApprovalVerifier` checks all of that server-side.
+
+    `binding` pins the approval to one transaction: network, chain id, source
+    wallet, destination, value and the hash of the exact signed payload. An approval
+    for one transfer therefore cannot authorise another, and cannot be replayed.
+    """
+
+    __tablename__ = "transaction_approvals"
+
+    # The primary key is declared here rather than inherited: `Base` supplies a
+    # `default=uuid.uuid4`, but redeclaring `id` in a subclass replaces that default
+    # with a bare column, so every INSERT sent NULL and the insert failed on NOT NULL.
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
+    # Short, opaque, operator-facing identifier used as `approval_id` in a tool call.
+    approval_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    # Never a machine identity. `TransactionEngine.NON_HUMAN_APPROVERS` refuses these.
+    approved_by: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+
+    # The transaction this approval is good for.
+    network: Mapped[str] = mapped_column(String(50), nullable=False)
+    chain_id: Mapped[Optional[int]] = mapped_column(nullable=True)
+    wallet_address: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    to_address: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    value_wei: Mapped[Optional[str]] = mapped_column(String(78), nullable=True)
+    tx_hash: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
+    estimated_cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Canonical comparison target. `verify_and_consume` recomputes this from the raw
+    # transaction and requires an exact match.
+    binding: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
+
+    # Provenance of the request being approved.
+    proposal_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
+    )
+
+    status: Mapped[str] = mapped_column(String(20), default="PENDING", nullable=False)
+    # PENDING -> CONSUMED (broadcast) | REJECTED (operator said no) | EXPIRED
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
 class TransactionReceipt(Base):
     """Blockchain transaction receipt with gas usage, logs, and status."""
 

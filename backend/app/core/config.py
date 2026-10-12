@@ -5,7 +5,7 @@ Enforces strict single-LLM configuration, spending bounds, and security paramete
 """
 
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -165,6 +165,20 @@ class Settings(BaseSettings):
         description="Threshold where user interaction is mandatory",
     )
 
+    # Value moving stays off unless an operator turns it on for this deployment.
+    # Even when enabled, every broadcast still requires a named human's server-side
+    # approval of one specific transaction; this flag is not that approval.
+    ALLOW_VALUE_MOVING: bool = Field(
+        default=False,
+        description=(
+            "Allow the agent to hold wallet.sign / transaction.submit permissions and "
+            "therefore to sign and broadcast. Off by default. Individual broadcasts "
+            "still require an explicit, transaction-bound human approval."
+        ),
+    )
+    # How long a quoted transfer stays approvable.
+    APPROVAL_TTL_MINUTES: int = Field(default=15, ge=1, le=120)
+
     # Cryptographic Vault (AES-256-GCM)
     WALLET_VAULT_MASTER_KEY: str = Field(
         default=_DEV_VAULT_KEY,
@@ -183,6 +197,13 @@ class Settings(BaseSettings):
     RPC_BASE: Optional[str] = "https://mainnet.base.org"
     RPC_POLYGON: Optional[str] = "https://polygon-rpc.com"
     RPC_SEPOLIA: Optional[str] = "https://rpc.sepolia.org"
+
+    # Operator-supplied ERC-20 contracts, keyed by network then symbol:
+    #   TOKEN_CONTRACTS={"ethereum": {"MYTOKEN": "0x..."}}
+    # A symbol is NEVER resolved by searching. An address that is neither in the
+    # built-in catalog nor here is refused rather than guessed, because sending to
+    # the wrong contract sends real money to whoever deployed it.
+    TOKEN_CONTRACTS: Dict[str, Dict[str, str]] = Field(default_factory=dict)
 
     # =========================================================================
     # INTEGRATIONS

@@ -153,23 +153,42 @@ async def probe_rpc(network: str) -> Dict[str, Any]:
     url = tx_engine.rpc_url(network)
     if not url:
         return {"_status": NOT_CONFIGURED, "reason": "no RPC URL configured"}
-    block = await tx_engine._rpc(network, "eth_blockNumber", [])
+    try:
+        block = await tx_engine._rpc(network, "eth_blockNumber", [])
+    except Exception as exc:
+        # Surface the deterministic category (RPC_AUTH, RPC_RATE_LIMITED, NO_RPC, ...)
+        # instead of the exception type, so "why is this chain failing" is answerable
+        # from the diagnostic record alone.
+        return {
+            "_status": UNAVAILABLE,
+            "category": getattr(exc, "category", None) or type(exc).__name__,
+            "detail": str(exc)[:300],
+        }
     return {"block": int(block, 16)}
 
 
 async def probe_browser() -> Dict[str, Any]:
-    from backend.app.browser.controller import browser_controller
+    # The module exports `controller`, not `browser_controller`. Importing the wrong
+    # name raised ImportError on every sweep, which `_timed` turned into a permanent
+    # UNAVAILABLE browser entry: the probe reported a fault that did not exist while
+    # the real browser state was never read. `health()` is synchronous.
+    from backend.app.browser.controller import controller as browser_controller
 
-    health = await browser_controller.health()
-    available = bool(health.get("available", health.get("status") in ("ok", HEALTHY)))
+    health = browser_controller.health()
+    available = health.get("status") in ("ok", HEALTHY)
     return {**health, "_status": HEALTHY if available else DEGRADED}
 
 
 async def probe_telegram() -> Dict[str, Any]:
+    # `TelegramBot.health()` is synchronous and only reads local state. Awaiting it
+    # raised `TypeError: object dict can't be used in 'await' expression`, which this
+    # same machinery recorded as UNAVAILABLE - a fabricated fault on every sweep.
     from backend.app.integrations.telegram import telegram_bot
 
-    health = await telegram_bot.health()
-    configured = bool(health.get("configured", health.get("status") in ("ok", HEALTHY)))
+    health = telegram_bot.health()
+    configured = health.get("status") in ("ok", HEALTHY)
+    # Not configured is a real, reportable state; it is not an outage, so it is
+    # reported distinctly instead of being flattened into "unavailable".
     return {**health, "_status": HEALTHY if configured else NOT_CONFIGURED}
 
 
@@ -219,8 +238,6 @@ class Watchdog:
 
     def _core_probes(self, db: AsyncSession) -> List[tuple[str, Callable[[], Awaitable[Dict[str, Any]]]]]:
         return [
-            ("database", lambda: probe_database(db)),
-            ("database_backlog", lambda: probe_database_backlog(db)),
             ("llm", probe_llm),
             ("browser", probe_browser),
             ("telegram", probe_telegram),
@@ -228,10 +245,31 @@ class Watchdog:
             ("tools", probe_tools),
         ]
 
+    def _session_probes(self, db: AsyncSession) -> List[tuple[str, Callable[[], Awaitable[Dict[str, Any]]]]]:
+        """Probes that consume the caller's `AsyncSession`.
+
+        These are kept OUT of the concurrent gather on purpose. A SQLAlchemy
+        `AsyncSession` is a single transactional connection and is explicitly not
+        safe for concurrent use: two coroutines awaiting on it interleave inside
+        the same transaction, so the second statement is executed against a session
+        the first is still using. That surfaced as `IllegalStateChangeError` /
+        "this session is provisioning a new connection; concurrent operations are
+        not permitted" and turned a perfectly healthy database into a reported
+        outage. They run sequentially instead.
+        """
+        return [
+            ("database", lambda: probe_database(db)),
+            ("database_backlog", lambda: probe_database_backlog(db)),
+        ]
+
     async def sweep(self, db: AsyncSession, *, notify: bool = True) -> WatchdogReport:
-        """Probe every subsystem concurrently and persist the results."""
+        """Probe every subsystem and persist the results."""
         started = datetime.now(timezone.utc)
         report = WatchdogReport(started_at=started)
+
+        # Session-bound probes first, one at a time (see `_session_probes`).
+        for name, factory in self._session_probes(db):
+            report.results.append(await _timed(name, factory))
 
         probes = self._core_probes(db)
         probes += [(f"rpc:{n}", lambda n=n: probe_rpc(n)) for n in self.networks]

@@ -47,6 +47,47 @@ logger = logging.getLogger(__name__)
 
 MAX_REPLANS_PER_TASK = 2
 
+# Verification methods that make no specific claim about WHAT was proven. Any
+# authoritative evidence satisfies them. `unspecified` is deliberately NOT here:
+# the planner's own default means "nobody said how this is proven", and treating
+# that as satisfied is how unverified work gets reported as done.
+GENERIC_EVIDENCE_METHODS = frozenset({"", "tool_evidence", "evidence_present"})
+
+# Which `ToolResult.evidence["kind"]` values can satisfy a concrete verification
+# method. A step is verified only when the tool produced evidence of the declared
+# kind, so a simulation can never stand in for a chain receipt, and a screenshot
+# can never stand in for either. Methods absent from this table are free text the
+# model invented; those fall back to "any authoritative evidence" (see _verify_step).
+EVIDENCE_KINDS: Dict[str, frozenset] = {
+    # On-chain finality. Only a real receipt proves a transaction executed.
+    "chain_receipt": frozenset({"chain_receipt", "tx_receipt", "transfer_receipt"}),
+    "receipt": frozenset({"chain_receipt", "tx_receipt", "transfer_receipt"}),
+    "tx_hash": frozenset({"chain_receipt", "tx_receipt", "transfer_receipt"}),
+    # A dry run proves nothing was executed; it cannot satisfy a receipt method.
+    "simulation": frozenset({"eth_call_simulation", "simulation"}),
+    "eth_call_simulation": frozenset({"eth_call_simulation", "simulation"}),
+    # Browser / page state.
+    "page_observation": frozenset({"page_observation"}),
+    "page_state": frozenset({"page_observation", "post_action_observation"}),
+    "post_action_observation": frozenset({"post_action_observation"}),
+    "screenshot": frozenset({"screenshot"}),
+    "visible_text": frozenset({"post_action_observation", "page_observation"}),
+    # Sources and notifications.
+    "http_status": frozenset({"http_status"}),
+    "source_scan": frozenset({"source_scan"}),
+    "notification_delivered": frozenset({"notification_delivery"}),
+    # A prepared transfer is a verified *plan*, not a verified broadcast. It gets
+    # its own kind so a `chain_receipt` method can never be satisfied by one.
+    "prepared_transfer": frozenset({"prepared_transfer"}),
+    "transfer_prepared": frozenset({"prepared_transfer"}),
+    # Contract reads.
+    "contract_read": frozenset({"contract_read"}),
+    # A wallet address read straight from the wallet service.
+    "wallet_record": frozenset({"wallet_record"}),
+    # Database-backed reads.
+    "record_read": frozenset({"record_read"}),
+}
+
 from backend.app.agent.prompts import AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
 
 
@@ -846,19 +887,49 @@ class AgentController:
     async def _verify_step(self, task: Task, step, tool_result) -> tuple[bool, int]:
         """Verify one plan step against its declared verification method.
 
-        The planner declares how each step must be proven; this checks whether
-        the evidence actually satisfies that declaration. A step whose method
-        is `unspecified` is never auto-verified.
+        The planner declares how each step must be proven; this checks whether the
+        evidence actually satisfies that declaration.
+
+        The comparison that was missing: the declared `verification_method` was never
+        matched against the kind of evidence the tool actually produced, so any
+        `authoritative` evidence satisfied any method. A step promising
+        `chain_receipt` that ran `simulate_transaction` (which reports
+        `kind="eth_call_simulation"`) counted as verified, and a fully "verified"
+        plan could then be marked COMPLETED on evidence that proves nothing happened.
+        `EVIDENCE_KINDS` maps each concrete method to the evidence kinds that can
+        satisfy it.
         """
         method = (step.verification_method or "").strip().lower()
         evidence = getattr(tool_result, "evidence", None)
+        data = tool_result.data or {}
 
         if evidence and evidence.get("authoritative"):
-            if method and "unspecified" not in method:
+            kind = str(evidence.get("kind") or "").strip().lower()
+            if method in GENERIC_EVIDENCE_METHODS:
+                # The step only asked for "the tool returned evidence".
                 return True, 1
-            return method in ("", "tool_evidence", "evidence_present"), 1
+            if method == "unspecified":
+                # The planner's default means nobody declared how this is proven.
+                # Treating that as satisfied is exactly how unverified work gets
+                # reported as done, so it is never auto-verified.
+                return False, 0
+            allowed = EVIDENCE_KINDS.get(method)
+            if allowed is None:
+                # A method nobody has mapped to a concrete evidence kind (free text
+                # from the model). Authoritative evidence is the best signal
+                # available; anything weaker is not.
+                return True, 1
+            if kind in allowed:
+                return True, 1
+            logger.info(
+                "Task %s step %s: declared verification method %r was NOT satisfied. "
+                "The tool produced %r evidence, which proves something different.",
+                task.task_id, step.index, method, kind or "(none)",
+            )
+            return False, 0
 
-        data = tool_result.data or {}
+        # Tools that predate the evidence envelope still expose their proof in the
+        # payload. Kept, but only for a method that actually names that proof.
         if data.get("tx_hash") and method in ("chain_receipt", "tx_hash", "receipt"):
             return True, 1
         if data.get("screenshot_path") and method in ("screenshot", "page_observation"):
@@ -866,7 +937,7 @@ class AgentController:
         if data.get("expected_text_seen") is True:
             return True, 1
 
-        if method and method not in ("unspecified", "tool_evidence"):
+        if method and method not in GENERIC_EVIDENCE_METHODS:
             logger.info(
                 "Task %s step %s: expected evidence %r was not satisfied by the tool result.",
                 task.task_id, step.index, method,

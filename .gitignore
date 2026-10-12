@@ -60,6 +60,12 @@ storage-state.json
 *.db
 *.log
 logs/
+# Pre-migration backups. `*.db` does not match `airdropos.db.bak-<stamp>`, so these
+# are excluded explicitly: a database copy must never reach the repository.
+*.db.bak-*
+*.db-journal*
+airdropos.db-wal
+airdropos.db-shm
 
 # IDE & OS
 .vscode/

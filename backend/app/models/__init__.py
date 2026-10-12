@@ -16,7 +16,11 @@ from backend.app.models.tasks import (
     TaskEvidence,
 )
 from backend.app.models.wallets import Wallet
-from backend.app.models.transactions import BlockchainTransaction, TransactionReceipt
+from backend.app.models.transactions import (
+    BlockchainTransaction,
+    TransactionApproval,
+    TransactionReceipt,
+)
 from backend.app.models.airdrops import (
     AirdropCampaign,
     CampaignSource,
@@ -69,6 +73,7 @@ __all__ = [
     "Wallet",
     "BlockchainTransaction",
     "TransactionReceipt",
+    "TransactionApproval",
     "AirdropCampaign",
     "CampaignSource",
     "WalletEligibility",

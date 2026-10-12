@@ -16,7 +16,12 @@ import httpx
 
 from backend.app.core.config import settings
 from backend.app.security.emergency_stop import EmergencyStopError, emergency_stop
-from backend.app.blockchain.chains import ChainError, EvmChainAdapter, get_chain
+from backend.app.blockchain.chains import (
+    ChainError,
+    EvmChainAdapter,
+    classify_rpc_http_status,
+    get_chain,
+)
 from backend.app.transactions.spend_ledger import SpendLedger, SpendLimitExceeded
 
 logger = logging.getLogger(__name__)
@@ -345,14 +350,43 @@ class TransactionEngine:
         try:
             async with httpx.AsyncClient(timeout=20) as client:
                 response = await client.post(url, json=payload)
-            body = response.json()
         except Exception as exc:
             raise TransactionRejected(f"RPC call '{method}' failed: {exc}", "RPC_FAILURE") from exc
 
-        if "error" in body:
+        # Status first. Previously `response.json()` ran unconditionally, so a provider
+        # that answers 401/403 with an HTML error page raised JSONDecodeError and the
+        # operator saw "RPC call failed: JSONDecodeError" - indistinguishable from a
+        # dead node and impossible to act on. A rejected key is a configuration fault,
+        # not an outage, and the category says so.
+        http_error = classify_rpc_http_status(response.status_code, network)
+        if http_error is not None:
+            raise TransactionRejected(str(http_error), http_error.category)
+
+        try:
+            body = response.json()
+        except Exception as exc:
             raise TransactionRejected(
-                f"RPC error for {method}: {body['error'].get('message', 'unknown')}", "RPC_ERROR"
+                f"RPC endpoint returned a non-JSON body for '{method}' (HTTP {response.status_code}).",
+                "RPC_MALFORMED",
+            ) from exc
+
+        if not isinstance(body, dict):
+            raise TransactionRejected(
+                f"RPC endpoint returned a non-object body for '{method}'.", "RPC_MALFORMED"
             )
+
+        if body.get("error"):
+            error = body["error"]
+            message = error.get("message", "unknown") if isinstance(error, dict) else str(error)
+            code = error.get("code") if isinstance(error, dict) else None
+            category = "RPC_ERROR"
+            # Some providers signal a bad key inside a 200 JSON-RPC error envelope.
+            if code in (-32001, -32602, 401, 403) or "unauthorized" in str(message).lower():
+                category = "RPC_AUTH"
+            elif code == -32005 or "rate limit" in str(message).lower():
+                category = "RPC_RATE_LIMITED"
+            raise TransactionRejected(f"RPC error for {method}: {message}", category)
+
         return body.get("result")
 
     async def get_balance_wei(self, network: str, address: str) -> int:
@@ -373,14 +407,28 @@ class TransactionEngine:
         }
         try:
             gas_limit = int(await self._rpc(intent.network, "eth_estimateGas", [tx]), 16)
-        except TransactionRejected:
+        except TransactionRejected as exc:
+            # Only an on-chain revert justifies guessing. A rejected key, a missing
+            # endpoint or a rate limit must NOT be downgraded to a static default:
+            # that produced a confident-looking estimate built on no RPC data at all.
+            if exc.category in ("RPC_AUTH", "RPC_RATE_LIMITED", "NO_RPC", "RPC_MALFORMED"):
+                raise
             # Estimation reverts often mean the call would revert on-chain.
             gas_limit = GAS_COST_CATEGORIES.get(intent.category, GAS_COST_CATEGORIES["UNKNOWN"])
 
         try:
             gas_price = int(await self._rpc(intent.network, "eth_gasPrice", []), 16)
-        except TransactionRejected:
-            gas_price = 0
+        except TransactionRejected as exc:
+            if exc.category in ("RPC_AUTH", "RPC_RATE_LIMITED", "NO_RPC", "RPC_MALFORMED"):
+                raise
+            # A node that answers but cannot price gas is reported as unknown, never
+            # as zero: "0 wei fee" reads as "free" and hides the gap.
+            raise TransactionRejected(
+                f"The RPC endpoint for '{intent.network}' did not return a gas price, so the "
+                f"fee for this transaction cannot be determined. Refusing to quote a transfer "
+                f"with an unknown cost.",
+                "GAS_PRICE_UNAVAILABLE",
+            ) from exc
 
         gas_price_gwei = gas_price / 1e9
         if intent.max_gas_gwei is not None and gas_price_gwei > intent.max_gas_gwei:

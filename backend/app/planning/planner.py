@@ -873,30 +873,64 @@ Produce EXACTLY this JSON shape:
 
     @staticmethod
     def _check_expression(task: Task, expression: str) -> bool:
-        for operator in (">=", "<=", "==", ">", "<", "!="):
-            if operator in expression:
-                field_name, _, raw_value = expression.partition(operator)
-                field_name = field_name.strip()
-                raw_value = raw_value.strip()
+        """Evaluate `field<op>value` against the live task record.
 
-                actual = getattr(task, field_name, None)
-                if actual is None:
-                    return False
-                try:
-                    left = float(actual) if not isinstance(actual, str) else actual
-                    right = float(raw_value)
-                    left_cmp = float(left)
-                except ValueError:
-                    left_cmp, right = actual, raw_value  # type: ignore[assignment]
+        Raises `ValueError` for anything it cannot evaluate, so the caller can
+        apply the documented "unparseable prerequisites do not block forever" rule.
 
-                return {
-                    ">=": lambda a, b: a >= b,
-                    "<=": lambda a, b: a <= b,
-                    "==": lambda a, b: a == b,
-                    "!=": lambda a, b: a != b,
-                    ">": lambda a, b: a > b,
-                    "<": lambda a, b: a < b,
-                }[operator](left_cmp, right)
+        Two defects are fixed here:
+
+        * `float(actual)` was applied to any non-string field. A `datetime`
+          (`deadline_at`, `execution_started_at`) raises `TypeError`, which is not a
+          `ValueError`, so it escaped the caller's `except ValueError` and aborted the
+          whole execution loop instead of skipping one prerequisite.
+        * An unknown field name resolved to `None` and returned `False`, which parked
+          the step in `WAITING` permanently. That contradicts the documented contract
+          and strands the task: a plan step referencing a field the model invented
+          would never run and could never be reported as a plan problem.
+        """
+        for operator in (">=", "<=", "==", "!=", ">", "<"):
+            if operator not in expression:
+                continue
+            field_name, _, raw_value = expression.partition(operator)
+            field_name = field_name.strip()
+            raw_value = raw_value.strip()
+
+            # An unknown attribute is unparseable, not "false". See docstring.
+            if not hasattr(task, field_name):
+                raise ValueError(f"Unknown task field in prerequisite: {field_name!r}")
+
+            actual = getattr(task, field_name)
+            if actual is None:
+                return False
+
+            try:
+                left = float(actual)
+                right = float(raw_value)
+            except (TypeError, ValueError):
+                # Non-numeric (string or datetime) fields compare as plain values.
+                left = actual
+                right = raw_value
+
+            compare = {
+                ">=": lambda a, b: a >= b,
+                "<=": lambda a, b: a <= b,
+                "==": lambda a, b: a == b,
+                "!=": lambda a, b: a != b,
+                ">": lambda a, b: a > b,
+                "<": lambda a, b: a < b,
+            }[operator]
+            try:
+                return bool(compare(left, right))
+            except TypeError as exc:
+                # e.g. `deadline_at > 2026-01-01`: a datetime can never be ordered
+                # against a bare string. This is a model authoring error, not a
+                # real precondition, so it is reported as unparseable and skipped
+                # rather than raising out of the execution loop.
+                raise ValueError(
+                    f"Cannot compare {field_name!r} ({type(actual).__name__}) with "
+                    f"{raw_value!r} in prerequisite {expression!r}: {exc}"
+                ) from exc
 
         raise ValueError(f"No comparison operator in '{expression}'")
 
