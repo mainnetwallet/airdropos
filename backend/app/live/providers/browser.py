@@ -19,6 +19,8 @@ from backend.app.live.models import Capabilities, Conflict, Frame, NotSupported,
 from backend.app.live.providers.base import SessionProvider
 from backend.app.live.sessions import SessionRecord
 
+TASK_DONE_GRACE_SECONDS = 8  # let the last frame/event show before the browser closes
+
 # Keys an operator may press. Anything else is refused rather than guessed at.
 ALLOWED_KEYS = {
     "Enter", "Tab", "Backspace", "Delete", "Escape",
@@ -51,8 +53,20 @@ class BrowserProvider(SessionProvider):
         (their context is closed too, cookies saved first) and contexts nothing tracks any more."""
         reg = hub.browser_sessions
         now = time.monotonic()
+        finished = await self._finished_task_ids(reg)
         for rec in list(reg.records.values()):
             if rec.stopped or controller.is_busy(rec.key):
+                continue
+            # The task this session was working on has finished: close the browser and
+            # mark the session stopped (not while an operator holds manual control).
+            if (
+                rec.task_id in finished
+                and rec.control is None
+                and time.time() - (rec.last_activity_at or 0) > TASK_DONE_GRACE_SECONDS
+            ):
+                reg.mark_stopped(rec.key, by_operator=False, reason="Task finished, browser closed")
+                self._drop_frames(rec.key)
+                await controller.close_session(rec.key)
                 continue
             if controller.peek_page(rec.key) is None and now - rec.created_mono > 5:
                 reg.mark_stopped(rec.key, by_operator=False, reason="Browser page closed")
@@ -65,6 +79,27 @@ class BrowserProvider(SessionProvider):
             if rec is None or rec.stopped:
                 await controller.close_session(key)
         reg.prune_stopped()
+
+    async def _finished_task_ids(self, reg) -> set:
+        """Task ids (of live sessions) whose task is COMPLETED, FAILED or CANCELLED."""
+        ids = {r.task_id for r in reg.records.values() if not r.stopped and r.task_id}
+        if not ids:
+            return set()
+        try:
+            from sqlalchemy import select
+
+            from backend.app.database.session import AsyncSessionLocal
+            from backend.app.models import Task
+            from backend.app.tasks.state_machine import TERMINAL_STATES
+
+            terminal = {st.value for st in TERMINAL_STATES}
+            async with AsyncSessionLocal() as db:
+                rows = await db.execute(
+                    select(Task.task_id, Task.status).where(Task.task_id.in_(list(ids)))
+                )
+                return {tid for tid, status in rows.all() if str(getattr(status, "value", status)) in terminal}
+        except Exception:
+            return set()
 
     def _drop_frames(self, key: str) -> None:
         for quality in FRAME_MIN_INTERVAL:
