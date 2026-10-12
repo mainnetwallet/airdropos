@@ -302,6 +302,30 @@ RETRY_BACKOFF_BASE_SECONDS = 30
 RETRY_BACKOFF_MAX_SECONDS = 600
 
 
+def retry_delay_seconds(retry_count: int) -> int:
+    """Exponential backoff for the next attempt, bounded by RETRY_BACKOFF_MAX_SECONDS."""
+    exponent = max(0, min(int(retry_count), 20))
+    return min(RETRY_BACKOFF_BASE_SECONDS * (2 ** exponent), RETRY_BACKOFF_MAX_SECONDS)
+
+
+async def _release_task_leases(db: AsyncSession, task_pk: Any, reason: str) -> None:
+    """Release leases of a run that has ended, so the next attempt is not refused as a conflict.
+
+    Leases are now committed while a task runs. If the run ends in an error the lease would
+    otherwise stay live for its full TTL and every retry would be rejected with "another worker
+    holds this task" while the task sat IN_PROGRESS.
+    """
+    from sqlalchemy import update
+
+    from backend.app.models import ExecutionLease
+
+    await db.execute(
+        update(ExecutionLease)
+        .where(ExecutionLease.task_id == task_pk, ExecutionLease.released_at.is_(None))
+        .values(released_at=datetime.now(timezone.utc), broken_reason=reason)
+    )
+
+
 async def _settle_failed_execution(task_pk: Any, reason: str, detail: Dict[str, Any]) -> None:
     """Record a failed execution attempt on the task, in a fresh session.
 
@@ -316,8 +340,9 @@ async def _settle_failed_execution(task_pk: Any, reason: str, detail: Dict[str, 
         if task is None or task.status != TaskStatus.IN_PROGRESS.value:
             return
         manager = TaskManager(db)
+        await _release_task_leases(db, task_pk, f"execution ended: {reason}")
         if task.retry_count < task.max_retries:
-            delay = min(RETRY_BACKOFF_BASE_SECONDS * (2 ** task.retry_count), RETRY_BACKOFF_MAX_SECONDS)
+            delay = retry_delay_seconds(task.retry_count)
             task.next_execution_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
             await manager.transition(
                 task, TaskStatus.RETRYING, reason=reason, error_details=detail
@@ -414,6 +439,16 @@ async def recover_interrupted_tasks() -> int:
     from backend.app.models import Task
 
     async with AsyncSessionLocal() as db:
+        interrupted = list(
+            (
+                await db.execute(
+                    select(Task.id).where(Task.status == TaskStatus.IN_PROGRESS.value)
+                )
+            ).scalars().all()
+        )
+        for task_pk in interrupted:
+            # The dead run's committed lease would otherwise block the retry for its full TTL.
+            await _release_task_leases(db, task_pk, "worker restarted; run interrupted")
         result = await db.execute(
             update(Task)
             .where(Task.status == TaskStatus.IN_PROGRESS.value)

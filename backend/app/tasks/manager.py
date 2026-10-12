@@ -259,10 +259,26 @@ class TaskManager:
         if task is None:
             return None
 
-        task.status = TaskStatus.IN_PROGRESS.value
-        if task.execution_started_at is None:
-            task.execution_started_at = datetime.now(timezone.utc)
-        await self.db.flush()
+        # Compare-and-set: FOR UPDATE SKIP LOCKED is a no-op on SQLite, so two workers could both
+        # SELECT the same READY row. The guarded UPDATE succeeds for exactly one of them.
+        claimed = await self.db.execute(
+            update(Task)
+            .where(
+                Task.id == task.id,
+                Task.status.in_([TaskStatus.READY.value, TaskStatus.RETRYING.value]),
+            )
+            .values(
+                status=TaskStatus.IN_PROGRESS.value,
+                execution_started_at=func.coalesce(
+                    Task.execution_started_at, datetime.now(timezone.utc)
+                ),
+            )
+            .execution_options(synchronize_session="fetch")
+        )
+        if (claimed.rowcount or 0) != 1:
+            logger.info("Task %s was claimed by another worker first", task.task_id)
+            return None
+        await self.db.refresh(task)
         await self._record_event(
             task, "TASK_CLAIMED", "INFO", {"worker_id": worker_id, "priority": task.priority}
         )
