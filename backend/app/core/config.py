@@ -179,6 +179,32 @@ class Settings(BaseSettings):
     # How long a quoted transfer stays approvable.
     APPROVAL_TTL_MINUTES: int = Field(default=15, ge=1, le=120)
 
+    # ------------------------------------------------------------------
+    # AUTONOMOUS EXECUTION POLICY
+    # ------------------------------------------------------------------
+    # What the agent may do without asking the owner first. Deny-by-default: with
+    # neither of these set, every autonomous category is refused and the agent
+    # behaves exactly as before.
+    #
+    # AUTONOMOUS_POLICY_FILE points at a JSON file and is preferred on Windows, where
+    # embedding multi-line JSON in .env is a reliable source of escaping mistakes.
+    # AUTONOMOUS_POLICY accepts the same JSON inline.
+    #
+    # The policy authorizes; the model never does. It decides which operation classes
+    # run unattended and within which ceilings, and every decision is recorded against
+    # the rule that made it. See docs/AUTONOMOUS_EXECUTION.md.
+    AUTONOMOUS_POLICY_FILE: str = Field(
+        default="",
+        description="Path to a JSON file describing which operations may run unattended.",
+    )
+    AUTONOMOUS_POLICY: Optional[str] = Field(
+        default=None,
+        description="Inline JSON alternative to AUTONOMOUS_POLICY_FILE.",
+    )
+    # Refuse a broadcast whose receipt cannot be read, so "sent" is never claimed
+    # without proof. Defaults on; turning it off means PENDING is reported as done.
+    AUTONOMOUS_REQUIRE_RECEIPT_DEFAULT: bool = True
+
     # Cryptographic Vault (AES-256-GCM)
     WALLET_VAULT_MASTER_KEY: str = Field(
         default=_DEV_VAULT_KEY,

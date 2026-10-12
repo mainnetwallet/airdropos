@@ -555,7 +555,9 @@ Details: `docs/TELEGRAM_SETUP.md`.
 | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_ID` | Your LLM provider. `LLM_BASE_URL` must include the version path, e.g. `https://api.openai.com/v1`. |
 | `RPC_*` | Blockchain RPC URLs (Alchemy etc.). Replace `your-api-key` for the chains you use. |
 | `MAX_TRANSACTION_VALUE_USD`, `MAX_DAILY_GAS_SPEND_USD`, `REQUIRE_CONFIRMATION_ABOVE_USD` | Spending limits. Review them before enabling real transactions. |
-| `ALLOW_VALUE_MOVING` | `true` lets the agent sign and broadcast at all. **Default `false`.** Read `docs/AGENT_CAPABILITIES.md` before changing it: turning this on still does not let the agent move money on its own, because every broadcast additionally needs an approval you personally give for that one exact transfer. |
+| `ALLOW_VALUE_MOVING` | `true` lets the agent sign and broadcast at all. **Default `false`.** Even when on, every broadcast still needs an approval bound to that one exact transfer, from you or from the autonomous policy below. |
+| `AUTONOMOUS_POLICY_FILE` | Path to a JSON policy deciding what the agent may do without asking. Unset means **everything is refused** — the deny-by-default posture. See `docs/AUTONOMOUS_EXECUTION.md`. |
+| `AUTONOMOUS_POLICY` | Inline JSON, if you would rather not use a file. A file is preferred on Windows. |
 | `TOKEN_CONTRACTS` | Optional. Lets you send a token that is not built in, e.g. `{"ethereum": {"MYTOKEN": "0x..."}}`. A symbol is never looked up by searching: a token that is neither built in nor listed here is refused rather than guessed. |
 | `APPROVAL_TTL_MINUTES` | How long a quoted transfer stays approvable. Default 15. |
 | `TELEGRAM_*`, `DISCORD_*`, `TWITTER_*` | Optional integrations (see `docs/TELEGRAM_SETUP.md`, `docs/DISCORD_SETUP.md`, `docs/X_INTEGRATION.md`). |

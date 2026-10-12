@@ -42,7 +42,8 @@ TABLE = "transaction_approvals"
 def upgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     if TABLE in set(inspector.get_table_names()):
-        # Already present (create_all-built database). Nothing to add.
+        # Already present (a create_all-built database). Nothing for this revision
+        # to do; later revisions reconcile any columns they add.
         return
 
     op.create_table(

@@ -132,6 +132,53 @@ export interface AgentApprovalRequest {
   state: string
 }
 
+/** One configured rule from the autonomous execution policy. */
+export interface AutonomousRule {
+  rule_id: string
+  category: string
+  action: 'allow' | 'deny'
+  max_value_usd: number | null
+  max_value_native: string | null
+  allowed_networks: string[] | null
+  allowed_tokens: string[] | null
+  allowed_destinations: string[] | null
+  allowed_source_wallets: string[] | null
+  require_receipt: boolean
+  description: string
+}
+
+/**
+ * What the agent may do without asking. Read from backend configuration.
+ *
+ * The UI only ever displays this. Every allow/deny decision is made by the backend
+ * policy; nothing here grants authority.
+ */
+export interface AutonomyPolicy {
+  policy: {
+    enabled: boolean
+    source: string
+    rules: AutonomousRule[]
+    value_moving: boolean
+    categories_known: string[]
+    note: string
+  }
+  value_moving_enabled: boolean
+  emergency_stop: Record<string, unknown>
+  note: string
+}
+
+/** A prepared transfer the backend has authorized on its own. */
+export interface AutonomousApproval {
+  tool: string
+  rule_id: string
+  network: string
+  to: string
+  asset: string
+  amount: string
+  estimated_fee_native: string
+  tx_hash?: string
+}
+
 export interface AgentChatResponse {
   reply: string
   tool_calls: AgentToolCall[]

@@ -38,10 +38,11 @@ from backend.app.blockchain.tokens import (
 )
 from backend.app.database.session import session_scope
 from backend.app.models import Wallet as WalletRow
+from backend.app.security.autonomous_policy import get_policy, is_policy_approver
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
 from backend.app.tools.wallet_tools import resolve_wallet
-from backend.app.transactions.approvals import ApprovalService
+from backend.app.transactions.approvals import ApprovalService, intent_fingerprint
 from backend.app.transactions.engine import (
     SubmissionAuthorization,
     TransactionIntent,
@@ -84,6 +85,37 @@ class TransferProposal:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def transfer_category(binding: Dict[str, Any]) -> str:
+    """Which value-moving category a binding belongs to.
+
+    An ERC-20 transfer carries calldata and sends zero native coin; a native transfer
+    does the opposite. Getting this wrong would let a rule written for one authorise
+    the other, so it is derived from the binding rather than supplied.
+    """
+    from backend.app.security.autonomous_policy import Category
+
+    return (
+        Category.TX_TOKEN_TRANSFER
+        if str(binding.get("data") or "0x") not in ("", "0x")
+        else Category.TX_NATIVE_TRANSFER
+    )
+
+
+def _native_amount(binding: Dict[str, Any]) -> Optional[str]:
+    """The amount as a decimal native-coin string, for a policy ceiling to compare.
+
+    ERC-20 transfers carry their amount in calldata, so there is no native amount for
+    a rule to bound; those are governed by `allowed_tokens` and `max_value_usd`
+    instead. Returning None is correct, not a gap.
+    """
+    if transfer_category(binding) != "tx.native_transfer":
+        return None
+    try:
+        return format_units(int(binding.get("value_wei") or 0), NATIVE_DECIMALS)
+    except (TypeError, ValueError):
+        return None
 
 
 def _approval_fields(
@@ -517,12 +549,13 @@ def _proposal_id() -> str:
 
 class ApproveTransferTool(BaseTool):
     name = "approve_transfer"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
-        "Record a human's approval of one specific prepared transfer, bound to the exact "
-        "network, wallet, destination, amount and calldata that were shown to them. Call this "
-        "only after they personally confirm. 'approved_by' must be their identity: the engine "
-        "refuses 'agent', 'system' and every other non-human approver."
+        "Authorize one specific prepared transfer. Pass approved_by set to the operator's own "
+        "identity when they personally confirmed the details. When the autonomous execution "
+        "policy already covers this exact transfer, omit approved_by and the policy is "
+        "consulted instead - the policy is the authorization, not the model. Never invent an "
+        "identity."
     )
     required_permissions = ["transaction.approve"]
     side_effect = SideEffect.STATE_MUTATION
@@ -542,14 +575,23 @@ class ApproveTransferTool(BaseTool):
             "approved_by": {
                 "type": "string",
                 "maxLength": 128,
-                "description": "The human who approved it. Must not be 'agent' or 'system'.",
+                "description": (
+                    "The human who approved it. Omit to use the configured autonomous policy, "
+                    "which is consulted for this exact transfer. Must not be 'agent' or 'system'."
+                ),
             },
             "summary": {"type": "string", "maxLength": 2000},
         },
-        "required": ["network", "wallet_address", "to_address", "approved_by"],
+        "required": ["network", "wallet_address", "to_address"],
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        from backend.app.security.autonomous_policy import (
+            Category,
+            get_policy,
+            policy_approver_identity,
+        )
+
         if emergency_stop.is_stopped:
             return ToolResult.failure(
                 "Emergency stop is active. Approvals are not being recorded while execution "
@@ -572,26 +614,63 @@ class ApproveTransferTool(BaseTool):
                 f"The approval fields are not valid integers: {exc}", category="INVALID_INPUT"
             )
 
+        identity = str(params.get("approved_by") or "").strip()
+
+        if not identity:
+            # No human identity supplied: ask the policy. This is the autonomous path,
+            # and the decision comes from configuration, not from the caller.
+            category = transfer_category(binding)
+            decision = get_policy().evaluate(
+                category,
+                network=binding["network"],
+                wallet=binding["wallet"],
+                destination=binding["to"],
+                value_native=_native_amount(binding),
+            )
+            if not decision.allowed:
+                return ToolResult.needs_user(
+                    f"{decision.reason} Show these details to the operator and record their "
+                    f"approval with approve_transfer(approved_by=<their identity>) to proceed."
+                )
+            identity = policy_approver_identity(decision.rule_id or category)
+
         async with session_scope() as db:
             try:
-                row = await ApprovalService(db).request(
-                    approved_by=params["approved_by"],
+                row, was_new = await ApprovalService(db).find_or_create(
+                    approved_by=identity,
                     binding=binding,
                     summary=params.get("summary") or "",
                     proposal_id=params.get("proposal_id"),
+                    idempotency_key=intent_fingerprint(binding),
                 )
             except Exception as exc:
                 return ToolResult.failure(str(exc), category="APPROVAL_INVALID")
             approval_id = row.approval_id
 
+        policy_authorised = identity.startswith("policy:autonomous")
+        note = (
+            "Authorized by the configured autonomous policy. It expires shortly and covers "
+            "exactly this one transaction."
+            if policy_authorised
+            else (
+                "Approval recorded. It expires shortly and authorises exactly this one "
+                "transaction; it cannot be reused for a different transfer."
+            )
+        )
+        if not was_new:
+            note += (
+                " This exact transfer already has an approval, so no second one was created "
+                "and the transfer cannot be broadcast twice."
+            )
+
         return ToolResult.success(
             data={
                 "approval_id": approval_id,
                 "binding": binding,
-                "note": (
-                    "Approval recorded. It expires shortly and authorises exactly this one "
-                    "transaction; it cannot be reused for a different transfer."
-                ),
+                "authorized_by": identity,
+                "authorized_by_policy": policy_authorised,
+                "new_approval": was_new,
+                "note": note,
             },
             evidence={
                 "authoritative": True,
@@ -620,10 +699,17 @@ class SubmitPreparedTransferTool(BaseTool):
         "properties": {
             "network": {"type": "string", "maxLength": 50},
             "approval_id": {"type": "string", "maxLength": 64},
-            "approved_by": {"type": "string", "maxLength": 128},
+            "approved_by": {
+                "type": "string",
+                "maxLength": 128,
+                "description": (
+                    "Optional. The identity the approval was issued to. Omit it to use the "
+                    "identity already recorded on the approval."
+                ),
+            },
             "wait_for_receipt": {"type": "boolean"},
         },
-        "required": ["network", "approval_id", "approved_by"],
+        "required": ["network", "approval_id"],
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -650,13 +736,35 @@ class SubmitPreparedTransferTool(BaseTool):
             ok, reason = ApprovalService.evaluate(approval)
             if not ok:
                 return ToolResult.failure(reason, category="APPROVAL_INVALID")
-            if str(approval.approved_by).strip().lower() != str(params["approved_by"]).strip().lower():
+            # `approved_by` is optional. When supplied it must match the approval; when
+            # omitted the approval's own identity is used. Either way the value comes
+            # from the stored row, so the caller cannot assert someone else's approval.
+            claimed = str(params.get("approved_by") or "").strip()
+            if claimed and str(approval.approved_by).strip().lower() != claimed.lower():
                 return ToolResult.failure(
-                    "That approval was issued to a different person than the one named here.",
+                    "That approval was issued to a different identity than the one named here.",
                     category="APPROVAL_INVALID",
                 )
             binding = dict(approval.binding or {})
             approved_by = str(approval.approved_by)
+
+            # An autonomous approval is re-authorized against the live policy here,
+            # immediately before signing, so a rule narrowed since approval stops it.
+            if is_policy_approver(approved_by):
+                category = transfer_category(binding)
+                decision = get_policy().evaluate(
+                    category,
+                    network=binding.get("network"),
+                    wallet=binding.get("wallet"),
+                    destination=binding.get("to"),
+                    value_native=_native_amount(binding),
+                )
+                if not decision.allowed:
+                    return ToolResult.failure(
+                        f"The autonomous policy no longer authorizes this transfer: "
+                        f"{decision.reason}",
+                        category="POLICY_DENIED",
+                    )
             wallet_address = str(approval.wallet_address)
 
             if binding.get("network") != chain.name:
@@ -685,6 +793,34 @@ class SubmitPreparedTransferTool(BaseTool):
                 wallet_row.encryption_tag,
             )
             wallet_label = wallet_row.label
+
+        # A repeat of an already-sent transfer must not send again. The hash is
+        # recorded at broadcast time (before any receipt wait), so this check is
+        # accurate even if the previous attempt never got to confirm.
+        async with session_scope() as db:
+            prior_hash = await ApprovalService(db).already_broadcast(binding)
+        if prior_hash:
+            return ToolResult.success(
+                data={
+                    "tx_hash": prior_hash,
+                    "network": chain.name,
+                    "wallet_address": wallet_address,
+                    "to": binding.get("to"),
+                    "value_wei": binding.get("value_wei"),
+                    "status": "ALREADY_BROADCAST",
+                    "resent": False,
+                    "note": (
+                        "This exact transfer was already broadcast as "
+                        f"{prior_hash}. Nothing was signed or sent again."
+                    ),
+                },
+                evidence={
+                    "authoritative": False,
+                    "kind": "chain_receipt",
+                    "tx_hash": prior_hash,
+                    "status": "ALREADY_BROADCAST",
+                },
+            )
 
         try:
             raw_tx = await _sign(binding, chain, wallet_address, material)
@@ -723,6 +859,17 @@ class SubmitPreparedTransferTool(BaseTool):
                 f"{type(exc).__name__}: {exc}",
                 category=getattr(exc, "category", "BROADCAST_FAILED"),
             )
+
+        # Persist before waiting on the receipt: if the process dies now, the hash is
+        # still on disk and a retry reports it instead of sending a second transfer.
+        try:
+            async with session_scope() as db:
+                await ApprovalService(db).record_broadcast(
+                    str(params["approval_id"]), tx_hash, "SUBMITTED"
+                )
+        except Exception as exc:
+            logger.error("Could not record broadcast hash for approval %s: %s",
+                         params["approval_id"], exc)
 
         result: Dict[str, Any] = {
             "tx_hash": tx_hash,
@@ -793,6 +940,27 @@ async def _load_signer(db, address: str):
     )
 
 
+def _checksum(address: Optional[str]) -> Optional[str]:
+    """EIP-55 form, which `eth_account` requires for `to`.
+
+    The binding case-folds addresses on purpose so approvals compare equal regardless
+    of checksum case. `sign_transaction` does the opposite and rejects anything that
+    is not in checksum form, so the address is converted here rather than at the point
+    of comparison.
+    """
+    if not address:
+        return None
+    from eth_utils import to_checksum_address
+
+    try:
+        return to_checksum_address(str(address))
+    except Exception:
+        # Leave it alone: the vault's own validation will reject a malformed address
+        # with a message about the address, which is more useful than one about
+        # checksumming.
+        return str(address)
+
+
 async def _sign(binding: Dict[str, Any], chain, wallet_address: str, material) -> str:
     """Sign the approved transaction locally. Nothing is broadcast here."""
     nonce = await engine.get_nonce(chain.name, wallet_address)
@@ -804,10 +972,10 @@ async def _sign(binding: Dict[str, Any], chain, wallet_address: str, material) -
 
     result = vault.sign_transaction(
         SigningRequest(
-            wallet_address=wallet_address,
+            wallet_address=_checksum(wallet_address),
             chain_id=chain.chain_id,
             transaction={
-                "to": binding.get("to"),
+                "to": _checksum(binding.get("to")),
                 "value": int(binding.get("value_wei") or 0),
                 "data": binding.get("data") or "0x",
                 "gas": gas_limit,

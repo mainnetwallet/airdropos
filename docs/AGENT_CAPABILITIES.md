@@ -72,8 +72,40 @@ ALLOW_VALUE_MOVING=true
 
 This grants the `wallet.sign` and `transaction.submit` permissions. It is **not** an
 approval to move money: without a server-side approval bound to the specific
-transaction, every broadcast is refused. The emergency stop still blocks everything,
-and it still needs you.
+transaction, every broadcast is refused. The emergency stop still blocks everything.
+
+### Letting it run unattended
+
+To stop being asked about operations you have already decided about, configure the
+autonomous policy. With no policy configured, every unattended operation is refused
+and the agent behaves exactly as described above.
+
+See **[AUTONOMOUS_EXECUTION.md](./AUTONOMOUS_EXECUTION.md)** for the full guide. In
+brief, create `data/autonomy.json`:
+
+```json
+{
+  "enabled": true,
+  "rules": [
+    { "category": "web.fetch", "action": "allow" },
+    { "category": "campaign.discover", "action": "allow" },
+    {
+      "id": "eth-transfers",
+      "category": "tx.native_transfer",
+      "action": "allow",
+      "allowed_networks": ["ethereum"],
+      "max_value_native": "0.05"
+    }
+  ]
+}
+```
+
+and set `AUTONOMOUS_POLICY_FILE=data/autonomy.json`. The Agent Console shows the
+resulting rules, and `GET /api/v1/agent/autonomy` returns them as JSON.
+
+Asking for the same transfer twice is safe: the second request reuses the first
+approval and reports the original hash with `ALREADY_BROADCAST` instead of sending
+again.
 
 ### ERC-20 tokens
 

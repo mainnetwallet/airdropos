@@ -24,7 +24,7 @@ import clsx from 'clsx'
 import { api } from '@/services/api'
 import { agentChatStore, type ChatMessage } from '@/services/agentChatStore'
 import { Alert, Card } from '@/components/ui'
-import type { AgentToolCall } from '@/types'
+import type { AgentToolCall, AutonomousRule, AutonomyPolicy } from '@/types'
 
 /** Quick actions only fill the composer; nothing is sent until the operator presses send. */
 const QUICK_ACTIONS = [
@@ -165,6 +165,14 @@ function ToolCallList({ calls }: { calls: AgentToolCall[] }) {
           {call.evidence?.kind && call.status === 'success' && (
             <p className="mt-1 text-[11px] text-slate-500">evidence: {call.evidence.kind}</p>
           )}
+          {typeof call.data?.tx_hash === 'string' && call.status === 'success' && (
+            // The hash the backend actually returned. Copyable like an address, and
+            // never derived in the browser.
+            <CopyableAddress address={call.data.tx_hash} label="Copy transaction hash" />
+          )}
+          {typeof call.data?.status === 'string' && call.status === 'success' && (
+            <p className="mt-1 text-[11px] text-slate-400">{call.data.status}</p>
+          )}
           {call.status === 'success' && addressOf(call.data) && (
             <CopyableAddress address={addressOf(call.data) as string} />
           )}
@@ -209,6 +217,80 @@ function ApprovalNotice({ message }: { message: ChatMessage }) {
           </p>
         </div>
       ))}
+    </div>
+  )
+}
+
+/**
+ * What the agent may do unattended, read straight from the backend policy.
+ *
+ * Defensive on purpose: a display component must never be able to take the console
+ * down. An older backend, a proxy error page, or a partial payload renders as
+ * "unavailable" rather than throwing and blanking the chat.
+ */
+function AutonomyPanel({ policy }: { policy: AutonomyPolicy | undefined }) {
+  const configured = policy?.policy
+  const enabled = Boolean(configured?.enabled)
+  const rules = Array.isArray(configured?.rules) ? (configured!.rules as AutonomousRule[]) : []
+  const valueMoving = Boolean(configured?.value_moving)
+  return (
+    <div className="mt-3 rounded-lg border border-surface-300 bg-surface-200/60 px-3 py-2.5 text-xs">
+      <p className="flex flex-wrap items-center gap-2 font-semibold text-slate-200">
+        <span>Autonomous execution</span>
+        <span
+          className={clsx(
+            'rounded px-1.5 py-0.5 text-[11px]',
+            enabled ? 'bg-emerald-500/15 text-emerald-300' : 'bg-slate-500/20 text-slate-400',
+          )}
+        >
+          {enabled ? 'enabled' : 'disabled'}
+        </span>
+        {valueMoving && (
+          <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] text-amber-300">
+            can move funds
+          </span>
+        )}
+      </p>
+      <p className="mt-1 text-slate-400">
+        {!configured
+          ? 'Policy status unavailable.'
+          : rules.length === 0
+            ? 'No rules configured. Every operation is refused until a rule allows it.'
+            : `${rules.length} rule${rules.length === 1 ? '' : 's'} from ${configured.source}`}
+      </p>
+      <ul className="mt-2 space-y-1">
+        {rules.map((rule) => (
+          <li key={rule.rule_id} className="flex flex-wrap items-baseline gap-1.5">
+            <span
+              className={clsx(
+                'rounded px-1 py-0.5 font-mono text-[10px]',
+                rule.action === 'allow'
+                  ? 'bg-emerald-500/15 text-emerald-300'
+                  : 'bg-status-error/15 text-status-error',
+              )}
+            >
+              {rule.action}
+            </span>
+            <span className="font-mono text-slate-300">{rule.category}</span>
+            <span className="text-slate-500">{rule.rule_id}</span>
+            {rule.max_value_native && (
+              <span className="text-slate-500">max {rule.max_value_native}</span>
+            )}
+            {rule.max_value_usd != null && (
+              <span className="text-slate-500">max ${rule.max_value_usd}</span>
+            )}
+            {rule.allowed_networks && (
+              <span className="text-slate-500">{rule.allowed_networks.join(', ')}</span>
+            )}
+            {rule.allowed_tokens && (
+              <span className="text-slate-500">tokens: {rule.allowed_tokens.join(', ')}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="mt-2 text-slate-500">
+        The emergency stop overrides every rule here and cannot be re-enabled by a policy.
+      </p>
     </div>
   )
 }
@@ -267,6 +349,11 @@ export default function AgentChat() {
   const inputRef = useRef<HTMLInputElement>(null)
 
   const { data: info } = useQuery({ queryKey: ['agent-info'], queryFn: api.agentInfo })
+  // Display only: every allow/deny is decided by the backend policy.
+  const { data: autonomy } = useQuery({
+    queryKey: ['agent-autonomy'],
+    queryFn: api.autonomy,
+  })
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -398,6 +485,12 @@ export default function AgentChat() {
             <span className="font-mono">{info.base_url}</span>. There is no model switching, fallback,
             or routing. API key is configured but never returned to the browser.
           </Alert>
+        </div>
+      )}
+
+      {autonomy && (
+        <div className={clsx(!showInfo && 'hidden lg:block')}>
+          <AutonomyPanel policy={autonomy} />
         </div>
       )}
 

@@ -1,9 +1,20 @@
-"""Test isolation for shared, file-backed runtime state.
+"""Test isolation for shared runtime state.
 
-The Emergency Stop and the spend ledger are persisted to files so that the API
-and worker processes share them. Tests must never read or write the real
-`./data` files, so both paths are pointed at a throwaway directory BEFORE the
-app (and its settings) is imported, and the files are wiped between tests.
+Two kinds of state leak out of a test process unless they are pinned:
+
+* The Emergency Stop and the spend ledger are persisted to files so the API and
+  worker processes share them. Both paths are pointed at a throwaway directory
+  BEFORE the app (and its settings) is imported, and the files are wiped between
+  tests.
+* The database session factory. Tools, services and endpoints frequently open their
+  own short-lived session (`database.session.session_scope`), so without isolation a
+  test writes to the operator's real `airdropos.db`, and a test that creates a wallet
+  or an approval leaves it there. Every test now gets its own in-memory database,
+  built from the live models.
+
+The in-memory engine pins one connection with StaticPool. Without that,
+`sqlite:///:memory:` hands every new connection a *different* empty database, and a
+tool opening its own session would query one the test never wrote to.
 """
 
 import os
@@ -37,9 +48,45 @@ def _reset_shared_state() -> None:
     emergency_stop._file_sig = None
     emergency_stop._persist_error = None
 
+    # The autonomous policy is process-global and cached. A test that switches
+    # autonomy on must not leave it on for the next one.
+    from backend.app.security.autonomous_policy import reset_policy_cache
+
+    reset_policy_cache()
+
 
 @pytest.fixture(autouse=True)
 def _clean_shared_runtime_state():
     _reset_shared_state()
     yield
     _reset_shared_state()
+
+
+@pytest.fixture(autouse=True)
+async def _isolated_database(monkeypatch):
+    """Give every test its own database, so none can touch the real one.
+
+    Patches the session factory rather than the engine, because that is the single
+    indirection every non-endpoint code path uses (`session_scope`). Endpoint tests
+    that build their own engine override `get_db` themselves and are unaffected.
+    """
+    import backend.app.database.session as session_module
+    from backend.app.database.session import Base
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    monkeypatch.setattr(
+        session_module,
+        "AsyncSessionLocal",
+        lambda *a, **k: AsyncSession(engine, expire_on_commit=False),
+    )
+    yield engine
+    await engine.dispose()

@@ -8,6 +8,7 @@
 import type {
   AgentChatResponse,
   AgentInfo,
+  AutonomyPolicy,
   DiagnosticsResponse,
   EmergencyStopStatus,
   GoalView,
@@ -164,6 +165,11 @@ export const api = {
 
   // --- Agent ------------------------------------------------------------
   agentInfo: () => request<AgentInfo>('/agent/info'),
+  /**
+   * What the agent may do without asking. Display-only: the backend makes every
+   * allow/deny decision, and the Emergency Stop overrides all of it.
+   */
+  autonomy: () => request<AutonomyPolicy>('/agent/autonomy'),
   /**
    * Send one operator message. The backend runs any tools the model selected and
    * returns their real results, so the response is a report, not just prose.

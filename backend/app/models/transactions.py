@@ -106,12 +106,25 @@ class TransactionApproval(Base):
 
     # Provenance of the request being approved.
     proposal_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+    # Deterministic digest of the transfer intent. A repeated request for the same
+    # intent reuses the existing approval instead of creating a second one, which is
+    # what stops a retried command from broadcasting twice.
+    idempotency_key: Mapped[Optional[str]] = mapped_column(
+        String(128), unique=True, index=True, nullable=True
+    )
+    # Which configured autonomous rule authorized this, when the policy did rather
+    # than a person. NULL for a human approval. Recorded so "why did this send money
+    # unattended" has a precise, checkable answer.
+    policy_rule_id: Mapped[Optional[str]] = mapped_column(String(128), index=True, nullable=True)
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="SET NULL"), nullable=True
     )
 
     status: Mapped[str] = mapped_column(String(20), default="PENDING", nullable=False)
+    # Recorded the moment the node accepts the broadcast, before any receipt wait, so
+    # a crash between the two still leaves the hash on disk.
+    broadcast_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     # PENDING -> CONSUMED (broadcast) | REJECTED (operator said no) | EXPIRED
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
     consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

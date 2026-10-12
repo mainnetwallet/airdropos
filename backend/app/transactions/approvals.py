@@ -30,6 +30,11 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models import TransactionApproval
+from backend.app.security.autonomous_policy import (
+    VALUE_CATEGORIES,
+    is_policy_approver,
+    rule_id_from_approver,
+)
 from backend.app.transactions.engine import NON_HUMAN_APPROVERS
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,24 @@ def canonical_binding(binding: Mapping[str, Any]) -> Dict[str, str]:
     return out
 
 
+def intent_fingerprint(binding: Mapping[str, Any]) -> str:
+    """A stable digest of exactly what a transfer does.
+
+    Used as the idempotency key so the same instruction asked twice maps to one
+    approval and therefore at most one broadcast. The network and chain id are
+    included deliberately: the same address and amount on a different chain is a
+    different transfer, not a repeat.
+    """
+    import hashlib
+
+    normalized = canonical_binding(binding)
+    material = "|".join(
+        f"{key}={normalized.get(key, '')}"
+        for key in sorted(("network", "chain_id", "wallet", "to", "value_wei", "data"))
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:64]
+
+
 class ApprovalService:
     """Create, inspect, reject and consume transaction approvals."""
 
@@ -90,20 +113,75 @@ class ApprovalService:
         proposal_id: Optional[str] = None,
         task_id: Optional[Any] = None,
         ttl_minutes: int = DEFAULT_APPROVAL_TTL_MINUTES,
+        rule_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> TransactionApproval:
-        """Record that a named human approved one specific transaction."""
+        """Record approval of one specific transaction.
+
+        See `find_or_create` for the variant that also reports whether the row was
+        newly created.
+        """
+        row, _created = await self.find_or_create(
+            approved_by=approved_by,
+            binding=binding,
+            summary=summary,
+            proposal_id=proposal_id,
+            task_id=task_id,
+            ttl_minutes=ttl_minutes,
+            rule_id=rule_id,
+            idempotency_key=idempotency_key,
+        )
+        return row
+
+    async def find_or_create(
+        self,
+        *,
+        approved_by: str,
+        binding: Mapping[str, Any],
+        summary: str,
+        proposal_id: Optional[str] = None,
+        task_id: Optional[Any] = None,
+        ttl_minutes: int = DEFAULT_APPROVAL_TTL_MINUTES,
+        rule_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+    ) -> tuple[TransactionApproval, bool]:
+        """Record an approval, or return the existing one for this exact intent.
+
+        Returns `(row, created)`. `created` is False when an approval already existed
+        for this idempotency key, which is how a repeated request is told apart from a
+        new one without either being able to queue a second broadcast.
+
+        `approved_by` is either a named human or the autonomous-policy identity. The
+        policy identity is NOT a claim the caller can simply make: `verify_and_consume`
+        re-evaluates the live policy against the actual transaction before spending it,
+        so writing that string into a tool call authorises nothing on its own.
+        """
         who = str(approved_by or "").strip()
         if not who:
             raise ApprovalError("An approval must name the human who gave it.")
         if who.lower() in NON_HUMAN_APPROVERS:
+            # `auto` is in this set. A policy identity must use the explicit
+            # `policy:autonomous:<rule>` form, which is checked below, so it can never
+            # collide with a bare "the system did it".
             raise ApprovalError(
                 f"'{who}' is not a person. The agent cannot approve its own transaction."
+            )
+        if is_policy_approver(who) and not rule_id_from_approver(who):
+            raise ApprovalError(
+                "An autonomous approval must name the rule that authorized it."
             )
 
         normalized = canonical_binding(binding)
         for required in ("network", "wallet", "to"):
             if not normalized.get(required):
                 raise ApprovalError(f"Approval binding is missing '{required}'.")
+
+        if idempotency_key:
+            existing = await self.find_by_idempotency_key(idempotency_key)
+            if existing is not None:
+                # One intent, one approval. A repeated request must not queue a second
+                # broadcast of a transfer that is already authorized or already sent.
+                return existing, False
 
         row = TransactionApproval(
             approval_id=secrets.token_urlsafe(18)[:32],
@@ -117,6 +195,8 @@ class ApprovalService:
             estimated_cost_usd=_as_float(normalized.get("estimated_cost_usd")),
             binding=normalized,
             proposal_id=proposal_id,
+            idempotency_key=idempotency_key,
+            policy_rule_id=rule_id_from_approver(who),
             task_id=task_id,
             summary=(summary or "")[:2000],
             status=STATUS_PENDING,
@@ -125,10 +205,11 @@ class ApprovalService:
         self.db.add(row)
         await self.db.flush()
         logger.info(
-            "Approval %s recorded for %s -> %s on %s by %s",
+            "Approval %s recorded for %s -> %s on %s by %s (rule=%s)",
             row.approval_id, row.wallet_address, row.to_address, row.network, who,
+            rule_id_from_approver(who),
         )
-        return row
+        return row, True
 
     # ------------------------------------------------------------------
     # Reads
@@ -136,6 +217,21 @@ class ApprovalService:
     async def get(self, approval_id: str) -> Optional[TransactionApproval]:
         return await self.db.scalar(
             select(TransactionApproval).where(TransactionApproval.approval_id == approval_id)
+        )
+
+    async def find_by_idempotency_key(self, key: str) -> Optional[TransactionApproval]:
+        """The approval already issued for this exact intent, if any.
+
+        This is what makes a repeated request safe. "Transfer 0.01 ETH to X" asked
+        twice must not produce two approvals and therefore two broadcasts.
+        """
+        if not key:
+            return None
+        return await self.db.scalar(
+            select(TransactionApproval)
+            .where(TransactionApproval.idempotency_key == key)
+            .order_by(TransactionApproval.created_at.desc())
+            .limit(1)
         )
 
     async def list_recent(self, limit: int = 25) -> List[TransactionApproval]:
@@ -164,8 +260,14 @@ class ApprovalService:
             return False, "This approval has already been used for a broadcast."
         if row.status == STATUS_REJECTED:
             return False, f"This approval was rejected: {row.rejection_reason or 'no reason given'}."
+        # A policy approver is neither a person nor a spoofable name: it is only
+        # honoured if `verify_and_consume` can still prove, from the live policy and
+        # the actual transaction, that the named rule authorizes it. `evaluate` alone
+        # never grants it.
         if str(row.approved_by).strip().lower() in NON_HUMAN_APPROVERS:
             return False, "The approver is not a person."
+        if is_policy_approver(row.approved_by) and not row.policy_rule_id:
+            return False, "This autonomous approval does not name the rule that authorized it."
 
         expires = _as_utc(row.expires_at)
         if expires is None:
@@ -249,6 +351,13 @@ class ApprovalService:
             )
             return False
 
+        # An autonomous approval is only as good as the policy behind it, evaluated
+        # NOW against the transaction actually presented. An operator who narrows or
+        # disables a rule between approval and broadcast stops the broadcast, and an
+        # approval naming a rule that no longer exists is dead.
+        if is_policy_approver(row.approved_by) and not _policy_still_authorizes(row, binding):
+            return False
+
         result = await self.db.execute(
             update(TransactionApproval)
             .where(
@@ -269,6 +378,30 @@ class ApprovalService:
         await self.db.commit()
         logger.info("Approval %s consumed for a real broadcast", approval_id)
         return True
+
+    async def record_broadcast(
+        self, approval_id: str, tx_hash: str, status: str = "SUBMITTED"
+    ) -> None:
+        """Attach the real broadcast hash to the approval that authorized it.
+
+        Recorded immediately after the node accepts the transaction, before any receipt
+        wait. That ordering matters: if the process dies between the two, the hash is
+        already on disk and a retry can report what happened instead of sending a
+        second time.
+        """
+        row = await self.get(approval_id)
+        if row is None:
+            return
+        row.tx_hash = tx_hash
+        row.broadcast_status = status
+        await self.db.flush()
+
+    async def already_broadcast(self, binding: Mapping[str, Any]) -> Optional[str]:
+        """The hash of an earlier broadcast of this exact intent, if any."""
+        row = await self.find_by_idempotency_key(intent_fingerprint(binding))
+        if row is None:
+            return None
+        return row.tx_hash
 
     async def expire_stale(self) -> int:
         """Mark timed-out approvals EXPIRED so the UI stops offering them."""
@@ -324,6 +457,73 @@ def _as_float(value: Any) -> Optional[float]:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+# ----------------------------------------------------------------------
+# Policy re-authorization
+# ----------------------------------------------------------------------
+def _policy_still_authorizes(
+    row: TransactionApproval, binding: Mapping[str, str]
+) -> bool:
+    """Re-evaluate the autonomous policy against the transaction being broadcast.
+
+    This is the load-bearing check for unattended execution. The approval row records
+    a rule id; this asks the *live* policy whether that rule still authorizes this
+    exact transaction. Nothing here is derived from the caller.
+
+    It also maps the transfer back onto its category, so a rule for
+    `tx.native_transfer` can never authorize an ERC-20 transfer (different `to`:
+    the token contract) and vice versa.
+    """
+    from backend.app.security.autonomous_policy import Category, get_policy
+
+    policy = get_policy()
+    if not policy.enabled:
+        logger.warning(
+            "Broadcast refused: autonomous execution is disabled; approval %s cannot be used.",
+            row.approval_id,
+        )
+        return False
+
+    rule_id = row.policy_rule_id or rule_id_from_approver(row.approved_by)
+    rule = next((r for r in policy.rules if r.rule_id == rule_id), None)
+    if rule is None:
+        logger.warning(
+            "Broadcast refused: rule %r no longer exists in the policy; approval %s is dead.",
+            rule_id, row.approval_id,
+        )
+        return False
+
+    if rule.category not in VALUE_CATEGORIES:
+        logger.warning(
+            "Broadcast refused: rule %r is for %r, which is not a value-moving category.",
+            rule_id, rule.category,
+        )
+        return False
+
+    approved = canonical_binding(row.binding or {})
+    destination = approved.get("to", "")
+    # An ERC-20 transfer's `to` is the token contract, so the category is decided by
+    # the calldata, which only an ERC-20 call carries.
+    category = (
+        Category.TX_TOKEN_TRANSFER
+        if str(approved.get("data") or "0x") not in ("", "0x")
+        else Category.TX_NATIVE_TRANSFER
+    )
+
+    decision = policy.evaluate(
+        category,
+        network=approved.get("network"),
+        wallet=approved.get("wallet"),
+        destination=destination,
+        value_native=approved.get("value_wei"),
+    )
+    if not decision.allowed:
+        logger.warning(
+            "Broadcast refused by autonomous policy: %s (approval %s)", decision.reason, row.approval_id
+        )
+        return False
+    return True
 
 
 # ----------------------------------------------------------------------

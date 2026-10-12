@@ -175,6 +175,69 @@ def _trim_history(history: List["ChatTurn"]) -> List["ChatTurn"]:
     return kept
 
 
+class AutonomyCheckRequest(BaseModel):
+    """One operation to ask about. Every field is a fact about the operation."""
+
+    category: str = Field(max_length=64)
+    network: Optional[str] = Field(default=None, max_length=50)
+    wallet: Optional[str] = Field(default=None, max_length=42)
+    destination: Optional[str] = Field(default=None, max_length=42)
+    token: Optional[str] = Field(default=None, max_length=64)
+    value_usd: Optional[float] = None
+    value_native: Optional[str] = Field(default=None, max_length=40)
+
+
+@router.get("/agent/autonomy", tags=["agent"])
+async def autonomy_policy(
+    request: Request,
+    principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    """What the agent may do without asking, and why any operation was refused.
+
+    Read from configuration. The model never contributes an allow decision; this
+    endpoint exists so the operator can see the same rules the agent is held to, and
+    so a refusal can be explained precisely instead of guessed at.
+    """
+    enforce_rate_limit(request, "read")
+    from backend.app.security.autonomous_policy import get_policy
+
+    return {
+        "policy": get_policy().describe(),
+        "value_moving_enabled": bool(getattr(settings, "ALLOW_VALUE_MOVING", False)),
+        "emergency_stop": emergency_stop.status(),
+        "note": (
+            "Autonomy is deny-by-default. The Emergency Stop overrides every rule here "
+            "and cannot be re-enabled by a policy."
+        ),
+    }
+
+
+@router.post("/agent/autonomy/check", tags=["agent"])
+async def check_autonomy(
+    request: Request,
+    payload: AutonomyCheckRequest,
+    principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    """Ask whether one specific operation is authorized to run unattended.
+
+    Returns the policy's own reasoning, including the exact rule and the exact
+    constraint that refused it, so the console can explain a refusal before the agent
+    attempts the operation.
+    """
+    enforce_rate_limit(request, "read")
+    from backend.app.security.autonomous_policy import get_policy
+
+    return get_policy().evaluate(
+        payload.category,
+        network=payload.network,
+        wallet=payload.wallet,
+        destination=payload.destination,
+        token=payload.token,
+        value_usd=payload.value_usd,
+        value_native=payload.value_native,
+    ).to_dict()
+
+
 @router.post("/agent/chat", tags=["agent"])
 async def agent_chat(
     request: Request,
