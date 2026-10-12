@@ -50,27 +50,57 @@ def _wrap(exc: store.ProfileError) -> HTTPException:
     return HTTPException(status_code=exc.status, detail={"error": str(exc)})
 
 
-async def _live_status(profile_id: str) -> Optional[str]:
-    """Status of the running session for a profile, or None (also when the worker is down)."""
+# Result of asking the worker about a profile's browser session.
+#   a status string -> the worker answered and a session record exists
+#   NOT_RUNNING     -> the worker answered and there is definitely no session for this profile
+#   UNKNOWN         -> the worker could not be asked (down, unreachable, rejected our key, ...)
+# UNKNOWN is never treated as "not running": destructive operations must fail closed.
+NOT_RUNNING = "none"
+UNKNOWN = "unknown"
+
+
+async def _live_status(profile_id: str) -> str:
+    """Status of the running session for a profile: a status, NOT_RUNNING or UNKNOWN."""
     try:
         data = await client.get_json(f"/sessions/browser/{profile_id}")
-        return data["session"]["status"]
+        return str(data["session"]["status"])
+    except client.GatewayError as exc:
+        # Only OUR gateway's explicit "no such session" counts. A bare 404 could come from a
+        # wrong LIVE_GATEWAY_URL pointing at some other server, which must not unlock deletes.
+        if exc.status == 404 and exc.code == "not_found":
+            return NOT_RUNNING
+        return UNKNOWN
     except Exception:
-        return None
+        return UNKNOWN
 
 
 def _public(profile: store.BrowserProfile, status: Optional[str]) -> Dict[str, Any]:
+    """``status`` is None when no session exists; the UI also receives "unknown" when the worker is unreachable."""
     data = profile.as_dict()
     data["has_saved_state"] = store.has_state(profile.id)
-    data["session_status"] = status
+    data["session_status"] = None if status in (None, NOT_RUNNING) else status
     return data
 
 
 @router.get("/profiles")
 async def list_profiles(principal: Principal = Depends(require_read)) -> Dict[str, Any]:
+    profiles = store.list_profiles()
+    reachable = True
+    statuses: Dict[str, str] = {}
+    if profiles:
+        try:
+            data = await client.get_json("/sessions")
+            statuses = {
+                str(x.get("key")): str(x.get("status"))
+                for x in data.get("sessions", [])
+                if x.get("integration") == "browser"
+            }
+        except Exception:
+            reachable = False
     out = []
-    for profile in store.list_profiles():
-        out.append(_public(profile, await _live_status(profile.id)))
+    for profile in profiles:
+        status = statuses.get(profile.id, NOT_RUNNING) if reachable else UNKNOWN
+        out.append(_public(profile, status))
     return {"profiles": out}
 
 
@@ -108,12 +138,24 @@ async def update_profile(
 
 
 async def _require_not_running(profile_id: str) -> None:
+    """Fail closed: only a definite "no session" / "stopped" answer allows a destructive change."""
     status = await _live_status(profile_id)
-    if status is not None and status != "stopped":
+    if status in (NOT_RUNNING, "stopped"):
+        return
+    if status == UNKNOWN:
         raise HTTPException(
-            status_code=409,
-            detail={"error": "A browser session is running for this profile. Stop it in Live Broadcast first."},
+            status_code=503,
+            detail={
+                "error": (
+                    "Cannot confirm whether a browser session is running for this profile "
+                    "(the worker is unreachable). Nothing was changed; try again once the worker is up."
+                )
+            },
         )
+    raise HTTPException(
+        status_code=409,
+        detail={"error": "A browser session is running for this profile. Stop it in Live Broadcast first."},
+    )
 
 
 @router.delete("/profiles/{profile_id}")

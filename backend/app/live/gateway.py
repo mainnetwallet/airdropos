@@ -35,6 +35,17 @@ async def _require_secret(x_live_gateway_key: Optional[str] = Header(default=Non
         raise HTTPException(status_code=401, detail="bad gateway key")
 
 
+async def _json_body(request: Request) -> Dict[str, Any]:
+    """The request body as a JSON object; anything else is a clean 400 instead of a 500."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail={"code": "bad_json", "message": "Body must be a JSON object."})
+    return body
+
+
 def _provider(integration: str):
     provider = PROVIDERS.get(integration)
     if provider is None:
@@ -116,7 +127,7 @@ def build_app() -> FastAPI:
 
     @app.post("/sessions", dependencies=deps)
     async def create_session(request: Request) -> Dict[str, Any]:
-        body = await request.json()
+        body = await _json_body(request)
         provider = _provider(str(body.get("integration") or ""))
         try:
             return {"session": await provider.create(body)}
@@ -154,7 +165,7 @@ def build_app() -> FastAPI:
 
     @app.post("/sessions/{integration}/{key}/action", dependencies=deps)
     async def action(integration: str, key: str, request: Request) -> Dict[str, Any]:
-        body = await request.json()
+        body = await _json_body(request)
         try:
             return await _provider(integration).action(key, str(body.get("action") or ""), body)
         except HTTPException:
@@ -166,7 +177,7 @@ def build_app() -> FastAPI:
 
     @app.post("/sessions/{integration}/{key}/input", dependencies=deps)
     async def send_input(integration: str, key: str, request: Request) -> Dict[str, Any]:
-        body = await request.json()
+        body = await _json_body(request)
         try:
             return await _provider(integration).input(key, body)
         except HTTPException:
@@ -246,6 +257,10 @@ async def _sweep_loop(shutdown_event: asyncio.Event) -> None:
     while not shutdown_event.is_set():
         try:
             hub.browser_sessions.sweep()
+            # Close pages/contexts left behind by crashes or closed tabs even when nobody is watching.
+            browser = PROVIDERS.get("browser")
+            if browser is not None and hasattr(browser, "reconcile"):
+                await browser.reconcile()
         except Exception:
             logger.exception("Session sweep failed")
         await asyncio.sleep(5)

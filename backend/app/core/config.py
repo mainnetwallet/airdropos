@@ -174,6 +174,9 @@ class Settings(BaseSettings):
     BROWSER_ACTION_TIMEOUT_MS: int = 15000
     BROWSER_VIEWPORT_WIDTH: int = 1280
     BROWSER_VIEWPORT_HEIGHT: int = 800
+    # Loopback, link-local and cloud-metadata targets are always refused. Private LAN ranges
+    # (10.x, 172.16-31.x, 192.168.x) are refused too unless this is true.
+    BROWSER_ALLOW_PRIVATE_NETWORK: bool = False
 
     # =========================================================================
     # LIVE BROADCAST (session gateway inside the worker process)

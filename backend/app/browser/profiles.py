@@ -41,9 +41,20 @@ _lock = threading.Lock()
 
 
 def normalize_session_key(key: str) -> str:
-    """Make any agent/profile-supplied key safe to use as an id and as a path part."""
-    cleaned = _KEY_RE.sub("_", (key or "").strip())[:64].strip(".")
-    return cleaned or "default"
+    """Make any agent/profile-supplied key safe to use as an id and as a path part.
+
+    Keys that are already safe are returned unchanged (profile ids always are). A key that
+    needed rewriting gets a short hash of the ORIGINAL appended, so two different raw keys
+    ("a b" and "a_b") can never collapse into the same browser context / state directory.
+    """
+    raw = (key or "").strip()
+    if not raw:
+        return "default"
+    cleaned = _KEY_RE.sub("_", raw).strip(".")
+    if cleaned == raw and len(raw) <= 64:
+        return raw
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{(cleaned or 'session')[:55]}-{digest}"
 
 
 def valid_profile_id(value: str) -> bool:
@@ -93,6 +104,16 @@ def _read_all() -> List[BrowserProfile]:
         if isinstance(item, dict) and valid_profile_id(str(item.get("id", ""))):
             out.append(BrowserProfile(**{k: v for k, v in item.items() if k in known}))
     return out
+
+
+def _private_dir(path: Path) -> None:
+    """Create a directory owner-only, together with its parents BELOW ROOT (ROOT itself is left as is)."""
+    path.mkdir(parents=True, exist_ok=True)
+    for d in (path, *[q for q in path.parents if ROOT in q.parents]):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
 
 
 def _write_all(profiles: List[BrowserProfile]) -> None:
@@ -188,12 +209,20 @@ def delete_profile(profile_id: str) -> None:
         if not any(p.id == profile_id for p in profiles):
             raise ProfileError("Profile not found.", 404)
         _write_all([p for p in profiles if p.id != profile_id])
-    clear_state(profile_id)
+        clear_state(profile_id)
 
 
 # ---------------------------------------------------------------------- saved state
 def _state_dir(key: str) -> Path:
     return ROOT / "profiles" / normalize_session_key(key)
+
+
+_DEFAULT_SECRET_KEY = "0123456789abcdef" * 4  # the publicly known development default in config.py
+
+
+def _encryption_unsafe() -> bool:
+    """Cookies are credentials: never encrypt them with a key anyone can read in the repository."""
+    return settings.ENVIRONMENT == "production" and settings.SECRET_KEY == _DEFAULT_SECRET_KEY
 
 
 def _fernet():
@@ -207,34 +236,58 @@ def has_state(key: str) -> bool:
     return (_state_dir(key) / "state.enc").exists()
 
 
-def save_state(key: str, state: Dict[str, Any]) -> None:
-    directory = _state_dir(key)
-    directory.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-    token = _fernet().encrypt(json.dumps(state).encode("utf-8"))
-    fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".state-", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(token)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, directory / "state.enc")
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+def save_state(key: str, state: Dict[str, Any]) -> bool:
+    """Encrypt and store session state. Only real profiles are persisted.
+
+    Returns False (and writes nothing) when the profile does not exist any more, so a
+    session closing after its profile was deleted cannot leave orphaned cookies behind,
+    and ad-hoc agent session keys never create credential files that nothing can clear.
+    """
+    key = normalize_session_key(key)
+    if _encryption_unsafe():
+        logger.error("Browser session state NOT saved: SECRET_KEY is still the default in production.")
+        return False
+    with _lock:
+        if get_profile(key) is None:
+            return False
+        directory = _state_dir(key)
+        _private_dir(directory)
+        # The profile id travels INSIDE the ciphertext so a copied/renamed state.enc cannot be
+        # loaded into a different profile.
+        payload = {"v": 1, "profile": key, "state": state}
+        token = _fernet().encrypt(json.dumps(payload).encode("utf-8"))
+        fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".state-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(token)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, directory / "state.enc")
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+    return True
 
 
 def load_state(key: str) -> Optional[Dict[str, Any]]:
+    key = normalize_session_key(key)
+    if _encryption_unsafe() or get_profile(key) is None:
+        return None
     path = _state_dir(key) / "state.enc"
     if not path.exists():
         return None
     try:
-        return json.loads(_fernet().decrypt(path.read_bytes()).decode("utf-8"))
+        data = json.loads(_fernet().decrypt(path.read_bytes()).decode("utf-8"))
     except Exception as exc:  # wrong key, corruption: start clean rather than crash
         logger.warning("Saved session state for '%s' could not be read (%s); starting clean.", key, type(exc).__name__)
         return None
+    if not isinstance(data, dict):
+        return None
+    if "profile" in data:
+        if data.get("profile") != key or not isinstance(data.get("state"), dict):
+            logger.warning("Saved session state for '%s' belongs to another profile; ignoring it.", key)
+            return None
+        return data["state"]
+    return data if "cookies" in data or "origins" in data else None
 
 
 def clear_state(key: str) -> None:

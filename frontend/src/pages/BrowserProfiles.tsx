@@ -156,7 +156,9 @@ export default function BrowserProfiles() {
       ) : (
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
           {profiles.map((p) => {
-            const running = p.session_status != null && p.session_status !== 'stopped'
+            const unknown = p.session_status === 'unknown'
+            const running = p.session_status != null && p.session_status !== 'stopped' && !unknown
+            const locked = running || unknown // never change a profile whose real state is not confirmed
             return (
               <Card key={p.id} className="flex flex-col gap-3">
                 <div className="flex items-start justify-between gap-2">
@@ -168,6 +170,8 @@ export default function BrowserProfiles() {
                     <Link to={`/live/browser/${encodeURIComponent(p.id)}`}>
                       <Pill tone="green"><span className="inline-flex items-center gap-1"><Radio className="h-3 w-3" /> Running</span></Pill>
                     </Link>
+                  ) : unknown ? (
+                    <Pill tone="gray">Status unknown</Pill>
                   ) : (
                     <Pill tone="gray">Not running</Pill>
                   )}
@@ -182,7 +186,7 @@ export default function BrowserProfiles() {
                 </div>
                 {p.start_url && <p className="truncate text-xs text-slate-500">Start: {p.start_url}</p>}
                 <div className="mt-auto flex flex-wrap gap-2">
-                  <button type="button" disabled={running || start.isPending} onClick={() => start.mutate(p)} className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-semibold text-white disabled:opacity-50">
+                  <button type="button" disabled={locked || start.isPending} onClick={() => start.mutate(p)} className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-accent px-3 text-xs font-semibold text-white disabled:opacity-50">
                     {start.isPending && start.variables?.id === p.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />} Start session
                   </button>
                   <button type="button" onClick={() => setEditing(p)} className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-surface-200 px-3 text-xs font-semibold text-slate-200">
@@ -190,7 +194,7 @@ export default function BrowserProfiles() {
                   </button>
                   <button
                     type="button"
-                    disabled={!p.has_saved_state || running}
+                    disabled={!p.has_saved_state || locked}
                     onClick={() => window.confirm(`Forget saved cookies for "${p.name}"? Every site will be logged out for this profile.`) && clearState.mutate(p.id)}
                     className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-surface-200 px-3 text-xs font-semibold text-slate-200 disabled:opacity-50"
                   >
@@ -198,7 +202,7 @@ export default function BrowserProfiles() {
                   </button>
                   <button
                     type="button"
-                    disabled={running}
+                    disabled={locked}
                     onClick={() => window.confirm(`Delete profile "${p.name}" and its saved session?`) && remove.mutate(p.id)}
                     className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-red-500/10 px-3 text-xs font-semibold text-red-600 disabled:opacity-50"
                   >

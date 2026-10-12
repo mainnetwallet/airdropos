@@ -70,7 +70,7 @@ class NavigateTool(BaseTool):
 
         shot = await controller.screenshot(params["session_key"], "navigate")
         return ToolResult.success(
-            data={"observation": obs, "screenshot_path": shot},
+            data={"observation": obs.__dict__, "screenshot_path": shot},
             evidence={"authoritative": True, "kind": "page_observation", "url": obs.get("url")},
         )
 

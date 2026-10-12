@@ -52,6 +52,8 @@ def bind_allowed() -> Optional[str]:
     """
     if _is_loopback(settings.LIVE_GATEWAY_HOST):
         return None
+    if settings.LIVE_GATEWAY_SECRET and len(settings.LIVE_GATEWAY_SECRET) < 24:
+        return "LIVE_GATEWAY_SECRET is shorter than 24 characters, too weak for a gateway reachable beyond loopback."
     if not settings.LIVE_GATEWAY_SECRET and settings.SECRET_KEY == _DEFAULT_SECRET_KEY:
         return (
             "LIVE_GATEWAY_HOST is not loopback but neither LIVE_GATEWAY_SECRET nor a custom "

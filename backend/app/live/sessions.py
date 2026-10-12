@@ -96,6 +96,10 @@ class BrowserSessionRegistry:
 
     def ensure(self, key: str, *, profile_id: Optional[str] = None, profile_name: Optional[str] = None) -> SessionRecord:
         rec = self.records.get(key)
+        if rec is not None and rec.stopped and rec.stopped_by_operator:
+            # Only restart() (an operator starting the session again) may undo an operator stop.
+            # A late agent/tool call must not quietly bring it back.
+            return rec
         if rec is None:
             self._ordinal += 1
             rec = SessionRecord(key=key, ordinal=self._ordinal)
@@ -116,6 +120,8 @@ class BrowserSessionRegistry:
 
     def touch(self, key: str, *, url: Optional[str] = None, title: Optional[str] = None) -> SessionRecord:
         rec = self.ensure(key)
+        if rec.stopped:
+            return rec
         rec.last_activity_at = time.time()
         if url is not None:
             rec.last_url = url
@@ -137,6 +143,10 @@ class BrowserSessionRegistry:
             self._emit(rec, "session.recovered", "Session recovered", SessionStatus.RUNNING)
         return rec
 
+    def is_operator_stopped(self, key: str) -> bool:
+        rec = self.records.get(key)
+        return bool(rec is not None and rec.stopped and rec.stopped_by_operator)
+
     # ------------------------------------------------------------------ agent gate
     def gate(self, key: str) -> Optional[str]:
         """Reason the AGENT must not act on this session right now, or None."""
@@ -157,7 +167,7 @@ class BrowserSessionRegistry:
     # ------------------------------------------------------------------ state changes
     def mark_waiting(self, key: str, reason: str) -> None:
         rec = self.ensure(key)
-        if rec.waiting and rec.waiting_reason == reason:
+        if rec.stopped or (rec.waiting and rec.waiting_reason == reason):
             return
         rec.waiting = True
         rec.waiting_reason = reason[:200]
@@ -190,6 +200,8 @@ class BrowserSessionRegistry:
 
     def mark_error(self, key: str, detail: str) -> None:
         rec = self.ensure(key)
+        if rec.stopped:
+            return
         rec.failed = True
         rec.last_error = detail[:200]
         self._emit(rec, "session.error", f"Error: {detail[:160]}", SessionStatus.FAILED)

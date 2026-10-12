@@ -47,6 +47,11 @@ def _redact(text: str) -> str:
         return re.sub(r"(?i)(token|secret|password|api[_-]?key)\s*[=:]\s*\S+", r"\1=***", text)
 
 
+def redact_text(text: Optional[str]) -> str:
+    """Public wrapper: strip credential-looking values from text shown to dashboard viewers."""
+    return _redact(text or "")
+
+
 class EventLog:
     def __init__(self, capacity: int = MAX_EVENTS) -> None:
         self._events: Deque[Dict[str, Any]] = deque(maxlen=capacity)

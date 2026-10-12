@@ -109,7 +109,8 @@ export interface BrowserProfileInfo {
   created_at: string
   updated_at: string
   has_saved_state: boolean
-  session_status: SessionStatus | null
+  // 'unknown' = the worker could not be reached, so the real state cannot be confirmed
+  session_status: SessionStatus | 'unknown' | null
 }
 
 export interface BrowserProfileInput {
