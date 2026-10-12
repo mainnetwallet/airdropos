@@ -5,6 +5,13 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security (Part 3)
+- Production startup guard: refuses default/placeholder `SECRET_KEY`, the public dev `WALLET_VAULT_MASTER_KEY`, `AUTH_ENABLED=false`, missing `OPERATOR_PASSWORD_HASH` and the default DB password. `ENVIRONMENT` is normalised so `Production`/`prod` cannot disable the checks. Vault key must be exactly 64 hex characters (config and `KeyVault`). `.env.example` no longer ships the dev vault key.
+- Browser: WebSocket handshakes are now guarded (context creation fails closed without `route_web_socket`; Playwright floor raised to 1.48); IPv4-compatible, site-local, 6to4 and Teredo IPv6 addresses are blocked.
+- Deployment: no hardcoded Postgres password (`POSTGRES_PASSWORD` required; `run.py` generates one for new `.env` files), no `--reload` in compose, nginx hardening headers and proper WebSocket upgrade handling, `.dockerignore` files keep `.env`/`data/` out of build contexts. `FRONTEND_BIND` lets operators keep the dashboard on loopback.
+- Alembic: `%(here)s`-relative paths (previously failed outside `backend/`); stale `backend/migrations/` marked deprecated (not deleted).
+- `submit_raw`: caller-supplied `human_approved` is no longer accepted as proof; an injected `ApprovalVerifier` must confirm a single-use approval bound to the exact transaction, and the signed bytes are decoded to enforce chain id, approved destination, no contract creation and restricted selectors. Raw broadcast stays disabled until a verifier is configured.
+
 ### Security (Live Broadcast, batch 2)
 - Browser destination guard now resolves hostnames and checks every request (redirects, iframes, fetches), blocks service workers, unwraps IPv4-mapped/NAT64 addresses and blocks cloud-metadata addresses even with `BROWSER_ALLOW_PRIVATE_NETWORK=true`.
 - Telegram: pause/stop re-checked under the client lock, auth/session errors never retried, idempotent pause/resume/stop with accurate events, no raw exception text or tracebacks in logs.

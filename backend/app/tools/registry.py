@@ -50,20 +50,36 @@ class AuthorizationPolicy:
         allow_wallet_signing: bool = True,
     ) -> None:
         self.enabled_permissions = set(enabled_permissions or [])
-        self.allowed_networks = set(allowed_networks or known_networks())
+        # `None` means "not configured" and takes the supported-chain default. An
+        # explicit empty list is an operator decision to allow NO network; it must
+        # not silently widen to every network.
+        self.allowed_networks = {
+            str(n).strip().lower()
+            for n in (known_networks() if allowed_networks is None else allowed_networks)
+            if str(n).strip()
+        }
         self.max_tx_value_usd = (
             max_tx_value_usd if max_tx_value_usd is not None else settings.MAX_TRANSACTION_VALUE_USD
         )
         self.max_daily_spend_usd = (
             max_daily_spend_usd if max_daily_spend_usd is not None else settings.MAX_DAILY_GAS_SPEND_USD
         )
-        self.allowed_wallet_ids = set(allowed_wallet_ids or [])
+        # Deny-by-default: no wallet id is permitted unless explicitly listed.
+        self.allowed_wallet_ids = {str(w).strip() for w in (allowed_wallet_ids or []) if str(w).strip()}
         self.allow_web_interaction = allow_web_interaction
         self.allow_transaction_submission = allow_transaction_submission
         self.allow_wallet_signing = allow_wallet_signing
 
     def permits(self, tool: BaseTool) -> tuple[bool, str]:
         required = set(tool.required_permissions)
+        # Fail closed: a tool that declares NO permissions would otherwise be allowed by every
+        # policy, including the deny-all default, because the empty set is a subset of anything.
+        # Only a pure, side-effect-free tool may omit them.
+        if not required and tool.side_effect is not SideEffect.NONE:
+            return False, (
+                f"Tool '{tool.name}' declares no required permissions but has side effect "
+                f"'{tool.side_effect.value}'; refusing."
+            )
         if not required.issubset(self.enabled_permissions):
             missing = sorted(required - self.enabled_permissions)
             return False, f"Permission(s) not granted: {', '.join(missing)}"
@@ -77,15 +93,52 @@ class AuthorizationPolicy:
 
         return True, ""
 
-    def permits_network(self, network: str) -> tuple[bool, str]:
-        if network and network.lower() not in self.allowed_networks:
+    def permits_network(self, network: Any) -> tuple[bool, str]:
+        """Fail closed: a missing, blank or non-string network is never permitted."""
+        if not isinstance(network, str) or not network.strip():
+            return False, "A network must be specified and be on the allowed network list."
+        if network.strip().lower() not in self.allowed_networks:
             return False, f"Network '{network}' is not in the allowed network list."
+        return True, ""
+
+    def permits_wallet(self, wallet_id: Any) -> tuple[bool, str]:
+        """Fail closed: only explicitly allowed wallet ids pass."""
+        if not isinstance(wallet_id, str) or not wallet_id.strip():
+            return False, "A wallet id must be specified and be on the allowed wallet list."
+        if wallet_id.strip() not in self.allowed_wallet_ids:
+            return False, f"Wallet '{wallet_id}' is not in the allowed wallet list."
+        return True, ""
+
+    def permits_arguments(self, tool: BaseTool, params: Dict[str, Any]) -> tuple[bool, str]:
+        """Enforce the network and wallet allowlists on a tool call's arguments.
+
+        Applies to any tool whose schema declares a `network`, `wallet_id` or
+        `wallet_ids` parameter, so a new tool cannot opt out by forgetting a check.
+        """
+        props = (tool.input_schema or {}).get("properties", {})
+        if "network" in props:
+            ok, reason = self.permits_network(params.get("network"))
+            if not ok:
+                return False, reason
+        if "wallet_id" in props:
+            ok, reason = self.permits_wallet(params.get("wallet_id"))
+            if not ok:
+                return False, reason
+        if "wallet_ids" in props:
+            ids = params.get("wallet_ids")
+            if not isinstance(ids, (list, tuple)) or not ids:
+                return False, "At least one wallet id must be specified."
+            for wallet_id in ids:
+                ok, reason = self.permits_wallet(wallet_id)
+                if not ok:
+                    return False, reason
         return True, ""
 
     def describe(self) -> Dict[str, Any]:
         return {
             "enabled_permissions": sorted(self.enabled_permissions),
             "allowed_networks": sorted(self.allowed_networks),
+            "allowed_wallet_ids": sorted(self.allowed_wallet_ids),
             "max_transaction_value_usd": self.max_tx_value_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "web_interaction_allowed": self.allow_web_interaction,
@@ -94,7 +147,12 @@ class AuthorizationPolicy:
         }
 
 
-DEFAULT_POLICY = AuthorizationPolicy(enabled_permissions=[])
+DEFAULT_POLICY = AuthorizationPolicy(
+    enabled_permissions=[],
+    allow_web_interaction=False,
+    allow_transaction_submission=False,
+    allow_wallet_signing=False,
+)
 
 
 class ToolRegistry:
@@ -264,21 +322,43 @@ class ToolRegistry:
         except ToolValidationError as exc:
             return ToolResult.failure(str(exc), category="INVALID_INPUT", retryable=False)
 
+        # Network / wallet allowlists apply to the arguments, not just the tool.
+        arguments_ok, arguments_reason = effective_policy.permits_arguments(tool, validated)
+        if not arguments_ok:
+            logger.warning("Tool '%s' refused by authorization policy: %s", name, arguments_reason)
+            return ToolResult(
+                status=ToolResultStatus.NOT_AUTHORIZED,
+                error=arguments_reason,
+                error_category="NOT_AUTHORIZED",
+                retryable=False,
+            )
+
         # Deterministic pre-flight guard for irreversible operations.
         try:
             if tool.side_effect in (SideEffect.WALLET_SIGNING, SideEffect.TRANSACTION_SUBMISSION):
-                if not emergency_stop.can_sign():
+                # A submission tool is gated on BOTH policies: a stop that halts
+                # only submissions must not be bypassable through a tool whose
+                # side effect is TRANSACTION_SUBMISSION.
+                blocked = not emergency_stop.can_sign()
+                if tool.side_effect is SideEffect.TRANSACTION_SUBMISSION:
+                    blocked = blocked or not emergency_stop.can_submit_transactions()
+                if blocked:
                     from backend.app.security.emergency_stop import EmergencyStopError
 
                     raise EmergencyStopError(
-                        f"{tool.name}:{task_id}", "Emergency stop is active; signing is blocked."
+                        f"{tool.name}:{task_id}",
+                        "Emergency stop is active; signing and submission are blocked.",
                     )
-            elif tool.side_effect is SideEffect.WEB_INTERACTION:
+            elif tool.side_effect in (SideEffect.WEB_INTERACTION, SideEffect.STATE_MUTATION):
+                # STATE_MUTATION tools act outside the process too (e.g. send_notification posts to
+                # Telegram), so they stop with task execution. Pure reads (NONE, EXTERNAL_READ) stay
+                # available for diagnostics.
                 if not emergency_stop.can_execute_tasks():
                     from backend.app.security.emergency_stop import EmergencyStopError
 
                     raise EmergencyStopError(
-                        f"{tool.name}:{task_id}", "Emergency stop is active; web interaction is blocked."
+                        f"{tool.name}:{task_id}",
+                        "Emergency stop is active; web interaction and state changes are blocked.",
                     )
         except Exception as exc:  # EmergencyStopError and any guard failure
             return ToolResult(

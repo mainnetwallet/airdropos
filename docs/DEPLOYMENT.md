@@ -87,11 +87,17 @@ alembic upgrade head
 
 Note: **Alembic 2** (`2_reconcile_schema_with_models.py`) modifies `wallets`, `knowledge_relationships`, `memory_records` to match the ORM. Running `alembic upgrade head` applies all revisions.
 
+### 2b. Migration directories
+`backend/alembic.ini` uses `%(here)s`-relative paths, so `alembic -c backend/alembic.ini ...` works from any directory. The only active chain is `backend/app/migrations/`. `backend/migrations/` is a stale, unused duplicate kept only so no history is deleted (see its `DEPRECATED.md`); never point Alembic at it. Do not run migrations against a production database without a backup.
+
 ### 3. Secrets Management
 
 - **WALLET_VAULT_MASTER_KEY** must be a 64‑character hex string (256 bits). Store securely (e.g., secret manager, `.env` with restricted permissions).
 - **Database passwords** should be stored in environment variables, not in the repo (`.gitignore` excludes `.env`).
 - **Telegram/X/Discord bot tokens** should be kept secret and rotated periodically.
+
+#### Worker egress
+The worker's browser blocks internal destinations in code, but only a network-level egress firewall on the worker container can fully close DNS-rebinding and non-HTTP paths. See `SECURITY.md` section 2.7.1.
 
 ### 4. Resource Limits
 
@@ -134,6 +140,40 @@ Similarly, mount `docs/`, `scripts/`, and any custom startup scripts.
 ### 7. Worker Process
 
 The `worker` service runs the scheduler daemon (`app/scheduler/worker.py`). It launches background jobs (`handle_airdrop_discovery`, `handle_campaign_monitoring`, etc.). Ensure the worker stays alive (Docker restart policy).
+
+### 8. Rate limiting behind a reverse proxy
+
+Rate limits are keyed on the connecting address. Behind the bundled nginx (or any reverse proxy) every client
+would otherwise share the proxy's address and one bucket. The bundled `nginx.conf` forwards `X-Forwarded-For`;
+the API only believes that header when the connecting peer is listed in `TRUSTED_PROXIES` (comma-separated
+IPs/CIDRs, e.g. your compose network's subnet: `docker network inspect <project>_default`). Empty (the default)
+trusts no forwarded header, so a client can never choose its own bucket by sending one.
+
+- List only addresses your own proxies connect from. Never list a range that clients can reach the API from directly.
+- The header is read right to left, skipping trusted proxies, so extra proxy hops are handled.
+- Audit-log `ip_address` fields still record the connecting address; only rate limiting uses `TRUSTED_PROXIES`.
+
+### 9. Emergency Stop: shared state, locking and limits
+
+The stop is a JSON file (`EMERGENCY_STOP_STATE_FILE`) that the API and worker both read, so both containers must
+mount the same `./data` volume (the bundled compose file does). Know its limits:
+
+- If the activation cannot be written, the stop is engaged **only in that process**, and the API returns an error
+  instead of success. Treat that as "not engaged elsewhere" and restart or retry. Nothing falls back silently.
+- A state file that is corrupt or unreadable fails **closed** (stopped). A file that is *missing at process start*
+  cannot be told apart from a first boot, so losing the `./data` volume loses the stop. Durable shared state in
+  PostgreSQL would remove this limit but needs a schema migration (see the security review notes); it is not done yet.
+- Cross-process locking uses `fcntl` (Linux/macOS) or `msvcrt` (Windows). If no lock can be taken, a release
+  (resume) is **refused** and the stop stays engaged; engaging a stop is never blocked by a lock failure. A release
+  also re-checks the file just before writing, so it can never overwrite a stop engaged in the meantime.
+- Operator-driven manual input to an open live session is not blocked by the stop (only the agent and session start/resume are).
+
+### 10. WebSocket session revocation window
+
+Open WebSockets re-read their session every `WS_REVALIDATE_SECONDS` (10s) and end at the exact expiry time.
+`/auth/logout` closes that session's sockets immediately. Any other revocation (account deactivation, a direct
+database update) can keep an already-open socket streaming for up to ~10 seconds. A socket whose session cannot be
+verified (e.g. database down) is closed after 3 consecutive failed checks.
 
 ## Local Development (without Docker)
 

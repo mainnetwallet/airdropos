@@ -22,6 +22,41 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "AirdropOS/1.0 (autonomous research agent; +https://airdropos.local)"
 
+MAX_REDIRECTS = 5
+
+
+class DestinationBlocked(Exception):
+    """A URL (or a redirect hop) points at a loopback, link-local, metadata or private address."""
+
+
+async def guarded_get(url: str, timeout: float) -> httpx.Response:
+    """GET ``url`` following redirects manually, vetting every hop.
+
+    The research tools take URLs chosen by an LLM that reads untrusted pages, so an attacker can
+    steer them at cloud metadata, loopback or the compose network (postgres, redis). Each hop is
+    checked with the browser's resolving destination check, which fails closed. Limitation: httpx
+    resolves the name again when it connects, so DNS rebinding is narrowed, not eliminated; an
+    egress firewall remains the complete answer.
+    """
+    from backend.app.browser.controller import destination_block_reason  # lazy: avoid import cycles
+
+    current = url
+    last_request: Optional[httpx.Request] = None
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            reason = await destination_block_reason(current)
+            if reason:
+                raise DestinationBlocked(reason)
+            response = await client.get(current, headers={"User-Agent": USER_AGENT})
+            last_request = response.request
+            location = response.headers.get("location")
+            if response.is_redirect and location:
+                current = str(response.url.join(location))
+                continue
+            return response
+    raise httpx.TooManyRedirects(f"More than {MAX_REDIRECTS} redirects", request=last_request)
+
+
 # Content that commonly indicates a campaign announcement.
 ANNOUNCEMENT_PATTERNS = [
     r"\bairdrop\b", r"\bsnapshot\b", r"\bclaim\b", r"\beligible\b",
@@ -95,8 +130,9 @@ class WebFetchTool(BaseTool):
             return ToolResult.failure(f"Unsupported URL scheme: {parsed.scheme}", "INVALID_INPUT")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                response = await client.get(url, headers={"User-Agent": USER_AGENT})
+            response = await guarded_get(url, self.timeout_seconds)
+        except DestinationBlocked as exc:
+            return ToolResult.failure(f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False)
         except httpx.TooManyRedirects as exc:
             return ToolResult.failure(f"Redirect loop: {exc}", category="REDIRECT_LOOP", retryable=False)
         except httpx.TimeoutException:
@@ -158,9 +194,10 @@ class SiteSearchTool(BaseTool):
         keywords = [re.sub(r"\\b|\\s", "", k) if k.startswith("\\") else k for k in keywords]
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                response = await client.get(url, headers={"User-Agent": USER_AGENT})
+            response = await guarded_get(url, self.timeout_seconds)
             response.raise_for_status()
+        except DestinationBlocked as exc:
+            return ToolResult.failure(f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False)
         except Exception as exc:
             return ToolResult.failure(f"Site scan failed: {exc}", category="NETWORK_ERROR", retryable=True)
 
@@ -212,9 +249,10 @@ class DocumentationReaderTool(BaseTool):
         sections = [s.lower() for s in (params.get("sections") or ["eligib", "require", "claim", "deadline", "snapshot"])]
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
-                response = await client.get(url, headers={"User-Agent": USER_AGENT})
+            response = await guarded_get(url, self.timeout_seconds)
             response.raise_for_status()
+        except DestinationBlocked as exc:
+            return ToolResult.failure(f"Destination not allowed: {exc}", category="DESTINATION_BLOCKED", retryable=False)
         except Exception as exc:
             return ToolResult.failure(f"Documentation read failed: {exc}", category="NETWORK_ERROR", retryable=True)
 

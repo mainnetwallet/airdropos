@@ -71,6 +71,14 @@ _METADATA_IPS = frozenset(
     ipaddress.ip_address(a) for a in ("169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254")
 )
 _NAT64 = ipaddress.ip_network("64:ff9b::/96")
+# IPv6 ranges that can smuggle an IPv4 destination past ``is_global`` (Python reports the
+# deprecated IPv4-compatible ::a.b.c.d and site-local fec0::/10 as "global"). They are refused
+# outright: nothing legitimate is reached through them, and with BROWSER_ALLOW_PRIVATE_NETWORK
+# the 6to4 / Teredo forms would otherwise let a loopback or LAN address through unjudged.
+_ALWAYS_BLOCKED_V6 = tuple(
+    ipaddress.ip_network(n)
+    for n in ("::/96", "fec0::/10", "2002::/16", "2001::/32")
+)
 
 
 def _unwrap_ip(ip):
@@ -84,6 +92,9 @@ def _unwrap_ip(ip):
 
 
 def _ip_block_reason(ip) -> Optional[str]:
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is None and ip not in _NAT64:
+        if any(ip in net for net in _ALWAYS_BLOCKED_V6):
+            return "IPv4-compatible, site-local and tunnelling addresses are not allowed"
     ip = _unwrap_ip(ip)
     if ip in _METADATA_IPS or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
         return "loopback, link-local and metadata addresses are not allowed"
@@ -354,6 +365,13 @@ class BrowserController:
             # Every request (redirect hops, iframes, scripts, fetches) is checked, not just the
             # first URL the agent asked for.
             await context.route("**/*", self._make_route_guard(session_key))
+            # context.route() never sees WebSocket handshakes, so a page could otherwise open
+            # ws://internal-host/ and bypass the guard above. Fail closed if this Playwright
+            # build cannot intercept them (route_web_socket needs Playwright >= 1.48).
+            route_ws = getattr(context, "route_web_socket", None)
+            if route_ws is None:
+                raise RuntimeError("Playwright >= 1.48 is required to guard WebSocket connections")
+            await route_ws("**/*", self._make_ws_guard(session_key))
         except Exception as exc:
             logger.error("Failed to create context for '%s': %s", session_key, _safe_error(exc))
             await self._safe_close(context)  # never leave a half-configured context behind
@@ -405,6 +423,34 @@ class BrowserController:
                     message=f"Blocked a request to {safe_url(url)}: {reason}",
                 )
             logger.warning("Blocked browser request for '%s' to %s: %s", session_key, safe_url(url), reason)
+
+        return guard
+
+    def _make_ws_guard(self, session_key: str):
+        async def guard(ws) -> None:
+            url = str(getattr(ws, "url", "") or "")
+            parts = urlsplit(url)
+            scheme = parts.scheme.lower()
+            if scheme not in ("ws", "wss"):
+                reason: Optional[str] = "only ws:// and wss:// WebSockets are allowed"
+            else:
+                # The same destination policy as HTTP: ws -> http, wss -> https.
+                http_url = ("https" if scheme == "wss" else "http") + url[len(scheme):]
+                try:
+                    reason = await destination_block_reason(http_url)
+                except Exception:
+                    reason = "the destination could not be verified"
+            if reason is None:
+                try:
+                    ws.connect_to_server()  # allowed: pass the connection through unchanged
+                except Exception:
+                    pass
+                return
+            try:
+                await ws.close(code=1008, reason="blocked by policy")
+            except Exception:
+                pass  # the page went away while we were deciding
+            logger.warning("Blocked WebSocket for '%s' to %s: %s", session_key, safe_url(url), reason)
 
         return guard
 

@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } fro
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, fetchFrame, liveApi as api, releaseControlOnUnload } from '@/services/api'
 import { useLiveEvents } from '@/hooks'
-import type { InputEvent, LiveEvent, LiveOverview, LiveSession } from '@/types/live'
+import type { WsEvent } from '@/types'
+import type { InputEvent, LiveEvent, LiveSession } from '@/types/live'
 
 // ---------------------------------------------------------------- media query
 export function useMediaQuery(query: string): boolean {
@@ -60,7 +61,7 @@ export function useLiveFeed(opts: { session?: string } = {}) {
 
   const { connected } = useLiveEvents(
     useCallback(
-      (ev) => {
+      (ev: WsEvent) => {
         if (ev.type !== 'live.event') return
         const event = ev.payload as unknown as LiveEvent
         if (opts.session && event.session_id !== opts.session) return

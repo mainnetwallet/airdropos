@@ -452,7 +452,7 @@ export const Airdrops = () => {
       filters={['All', 'Active', 'Potential', 'Completed']}
       knownTotal={data?.campaigns}
       icon={<Compass className="h-8 w-8" />}
-      note="The campaigns listing endpoint is not yet exposed by the backend. The discovery and verification engines exist in backend/app/airdrops/."
+      note="The backend exposes GET /campaigns, /campaigns/{id} and /campaigns/{id}/eligibility, but this page does not call them yet; the list UI is not built."
       askLabel="Ask the agent to find airdrops"
       askPrompt="Find new legitimate airdrops and summarize the eligibility requirements."
     />
@@ -468,7 +468,7 @@ export const Transactions = () => (
     searchPlaceholder="Search transactions…"
     filters={['All', 'Pending', 'Completed', 'Failed']}
     icon={<Activity className="h-8 w-8" />}
-    note="The transactions listing endpoint is not yet exposed by the backend. The transaction engine and receipt tracker exist in backend/app/transactions/."
+    note="The backend exposes read-only GET /transactions, /transactions/{id} and its receipt, but this page does not call them yet; the list UI is not built."
     askLabel="Ask the agent about recent transactions"
     askPrompt="Summarize my recent transactions and their status."
   />

@@ -89,7 +89,7 @@ Each subsystem implements its own **deterministic guards**:
 |-------|------------|
 | **Runtime** | Python 3.10+, FastAPI, Starlette |
 | **Database** | PostgreSQL (SQLAlchemy 2.0 async); in‑memory SQLite for tests |
-| **Security** | PBKDF2‑HMAC‑SHA256 password hashing; Argon2‑equivalent; OAuth2‑style scopes |
+| **Security** | PBKDF2‑HMAC‑SHA256 password hashing (600k rounds); OAuth2‑style scopes |
 | **CLI** | `pytest` for unit/integration; `npm run lint` and `npm run build` for frontend |
 | **Containerization** | `docker-compose.yml`, multi‑stage `Dockerfile` |
 | **Tools** | Playwright (browser automation), eth‑account (signing), httpx (RPC), alembic (migrations) |
@@ -112,8 +112,8 @@ All endpoints require `get_principal`; response bodies **never contain secrets**
 | `/api/v1/emergency-stop` | – | `emergency` | – | – |
 
 ### WebSocket (`app/api/v1/endpoints/ws.py`)
-- Single endpoint `/api/v1/ws?token=...`.
-- Session resolved from `UserSession`; `principal` includes scopes.
+- Single endpoint `/api/v1/ws`. The token is sent as `Sec-WebSocket-Protocol: bearer, <token>` (or an `Authorization` header), never in the URL.
+- Session resolved by the same `resolve_session` as REST; requires the `read` scope and is revalidated while connected (logout/expiry closes the stream).
 - Emits `connected` event; responds to `ping` with `pong`.
 
 ## Testing & Verification

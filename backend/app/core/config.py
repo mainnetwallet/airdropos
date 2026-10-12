@@ -4,9 +4,20 @@ Loads and validates environment variables using Pydantic Settings.
 Enforces strict single-LLM configuration, spending bounds, and security parameters.
 """
 
+import re
 from typing import List, Optional
-from pydantic import AnyHttpUrl, Field, field_validator
+from pydantic import AnyHttpUrl, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Publicly known development defaults. They are fine on a laptop and fatal in production,
+# so ``Settings`` refuses to start in production while any of them is still in use.
+_DEV_SECRET_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+_DEV_VAULT_KEY = _DEV_SECRET_KEY
+_DEV_DB_PASSWORD = "airdropos_password"
+_VAULT_KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
+_PLACEHOLDER_PREFIXES = ("replace-with", "replace_with", "change-me", "changeme", "change_me", "your-")
+_PRODUCTION_NAMES = {"production": "production", "prod": "production"}
 
 
 class Settings(BaseSettings):
@@ -21,7 +32,7 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = Field(default="development", description="Current environment")
     LOG_LEVEL: str = Field(default="INFO", description="Logging verbosity")
     SECRET_KEY: str = Field(
-        default="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        default=_DEV_SECRET_KEY,
         description="Application secret key for signing tokens",
     )
     API_V1_PREFIX: str = Field(default="/api/v1")
@@ -49,6 +60,15 @@ class Settings(BaseSettings):
         ),
     )
     SESSION_TTL_HOURS: int = Field(default=24, description="Operator session lifetime")
+    TRUSTED_PROXIES: str = Field(
+        default="",
+        description=(
+            "Comma-separated IPs/CIDRs of reverse proxies allowed to set X-Forwarded-For (e.g. "
+            "the frontend nginx container's network). Empty (default) trusts no forwarded header, "
+            "so rate limits are keyed on the connecting address. Never list a range that clients "
+            "can connect from directly."
+        ),
+    )
     TELEGRAM_WEBHOOK_SECRET: Optional[str] = Field(
         default=None,
         description="Shared secret for authenticating Telegram webhook requests",
@@ -96,6 +116,21 @@ class Settings(BaseSettings):
         default=False,
         description="Global kill-switch stopping all execution and transactions",
     )
+    EMERGENCY_STOP_STATE_FILE: str = Field(
+        default="./data/emergency_stop.json",
+        description=(
+            "Shared, persistent Emergency Stop state. The API and the worker read the same "
+            "file (docker-compose mounts ./data into both), so a stop engaged in one process "
+            "is honoured by the other and survives restarts."
+        ),
+    )
+    SPEND_LEDGER_PATH: str = Field(
+        default="./data/spend_ledger.db",
+        description=(
+            "Persistent, cross-process spend ledger used to enforce the rolling 24-hour "
+            "spending limit atomically."
+        ),
+    )
     MAX_TRANSACTION_VALUE_USD: float = Field(
         default=50.0,
         description="Hard spending ceiling for any individual on-chain transaction",
@@ -123,8 +158,11 @@ class Settings(BaseSettings):
 
     # Cryptographic Vault (AES-256-GCM)
     WALLET_VAULT_MASTER_KEY: str = Field(
-        default="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        description="64-character hex string representing a 256-bit key",
+        default=_DEV_VAULT_KEY,
+        description=(
+            "Exactly 64 hex characters (a 256-bit key), optionally prefixed with 0x. "
+            "Generate with: openssl rand -hex 32"
+        ),
     )
 
     # =========================================================================
@@ -209,12 +247,63 @@ class Settings(BaseSettings):
     CLAIM_CHECK_INTERVAL_MINUTES: int = 30
     DAILY_REPORT_HOUR_UTC: int = 8
 
+    @field_validator("ENVIRONMENT")
+    @classmethod
+    def normalize_environment(cls, v: str) -> str:
+        # Every ``ENVIRONMENT == "production"`` check in the code base is exact, so "Production"
+        # or "prod" would silently switch all of them off. Normalise once, here.
+        name = (v or "").strip().lower()
+        return _PRODUCTION_NAMES.get(name, name or "development")
+
     @field_validator("WALLET_VAULT_MASTER_KEY")
     @classmethod
     def validate_master_key(cls, v: str) -> str:
-        if len(v) < 32:
-            raise ValueError("WALLET_VAULT_MASTER_KEY must be at least 32 characters long")
-        return v
+        raw = (v or "").strip()
+        if raw[:2].lower() == "0x":
+            raw = raw[2:]
+        # The value itself is never echoed into the error: it is the wallet encryption key.
+        if not _VAULT_KEY_RE.fullmatch(raw):
+            raise ValueError(
+                "WALLET_VAULT_MASTER_KEY must be exactly 64 hexadecimal characters "
+                "(a 256-bit key, optionally prefixed with 0x)"
+            )
+        return v.strip()
+
+    @model_validator(mode="after")
+    def reject_insecure_production_config(self) -> "Settings":
+        """Production refuses to start on default, placeholder or missing secrets.
+
+        This only ever rejects. It never generates, replaces or rotates a key: an existing vault
+        key must stay exactly as the operator set it, or stored wallets become undecryptable.
+        """
+        if self.ENVIRONMENT != "production":
+            return self
+        problems: List[str] = []
+
+        secret = (self.SECRET_KEY or "").strip()
+        if secret == _DEV_SECRET_KEY or secret.lower().startswith(_PLACEHOLDER_PREFIXES):
+            problems.append("SECRET_KEY is the default or a placeholder value")
+        elif len(secret) < 32:
+            problems.append("SECRET_KEY must be at least 32 characters")
+
+        vault_key = self.WALLET_VAULT_MASTER_KEY.strip()
+        vault_key = vault_key[2:] if vault_key[:2].lower() == "0x" else vault_key
+        if vault_key.lower() == _DEV_VAULT_KEY:
+            problems.append("WALLET_VAULT_MASTER_KEY is the publicly known default")
+
+        if self.AUTH_ENABLED is not True:
+            problems.append("AUTH_ENABLED must be true")
+        elif not (self.OPERATOR_PASSWORD_HASH or "").strip():
+            problems.append("OPERATOR_PASSWORD_HASH is required while AUTH_ENABLED is true")
+
+        if _DEV_DB_PASSWORD in (self.DATABASE_URL or ""):
+            problems.append("DATABASE_URL still contains the default database password")
+
+        if problems:
+            raise ValueError(
+                "Refusing to start with ENVIRONMENT=production: " + "; ".join(problems) + "."
+            )
+        return self
 
 
 settings = Settings()

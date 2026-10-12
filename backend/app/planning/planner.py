@@ -417,7 +417,12 @@ Produce EXACTLY this JSON shape:
                 step.estimated_cost_usd = 0.0
 
             network = (step.parameters or {}).get("network")
-            if network and str(network).lower() not in constraints.allowed_networks:
+            network_text = str(network).strip().lower() if network is not None else ""
+            if step.kind is StepKind.TRANSACT and not network_text:
+                # Fail closed: an irreversible step with no network cannot be checked.
+                step.status = "skipped"
+                step.failure_reason = "A transaction step must name a network on the allowed list."
+            elif network_text and network_text not in constraints.allowed_networks:
                 step.status = "skipped"
                 step.failure_reason = f"Network '{network}' is not in the allowed network list."
 

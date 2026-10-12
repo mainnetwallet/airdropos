@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ChevronRight, KeyRound, LogOut, PlayCircle, Plug, Power, ShieldAlert } from 'lucide-react'
+import { AlertTriangle, ChevronRight, KeyRound, LogOut, PlayCircle, Plug, Power } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { api, UNAUTHORIZED_EVENT } from '@/services/api'
 import { Alert, Card, IconTile, Loading, PageHeader } from '@/components/ui'

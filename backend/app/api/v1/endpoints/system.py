@@ -34,6 +34,7 @@ from backend.app.memory.manager import MemoryManager
 from backend.app.notifications.dispatcher import dispatcher
 from backend.app.security.auth import (
     Principal,
+    Scope,
     enforce_rate_limit,
     require_agent_chat,
     require_emergency,
@@ -41,10 +42,15 @@ from backend.app.security.auth import (
     require_system_admin,
     require_task_write,
     require_tool_read,
+    require_scopes,
     require_wallet_read,
     write_audit,
 )
-from backend.app.security.emergency_stop import emergency_stop
+from backend.app.security.emergency_stop import (
+    EmergencyStopAuthorizationError,
+    EmergencyStopPersistenceError,
+    emergency_stop,
+)
 from backend.app.tasks.manager import TaskManager
 from backend.app.scheduler.worker_status import STALE_AFTER_SECONDS, WORKER_SUBSYSTEM
 from backend.app.tasks.state_machine import TaskStatus
@@ -695,20 +701,48 @@ async def engage_stop(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_emergency),
 ) -> Dict[str, Any]:
-    enforce_rate_limit(request, "emergency")
-    event = emergency_stop.activate(payload.reason, payload.activated_by)
-    await dispatcher.notify(
-        "Emergency stop engaged",
-        f"{payload.reason}\n\nAlready-submitted transactions cannot be cancelled.",
-        dedupe_key=f"estop-{datetime.now(timezone.utc).timestamp()}",
-    )
+    # Deliberately NOT rate limited: engaging the kill switch must never be refused with a 429
+    # (the dashboard polls the status route, and a shared bucket used to lock the button out).
+    # The actor is the authenticated principal; a client-supplied name is not trusted.
+    actor = principal.email
+    try:
+        event = emergency_stop.activate(payload.reason, actor)
+    except EmergencyStopPersistenceError as exc:
+        # The stop IS engaged in this process, but it could not be saved, so it must not be
+        # reported as a successful activation.
+        try:
+            await write_audit(
+                db, principal, "EMERGENCY_STOP_ENGAGE_UNPERSISTED", "system", "global",
+                after_state={"reason": payload.reason},
+                ip_address=request.client.host if request.client else None,
+            )
+            await db.commit()
+        except Exception:
+            logger.error("Could not audit an unpersisted emergency stop.", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": str(exc),
+                "engaged_in_this_process": True,
+                "persisted": False,
+                "action": "Stop the worker process manually; the stop is not shared.",
+            },
+        ) from exc
+    try:
+        await dispatcher.notify(
+            "Emergency stop engaged",
+            f"{payload.reason}\n\nAlready-submitted transactions cannot be cancelled.",
+            dedupe_key=f"estop-{datetime.now(timezone.utc).timestamp()}",
+        )
+    except Exception:  # the stop is already on; a notification failure must not hide that
+        logger.error("Emergency stop notification failed.", exc_info=True)
     await write_audit(
         db,
         principal,
         "EMERGENCY_STOP_ENGAGE",
         "system",
         "global",
-        after_state={"reason": payload.reason, "activated_by": payload.activated_by},
+        after_state={"reason": payload.reason, "activated_by": actor},
         ip_address=request.client.host if request.client else None,
     )
     return event
@@ -718,10 +752,22 @@ async def engage_stop(
 async def release_stop(
     request: Request,
     db: AsyncSession = Depends(get_db),
-    principal: Principal = Depends(require_emergency),
+    # Releasing is stricter than engaging: a session that can only hit the panic button
+    # (emergency_stop scope alone) must not be able to undo it.
+    principal: Principal = Depends(require_scopes(Scope.EMERGENCY_STOP, Scope.SYSTEM_ADMIN)),
 ) -> Dict[str, Any]:
     enforce_rate_limit(request, "emergency")
-    result = emergency_stop.resume()
+    try:
+        result = emergency_stop.resume(principal.email)
+    except EmergencyStopAuthorizationError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail={"error": str(exc)}) from exc
+    except Exception as exc:
+        # Persistence or locking failed: the stop stays engaged.
+        logger.error("Emergency stop release failed; stop remains engaged.", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "Could not persist the release; the emergency stop remains ENGAGED."},
+        ) from exc
     await write_audit(
         db,
         principal,
@@ -739,7 +785,7 @@ async def stop_status(
     db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_emergency),
 ) -> Dict[str, Any]:
-    enforce_rate_limit(request, "emergency")
+    enforce_rate_limit(request, "read")  # polled by the dashboard; must not share the stop bucket
     return emergency_stop.status()
 
 

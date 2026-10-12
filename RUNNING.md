@@ -42,7 +42,7 @@ python3 run.py
 
 What the two commands do:
 
-1. **`run.py --set-password`** (once): creates `.env` with fresh random `SECRET_KEY` and `WALLET_VAULT_MASTER_KEY`, installs Python packages, asks for your login password (at least 4 characters) and saves its hash into `.env`.
+1. **`run.py --set-password`** (once): creates `.env` with fresh random `SECRET_KEY` and `WALLET_VAULT_MASTER_KEY`, installs Python packages, asks for your login password (at least 12 characters) and saves its hash into `.env`.
 2. **`run.py`**: starts everything.
 
 After the first time, you only ever run `python run.py` (Windows: `py run.py`).
@@ -130,7 +130,8 @@ Then edit it (`notepad .env` on Windows, `nano .env` on Linux) and set:
 | Variable | What to do |
 |---|---|
 | `SECRET_KEY` | Random string, 32+ chars |
-| `WALLET_VAULT_MASTER_KEY` | Exactly 64 hex chars. **Back it up.** |
+| `WALLET_VAULT_MASTER_KEY` | Exactly 64 hex chars. **Back it up.** Never change it on a deployment that already holds wallets. |
+| `POSTGRES_PASSWORD` | Docker only. Random value (`openssl rand -hex 24`); `docker compose` refuses to start without it |
 | `LLM_API_KEY` | Your LLM provider key |
 | `OPERATOR_PASSWORD_HASH` | Hash of your password, in single quotes (below) |
 
@@ -162,6 +163,17 @@ curl -X POST http://localhost:8000/api/v1/auth/bootstrap
 ```
 
 Dashboard: http://localhost:3000
+
+**Upgrading an existing Docker install:** `docker-compose.yml` no longer contains a database password.
+Add `POSTGRES_PASSWORD=` to `.env`. Postgres only reads it when its data volume is first created, so for an
+existing volume set it to the password that database already has (older versions used the one in your
+`DATABASE_URL`). It does not change the password of an existing database; to rotate it, run
+`ALTER USER airdropos PASSWORD '...'` inside Postgres, then update `.env`.
+In production (`ENVIRONMENT=production`) the app refuses to start on a default or placeholder `SECRET_KEY`
+or `WALLET_VAULT_MASTER_KEY`, with `AUTH_ENABLED=false`, without `OPERATOR_PASSWORD_HASH`, or with the old
+default database password. It never generates or replaces your vault key.
+The dashboard port is published on all interfaces by default; set `FRONTEND_BIND=127.0.0.1` in `.env` to
+keep it on loopback behind a TLS proxy or SSH tunnel.
 
 Useful:
 ```bash
@@ -195,7 +207,7 @@ sudo usermod -aG docker $USER && newgrp docker
 git clone https://github.com/mainnetwallet/airdropos.git
 cd airdropos
 cp .env.example .env
-nano .env        # SECRET_KEY, WALLET_VAULT_MASTER_KEY, LLM_API_KEY, OPERATOR_PASSWORD_HASH
+nano .env        # SECRET_KEY, WALLET_VAULT_MASTER_KEY, POSTGRES_PASSWORD, LLM_API_KEY, OPERATOR_PASSWORD_HASH
                  # keep AUTH_ENABLED=true, set ENVIRONMENT=production
 docker compose up -d --build
 docker compose exec backend python -m backend.app.services.init_db
