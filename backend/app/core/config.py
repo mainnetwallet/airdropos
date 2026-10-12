@@ -96,6 +96,21 @@ class Settings(BaseSettings):
         default=False,
         description="Global kill-switch stopping all execution and transactions",
     )
+    EMERGENCY_STOP_STATE_FILE: str = Field(
+        default="./data/emergency_stop.json",
+        description=(
+            "Shared, persistent Emergency Stop state. The API and the worker read the same "
+            "file (docker-compose mounts ./data into both), so a stop engaged in one process "
+            "is honoured by the other and survives restarts."
+        ),
+    )
+    SPEND_LEDGER_PATH: str = Field(
+        default="./data/spend_ledger.db",
+        description=(
+            "Persistent, cross-process spend ledger used to enforce the rolling 24-hour "
+            "spending limit atomically."
+        ),
+    )
     MAX_TRANSACTION_VALUE_USD: float = Field(
         default=50.0,
         description="Hard spending ceiling for any individual on-chain transaction",

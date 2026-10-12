@@ -17,6 +17,7 @@ import httpx
 from backend.app.core.config import settings
 from backend.app.security.emergency_stop import EmergencyStopError, emergency_stop
 from backend.app.blockchain.chains import ChainError, EvmChainAdapter
+from backend.app.transactions.spend_ledger import SpendLedger, SpendLimitExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -96,12 +97,40 @@ class TransactionIntent:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+# Approver identities that are never a human. A broadcast needs a person's approval,
+# not the agent approving itself.
+NON_HUMAN_APPROVERS = frozenset({"", "agent", "system", "llm", "assistant", "claude", "worker", "none", "auto"})
+
+
+@dataclass(frozen=True)
+class SubmissionAuthorization:
+    """Everything `submit_raw` requires before it will broadcast.
+
+    There is deliberately no default: a caller cannot broadcast without
+    stating the wallet it is authorised for, the cost it is spending, and the
+    human who approved it.
+    """
+
+    wallet_address: str
+    authorized_addresses: frozenset
+    estimated_cost_usd: float
+    approved_by: str
+    approval_id: str
+    human_approved: bool = False
+    task_id: Optional[str] = None
+
+
 class TransactionEngine:
     """Validates, builds, and submits transactions within hard limits."""
 
-    def __init__(self) -> None:
-        self.daily_spend_usd = 0.0
-        self.spend_lock = asyncio.Lock()
+    def __init__(self, ledger: Optional[SpendLedger] = None) -> None:
+        # Spend is persisted and shared across processes; see spend_ledger.py.
+        self.ledger = ledger or SpendLedger()
+
+    @property
+    def daily_spend_usd(self) -> float:
+        """Spend (committed + reserved) in the rolling 24-hour window."""
+        return self.ledger.spent_last_24h()
 
     # ------------------------------------------------------------------
     # Deterministic validation (never trusts the LLM)
@@ -144,31 +173,51 @@ class TransactionEngine:
             raise TransactionRejected("Invalid gas estimate.", "GAS_ESTIMATE")
 
     async def check_spend_limits(self, estimated_cost_usd: float) -> None:
-        """Enforce per-transaction and rolling daily spend ceilings."""
+        """Advisory, read-only check of the per-transaction and rolling daily ceilings.
+
+        This does NOT reserve anything, so on its own it cannot stop concurrent
+        callers from collectively overspending. Anything that actually spends
+        must use `reserve_spend`, which checks and reserves atomically.
+        """
         if estimated_cost_usd > settings.MAX_TRANSACTION_VALUE_USD:
             raise TransactionRejected(
                 f"Estimated transaction cost ${estimated_cost_usd:.2f} exceeds the per-transaction "
                 f"limit of ${settings.MAX_TRANSACTION_VALUE_USD:.2f}.",
                 "LIMIT_EXCEEDED",
             )
-        async with self.spend_lock:
-            projected = self.daily_spend_usd + estimated_cost_usd
-            if projected > settings.MAX_DAILY_GAS_SPEND_USD:
-                raise TransactionRejected(
-                    f"Projected daily spend ${projected:.2f} exceeds the daily limit of "
-                    f"${settings.MAX_DAILY_GAS_SPEND_USD:.2f}.",
-                    "DAILY_LIMIT_EXCEEDED",
-                )
+        projected = (await asyncio.to_thread(self.ledger.spent_last_24h)) + estimated_cost_usd
+        if projected > settings.MAX_DAILY_GAS_SPEND_USD:
+            raise TransactionRejected(
+                f"Projected daily spend ${projected:.2f} exceeds the daily limit of "
+                f"${settings.MAX_DAILY_GAS_SPEND_USD:.2f}.",
+                "DAILY_LIMIT_EXCEEDED",
+            )
+
+    async def reserve_spend(self, estimated_cost_usd: float, ref: Optional[str] = None) -> str:
+        """Atomically enforce both limits and reserve the cost. Returns a reservation id."""
+        try:
+            return await asyncio.to_thread(
+                self.ledger.reserve,
+                estimated_cost_usd,
+                per_transaction_limit=settings.MAX_TRANSACTION_VALUE_USD,
+                daily_limit=settings.MAX_DAILY_GAS_SPEND_USD,
+                ref=ref,
+            )
+        except SpendLimitExceeded as exc:
+            raise TransactionRejected(str(exc), exc.category) from exc
+
+    async def commit_spend(self, reservation_id: str, actual_cost_usd: Optional[float] = None) -> None:
+        await asyncio.to_thread(self.ledger.commit, reservation_id, actual_cost_usd)
+
+    async def release_spend(self, reservation_id: str) -> bool:
+        return await asyncio.to_thread(self.ledger.release, reservation_id)
 
     def record_spend(self, amount_usd: float) -> None:
-        async def _apply() -> None:
-            async with self.spend_lock:
-                self.daily_spend_usd += amount_usd
-
-        asyncio.create_task(_apply())
+        """Record already-incurred spend. Synchronous and durable (no fire-and-forget task)."""
+        self.ledger.record(amount_usd)
 
     def reset_daily_spend(self) -> None:
-        self.daily_spend_usd = 0.0
+        self.ledger.reset()
 
     # ------------------------------------------------------------------
     # RPC interaction
@@ -269,15 +318,97 @@ class TransactionEngine:
                 "note": "Simulation reverted. Submission would likely revert on-chain.",
             }
 
-    async def submit_raw(self, network: str, raw_tx_hex: str) -> str:
-        """Broadcast a signed transaction and return its hash."""
+    @staticmethod
+    def _recover_sender(raw_tx_hex: str) -> str:
+        """Recover the signer of a raw signed transaction. Raises on anything undecodable."""
+        try:
+            from eth_account import Account
+
+            raw = raw_tx_hex if raw_tx_hex.startswith("0x") else "0x" + raw_tx_hex
+            return str(Account.recover_transaction(raw))
+        except Exception as exc:
+            raise TransactionRejected(
+                f"Raw transaction could not be decoded; refusing to broadcast: {exc}", "UNDECODABLE_TX"
+            ) from exc
+
+    async def submit_raw(
+        self,
+        network: str,
+        raw_tx_hex: str,
+        *,
+        authorization: SubmissionAuthorization,
+    ) -> str:
+        """Broadcast a signed transaction and return its hash.
+
+        Fails closed. Before any broadcast this enforces, in order:
+          1. Emergency Stop,
+          2. explicit human approval,
+          3. that the transaction was signed by an authorised wallet,
+          4. the per-transaction and rolling daily spend limits (atomic reservation),
+          5. Emergency Stop again, immediately before the RPC call.
+        """
         if not emergency_stop.can_submit_transactions():
             raise EmergencyStopError(
                 "broadcast", "Emergency stop is active; refusing to broadcast."
             )
-        tx_hash = await self._rpc(network, "eth_sendRawTransaction", [raw_tx_hex])
+
+        if not isinstance(authorization, SubmissionAuthorization):
+            raise TransactionRejected("A SubmissionAuthorization is required to broadcast.", "NOT_AUTHORIZED")
+        if (
+            not authorization.human_approved
+            or str(authorization.approved_by).strip().lower() in NON_HUMAN_APPROVERS
+            or not str(authorization.approval_id or "").strip()
+        ):
+            raise TransactionRejected(
+                "Broadcast requires an explicit human approval (approved_by and approval_id).",
+                "HUMAN_APPROVAL_REQUIRED",
+            )
+
+        authorized = {str(a).lower() for a in (authorization.authorized_addresses or ())}
+        if not authorized or str(authorization.wallet_address).lower() not in authorized:
+            raise TransactionRejected(
+                "Wallet is not in the authorized wallet set; refusing to broadcast.", "NOT_AUTHORIZED"
+            )
+        sender = self._recover_sender(raw_tx_hex)
+        if sender.lower() != str(authorization.wallet_address).lower():
+            raise TransactionRejected(
+                "Raw transaction signer does not match the authorised wallet; refusing to broadcast.",
+                "NOT_AUTHORIZED",
+            )
+
+        reservation_id = await self.reserve_spend(
+            authorization.estimated_cost_usd,
+            ref=f"{network}:{authorization.approval_id}:{authorization.task_id or '-'}",
+        )
+
+        try:
+            # Stop may have been engaged while we were reserving.
+            if not emergency_stop.can_submit_transactions():
+                raise EmergencyStopError(
+                    "broadcast", "Emergency stop is active; refusing to broadcast."
+                )
+            tx_hash = await self._rpc(network, "eth_sendRawTransaction", [raw_tx_hex])
+        except (EmergencyStopError, TransactionRejected) as exc:
+            # Release only when the transaction definitely was not sent. An
+            # RPC_FAILURE (timeout/connection drop) is ambiguous: the node may
+            # have accepted it, so the reservation keeps counting.
+            if isinstance(exc, EmergencyStopError) or getattr(exc, "category", "") in ("RPC_ERROR", "NO_RPC"):
+                await self.release_spend(reservation_id)
+            else:
+                logger.warning(
+                    "Broadcast outcome unknown (%s); spend reservation %s retained.",
+                    getattr(exc, "category", "?"), reservation_id,
+                )
+            raise
+        except BaseException:
+            logger.warning("Broadcast interrupted; spend reservation %s retained.", reservation_id)
+            raise
+
         if not tx_hash:
+            # The node answered without a hash: ambiguous, so keep the reservation.
             raise TransactionRejected("RPC accepted the transaction but returned no hash.", "NO_TX_HASH")
+
+        await self.commit_spend(reservation_id)
         return tx_hash
 
     async def get_receipt(self, network: str, tx_hash: str) -> Optional[Dict[str, Any]]:

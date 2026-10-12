@@ -323,11 +323,18 @@ class ToolRegistry:
         # Deterministic pre-flight guard for irreversible operations.
         try:
             if tool.side_effect in (SideEffect.WALLET_SIGNING, SideEffect.TRANSACTION_SUBMISSION):
-                if not emergency_stop.can_sign():
+                # A submission tool is gated on BOTH policies: a stop that halts
+                # only submissions must not be bypassable through a tool whose
+                # side effect is TRANSACTION_SUBMISSION.
+                blocked = not emergency_stop.can_sign()
+                if tool.side_effect is SideEffect.TRANSACTION_SUBMISSION:
+                    blocked = blocked or not emergency_stop.can_submit_transactions()
+                if blocked:
                     from backend.app.security.emergency_stop import EmergencyStopError
 
                     raise EmergencyStopError(
-                        f"{tool.name}:{task_id}", "Emergency stop is active; signing is blocked."
+                        f"{tool.name}:{task_id}",
+                        "Emergency stop is active; signing and submission are blocked.",
                     )
             elif tool.side_effect is SideEffect.WEB_INTERACTION:
                 if not emergency_stop.can_execute_tasks():
