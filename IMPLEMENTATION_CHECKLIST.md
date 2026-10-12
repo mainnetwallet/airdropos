@@ -24,7 +24,7 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] `AgentController` Observe-Plan-Act-Verify loop
 - [x] Conservative `_verify()` requiring authoritative evidence
 - [x] Loop budgets, timeouts, cancellation, checkpointing
-- [ ] `app/planning/planner.py` — **decomposition and replanning not implemented**
+- [x] `app/planning/planner.py` — decomposition, persisted plan revisions, replanning (wired into `AgentController`)
 - [ ] `app/agent/intent.py`, `context.py`, `decision.py` — **not implemented** (logic inline in controller)
 
 ## Phase 3 — Persistence & Recovery
@@ -36,7 +36,7 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] `FOR UPDATE SKIP LOCKED` concurrency control
 - [x] `NonceManager` per-(network, address) locks
 - [x] Worker crash recovery (`recover_interrupted_tasks`)
-- [ ] `app/tasks/recovery.py` — standalone module **not written**
+- [x] `app/tasks/recovery.py` — failure diagnosis/classification and retry backoff (used by the controller); interrupted-task recovery lives in `scheduler/worker.py`
 
 ## Phase 4 — Wallets, Blockchain & Security
 - [x] AES-256-GCM key vault with ephemeral key scope
@@ -87,8 +87,8 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] Campaign, transaction, audit log, settings endpoints
 - [x] `AUTH_ENABLED=False` now actually honored; refuses to serve unauthenticated traffic when `ENVIRONMENT=production`
 - [x] Settings secrets are write-only (`[REDACTED]` for every caller, including SYSTEM_ADMIN)
-- [ ] Discord integration — **not implemented** (documented)
-- [ ] X integration — **not implemented** (documented)
+- [~] Discord — command router and REST reply exist, but there is **no gateway client**: `start_polling()` returns False and health reports `NOT_IMPLEMENTED`; nothing starts it
+- [~] X — command router exists, but there is **no API listener and replies are only logged**: `start_polling()` returns False and health reports `NOT_IMPLEMENTED`; nothing starts it
 
 ## Phase 9 — Scheduler & 24/7 Operation
 - [x] Persistent job definitions surviving restart
@@ -110,7 +110,7 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] Memory & Learning
 - [x] System Diagnostics
 - [x] Self-Improvement proposals
-- [~] Airdrop Explorer, Transactions, Social, Automation, Evidence — **placeholders awaiting endpoints**
+- [~] Airdrop Explorer, Transactions, Social, Automation, Evidence — **still placeholder pages**. Read APIs exist for campaigns, transactions and audit; the UIs are not built. No schedule or evidence API.
 
 ## Phase 11 — Tests & Documentation
 - [x] `test_tasks.py`, `test_security.py`, `test_llm.py`
@@ -132,3 +132,10 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] `Dockerfile`, `docker-compose.yml`, frontend nginx config
 - [x] `scripts/start_backend.sh`, `scripts/start_worker.sh`
 - [x] `docs/DEPLOYMENT.md`, `docs/DATABASE_BACKUP.md`
+
+## Known gaps (verified 2026-10-12)
+- [~] Airdrop discovery runs on a hard-coded community URL list and **does not persist** discovered campaigns to the database.
+- [~] Dynamic tools: proposals are AST-validated and stored inert; execution is intentionally disabled, so there are no working dynamic adapters.
+- [ ] Human-approval store/API: `TransactionEngine` requires an `ApprovalVerifier`, but no implementation or approval endpoint exists, so broadcast fails closed.
+- [~] Containers (backend, worker, frontend) run as root; the dashboard publishes on `0.0.0.0:3000` over plain HTTP unless `FRONTEND_BIND` is set.
+- [~] Egress: destinations are vetted before each request, but there is no network-level egress firewall; DNS rebinding is narrowed, not eliminated.

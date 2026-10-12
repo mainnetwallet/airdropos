@@ -179,15 +179,11 @@ class TwitterBot:
         if not self.is_configured:
             logger.info("Twitter bot not started: token or authorized users not configured.")
             return False
-        try:
-            # In a real implementation, we would set up webhook listeners or polling
-            # For now, we'll simulate the startup
-            logger.info("Twitter bot listener started (simulated)")
-            self._running = True
-            return True
-        except Exception as exc:
-            logger.error("Twitter bot failed to start: %s", exc)
-            return False
+        # No X API listener exists yet (no polling/webhook/DM client), so nothing can receive
+        # messages. Report that honestly rather than pretending to be listening.
+        logger.warning("X (Twitter) listener is not implemented; the bot is NOT listening.")
+        self._running = False
+        return False
 
     async def stop(self) -> None:
         self._running = False
@@ -195,7 +191,8 @@ class TwitterBot:
 
     def health(self) -> Dict[str, Any]:
         return {
-            "status": "HEALTHY" if self._running else ("NOT_CONFIGURED" if not self.is_configured else "STOPPED"),
+            "status": "HEALTHY" if self._running else "NOT_IMPLEMENTED",
+            "implemented": False,
             "listener": self._running,
             "authorized_users": len(self.authorized_users),
             "bearer_token_configured": bool(self.bearer_token),

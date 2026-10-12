@@ -52,7 +52,6 @@ const BASE =
 export default function SessionActions({
   session,
   canControl,
-  compact = false,
   className,
 }: {
   session: LiveSession

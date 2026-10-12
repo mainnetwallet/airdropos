@@ -151,15 +151,11 @@ class DiscordBot:
         if not self.is_configured:
             logger.info("Discord bot not started: token or authorized users not configured.")
             return False
-        try:
-            # In a real implementation, we would use discord.py or similar
-            # For now, we'll simulate the startup
-            logger.info("Discord bot gateway connection started (simulated)")
-            self._running = True
-            return True
-        except Exception as exc:
-            logger.error("Discord bot failed to start: %s", exc)
-            return False
+        # No gateway client exists yet (no discord.py / websocket loop), so nothing can receive
+        # messages. Report that honestly rather than pretending to be connected.
+        logger.warning("Discord gateway is not implemented; the bot is NOT listening.")
+        self._running = False
+        return False
 
     async def stop(self) -> None:
         self._running = False
@@ -167,7 +163,8 @@ class DiscordBot:
 
     def health(self) -> Dict[str, Any]:
         return {
-            "status": "HEALTHY" if self._running else ("NOT_CONFIGURED" if not self.is_configured else "STOPPED"),
+            "status": "HEALTHY" if self._running else "NOT_IMPLEMENTED",
+            "implemented": False,
             "gateway": self._running,
             "authorized_users": len(self.authorized_users),
             "token_configured": bool(self.token),
