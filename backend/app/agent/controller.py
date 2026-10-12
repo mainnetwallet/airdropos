@@ -144,6 +144,7 @@ class AgentController:
         worker_id = f"controller-{id(self):x}"
         try:
             lease = await self.leases.acquire(task, worker_id)
+            await self.db.commit()  # publish the lease; do not hold the DB write lock across the run
         except Exception as exc:
             logger.warning("Could not acquire lease for %s: %s", task.task_id, exc)
             report.outcome = LoopOutcome.STOPPED
@@ -152,6 +153,7 @@ class AgentController:
 
         try:
             plan_spec = await self._ensure_plan(task, report)
+            await self.db.commit()
             iteration = await self._resume_iteration(task)
             if iteration:
                 report.steps.append(
@@ -205,6 +207,9 @@ class AgentController:
                     break
 
                 await self._checkpoint(task, iteration, f"iteration_{iteration}")
+                # Commit per iteration: progress, evidence and checkpoints survive a crash or a
+                # later failure, and SQLite's single write lock is released between steps.
+                await self.db.commit()
             else:
                 # Loop exhausted its budget without reaching a terminal state.
                 report.outcome = LoopOutcome.BUDGET_EXHAUSTED

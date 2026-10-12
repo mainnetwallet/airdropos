@@ -330,6 +330,9 @@ SYSTEM_PRINCIPAL = Principal(
 # ======================================================================
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# Minimum gap between two last_used_at writes for the same session.
+LAST_USED_WRITE_INTERVAL = timedelta(seconds=60)
+
 
 async def resolve_session(db: AsyncSession, token: Optional[str], touch: bool = True) -> Principal:
     """Resolve a raw session token into a Principal. The single source of truth.
@@ -372,7 +375,14 @@ async def resolve_session(db: AsyncSession, token: Optional[str], touch: bool = 
     scopes = frozenset(s for s in granted if isinstance(s, str) and s in ALL_SCOPES)
 
     if touch:
-        session.last_used_at = now
+        # last_used_at is bookkeeping, not a security check. Writing it on every request made each
+        # dashboard poll a write to the same row, which on SQLite serialises against the worker's
+        # own writes ("database is locked"). Refresh it at most once per interval.
+        last_used = session.last_used_at
+        if last_used is not None and last_used.tzinfo is None:
+            last_used = last_used.replace(tzinfo=timezone.utc)
+        if last_used is None or now - last_used >= LAST_USED_WRITE_INTERVAL:
+            session.last_used_at = now
 
     return Principal(
         user_id=str(user.id),

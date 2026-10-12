@@ -23,12 +23,12 @@ from backend.app.core.config import settings
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database.session import AsyncSessionLocal, engine
-from backend.app.models import IntegrationHealth
+from backend.app.models import IntegrationHealth, Task
 from backend.app.notifications.dispatcher import Severity, dispatcher
 from backend.app.scheduler.scheduler import DEFAULT_JOBS, scheduler
 from backend.app.browser.controller import controller as browser_controller
 from backend.app.live import gateway as live_gateway
-from backend.app.scheduler.worker_status import heartbeat_loop, state as worker_state
+from backend.app.scheduler.worker_status import heartbeat_loop, redact, state as worker_state
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
@@ -298,11 +298,44 @@ async def _record_health(db: AsyncSession, subsystem: str, status: str, detail: 
 # ----------------------------------------------------------------------
 # Task execution loop
 # ----------------------------------------------------------------------
+RETRY_BACKOFF_BASE_SECONDS = 30
+RETRY_BACKOFF_MAX_SECONDS = 600
+
+
+async def _settle_failed_execution(task_pk: Any, reason: str, detail: Dict[str, Any]) -> None:
+    """Record a failed execution attempt on the task, in a fresh session.
+
+    Without this, a failed run left the task IN_PROGRESS (or, when the exception rolled the
+    session back, silently put it back to READY with no retry counted, no event and no error), so
+    the worker re-claimed it every few seconds forever and the dashboard showed a READY task that
+    never progressed. The retry budget (``max_retries``) is honoured; once spent the task FAILS.
+    Only a task still IN_PROGRESS is touched, so a status set by the run itself is preserved.
+    """
+    async with AsyncSessionLocal() as db:
+        task = await db.get(Task, task_pk)
+        if task is None or task.status != TaskStatus.IN_PROGRESS.value:
+            return
+        manager = TaskManager(db)
+        if task.retry_count < task.max_retries:
+            delay = min(RETRY_BACKOFF_BASE_SECONDS * (2 ** task.retry_count), RETRY_BACKOFF_MAX_SECONDS)
+            task.next_execution_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+            await manager.transition(
+                task, TaskStatus.RETRYING, reason=reason, error_details=detail
+            )
+        else:
+            await manager.transition(
+                task, TaskStatus.FAILED, reason=f"{reason} (retries exhausted)", error_details=detail
+            )
+        await db.commit()
+        logger.warning("Task %s -> %s after failed execution: %s", task.task_id, task.status, reason)
+
+
 async def task_execution_loop() -> None:
     """Continuously claim and execute tasks."""
     logger.info("Task execution loop started for %s", WORKER_ID)
     while not _shutdown_event.is_set():
         current_task_id = None
+        current_task_pk = None
         try:
             if emergency_stop.is_stopped and not emergency_stop.can_execute_tasks():
                 worker_state.polled("paused: emergency stop is active")
@@ -318,7 +351,14 @@ async def task_execution_loop() -> None:
                     await asyncio.sleep(3)
                     continue
 
+                # Persist the claim NOW. Until this commit the claim only exists in this open
+                # transaction: on SQLite it holds the database write lock for the whole run
+                # (blocking the heartbeat and every API write), and any later exception rolls the
+                # claim back so the task silently reverts to READY.
+                await db.commit()
+
                 current_task_id = task.task_id
+                current_task_pk = task.id
                 worker_state.polled(f"running {task.task_id}")
                 worker_state.task_claimed(task.task_id, task.title)
 
@@ -328,6 +368,13 @@ async def task_execution_loop() -> None:
 
                 logger.info("Task %s finished: %s", task.task_id, report.outcome.value)
                 worker_state.task_finished(task.task_id, report.outcome.value)
+
+                if report.outcome.value == "failed" and task.status == TaskStatus.IN_PROGRESS.value:
+                    await _settle_failed_execution(
+                        current_task_pk,
+                        "execution failed",
+                        {"failures": [redact(str(f))[:300] for f in report.failures[:5]]},
+                    )
 
                 if report.outcome.value == "needs_user_action" and report.blockers:
                     await dispatcher.notify(
@@ -343,6 +390,17 @@ async def task_execution_loop() -> None:
         except Exception as exc:
             logger.exception("Task execution error: %s", exc)
             worker_state.failed(exc, current_task_id)
+            if current_task_pk is not None:
+                # The session above was rolled back; record the failure in a new one so the
+                # attempt is counted instead of vanishing. Never let this mask the original error.
+                try:
+                    await _settle_failed_execution(
+                        current_task_pk,
+                        f"execution raised {type(exc).__name__}",
+                        {"type": type(exc).__name__, "message": redact(str(exc))[:400]},
+                    )
+                except Exception:
+                    logger.exception("Could not record failure for task %s", current_task_id)
             await asyncio.sleep(5)
 
 

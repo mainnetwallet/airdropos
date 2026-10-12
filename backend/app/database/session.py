@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import AsyncGenerator
 import uuid
 
-from sqlalchemy import DateTime
+from sqlalchemy import DateTime, event
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.asyncio import (
@@ -33,7 +33,13 @@ def _render_jsonb_as_json_on_sqlite(type_, compiler, **kw):
 _IS_SQLITE = settings.DATABASE_URL.startswith("sqlite")
 
 # Initialize async engine. SQLite uses its own pool, which rejects pool_size/max_overflow.
-_engine_kwargs = {} if _IS_SQLITE else {
+# The API, the worker and the live gateway are separate processes sharing one SQLite file, so a
+# writer must wait for the lock instead of failing at once ("database is locked"). Kept below the
+# worker heartbeat staleness window (worker_status.STALE_AFTER_SECONDS) so one slow write cannot
+# by itself make the dashboard report the worker offline.
+SQLITE_BUSY_TIMEOUT_SECONDS = 15
+
+_engine_kwargs = {"connect_args": {"timeout": SQLITE_BUSY_TIMEOUT_SECONDS}} if _IS_SQLITE else {
     "pool_size": settings.DB_POOL_SIZE,
     "max_overflow": settings.DB_MAX_OVERFLOW,
 }
@@ -43,6 +49,24 @@ engine = create_async_engine(
     pool_pre_ping=True,
     **_engine_kwargs,
 )
+
+if _IS_SQLITE:
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _record) -> None:
+        """WAL lets readers proceed during a write; busy_timeout makes writers queue.
+
+        WAL is a persistent, in-place journal-mode switch: no data is rewritten or reset. If the
+        file system refuses it (e.g. a network drive) SQLite keeps its current mode and we
+        continue with the busy timeout alone.
+        """
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_SECONDS * 1000}")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cursor.close()
 
 # Async session factory
 AsyncSessionLocal = async_sessionmaker(
