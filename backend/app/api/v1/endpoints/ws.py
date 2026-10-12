@@ -37,17 +37,22 @@ class EventBus:
 
     def __init__(self) -> None:
         self._clients: Set[WebSocket] = set()
+        # Sockets allowed to receive live-session activity (browser/Telegram session events).
+        self._live_ok: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
         self._recent: List[Dict[str, Any]] = []
 
-    async def connect(self, websocket: WebSocket) -> None:
+    async def connect(self, websocket: WebSocket, live_ok: bool = True) -> None:
         await websocket.accept()
         async with self._lock:
             self._clients.add(websocket)
+            if live_ok:
+                self._live_ok.add(websocket)
 
     async def disconnect(self, websocket: WebSocket) -> None:
         async with self._lock:
             self._clients.discard(websocket)
+            self._live_ok.discard(websocket)
 
     async def broadcast(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Deliver an event to all clients. Dead sockets are pruned."""
@@ -62,7 +67,8 @@ class EventBus:
 
         dead: List[WebSocket] = []
         async with self._lock:
-            targets = list(self._clients)
+            # What the operator's sessions are doing is not for anonymous sockets.
+            targets = list(self._live_ok if event_type == "live.event" else self._clients)
 
         for client in targets:
             try:
@@ -74,6 +80,7 @@ class EventBus:
             async with self._lock:
                 for client in dead:
                     self._clients.discard(client)
+                    self._live_ok.discard(client)
 
     def recent(self, limit: int = 50) -> List[Dict[str, Any]]:
         return self._recent[-limit:]
@@ -201,7 +208,9 @@ async def websocket_endpoint(
         await websocket.close(code=4401, reason="Authentication required")
         return
 
-    await bus.connect(websocket)
+    # Live session activity needs a real, verified principal. Anonymous sockets are only tolerated
+    # outside production (auth disabled for local development); in production they never receive it.
+    await bus.connect(websocket, live_ok=principal is not None or settings.ENVIRONMENT != "production")
     try:
         await websocket.send_json(
             {

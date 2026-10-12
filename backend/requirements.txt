@@ -28,6 +28,9 @@ cryptography>=42.0.7
 # Browser Automation
 playwright>=1.44.0
 
+# Host resource readout for Live Broadcast (optional; degrades gracefully)
+psutil>=5.9.8
+
 # Social Integrations
 python-telegram-bot>=21.1.1
 telethon>=1.36.0

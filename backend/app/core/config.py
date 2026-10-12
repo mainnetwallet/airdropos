@@ -174,6 +174,28 @@ class Settings(BaseSettings):
     BROWSER_ACTION_TIMEOUT_MS: int = 15000
     BROWSER_VIEWPORT_WIDTH: int = 1280
     BROWSER_VIEWPORT_HEIGHT: int = 800
+    # Loopback, link-local and cloud-metadata targets are always refused. Private LAN ranges
+    # (10.x, 172.16-31.x, 192.168.x) are refused too unless this is true.
+    BROWSER_ALLOW_PRIVATE_NETWORK: bool = False
+
+    # =========================================================================
+    # LIVE BROADCAST (session gateway inside the worker process)
+    # =========================================================================
+    # The browser and Telegram clients live in the worker, not in the API. The
+    # worker therefore serves a small internal HTTP gateway that ONLY the API
+    # talks to (shared secret). Browsers never reach it directly.
+    LIVE_GATEWAY_ENABLED: bool = True
+    LIVE_GATEWAY_HOST: str = "127.0.0.1"
+    LIVE_GATEWAY_PORT: int = 8765
+    LIVE_GATEWAY_URL: str = "http://127.0.0.1:8765"
+    LIVE_GATEWAY_SECRET: Optional[str] = Field(
+        default=None,
+        description="Shared secret between API and worker gateway. Derived from SECRET_KEY when unset.",
+    )
+    LIVE_CONTROL_LOCK_TTL_SECONDS: int = 45
+    LIVE_HUMAN_WAIT_TIMEOUT_SECONDS: int = 1800
+    LIVE_FRAME_JPEG_QUALITY_FULL: int = 72
+    LIVE_FRAME_JPEG_QUALITY_THUMB: int = 40
 
     # =========================================================================
     # 24/7 SCHEDULER & RECURRING CYCLES

@@ -26,6 +26,8 @@ from backend.app.database.session import AsyncSessionLocal, engine
 from backend.app.models import IntegrationHealth
 from backend.app.notifications.dispatcher import Severity, dispatcher
 from backend.app.scheduler.scheduler import DEFAULT_JOBS, scheduler
+from backend.app.browser.controller import controller as browser_controller
+from backend.app.live import gateway as live_gateway
 from backend.app.scheduler.worker_status import heartbeat_loop, state as worker_state
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
@@ -405,12 +407,26 @@ async def main() -> None:
     # Heartbeat first, so the dashboard shows the worker even while a task runs.
     heartbeat = asyncio.create_task(heartbeat_loop(_shutdown_event))
 
+    # Live Broadcast gateway: the only way the API can show or control the browsers
+    # and Telegram session that live in THIS process.
+    gateway_task = asyncio.create_task(live_gateway.serve(_shutdown_event))
+
     await asyncio.create_task(task_execution_loop())
 
     await _shutdown_event.wait()
     logger.info("Shutdown signal received. Preserving state.")
 
     heartbeat.cancel()
+    try:
+        await asyncio.wait_for(gateway_task, timeout=6)
+    except Exception:
+        gateway_task.cancel()
+    try:  # keep browser cookies of open sessions, then close the browsers cleanly
+        for key in list(browser_controller.open_keys()):
+            await browser_controller.save_state(key)
+        await browser_controller.stop()
+    except Exception:
+        logger.exception("Browser shutdown failed")
     await scheduler.stop()
     try:
         await engine.dispose()

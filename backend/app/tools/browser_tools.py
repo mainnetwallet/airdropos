@@ -10,9 +10,30 @@ import logging
 from typing import Any, Dict
 
 from backend.app.browser.controller import controller
+from backend.app.browser.profiles import normalize_session_key
+from backend.app.live import hub
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _gate(params: Dict[str, Any]):
+    """Refuse to act while an operator paused/stopped the session, holds manual
+    control, or the session is parked waiting for human verification."""
+    reason = hub.browser_sessions.gate(normalize_session_key(params["session_key"]))
+    return ToolResult.needs_user(reason) if reason else None
+
+
+def _needs_human(params: Dict[str, Any], reason: str) -> ToolResult:
+    """Park the session as 'waiting for user' (keeps the page, cookies and profile as they are)."""
+    hub.browser_sessions.mark_waiting(normalize_session_key(params["session_key"]), reason)
+    return ToolResult.needs_user(reason)
+
+
+def _event(params: Dict[str, Any], type_: str, message: str, status: str = "ok") -> None:
+    key = normalize_session_key(params["session_key"])
+    hub.browser_sessions.touch(key)
+    hub.events.emit(integration="browser", session_id=f"browser:{key}", type=type_, message=message, status=status)
 
 
 class NavigateTool(BaseTool):
@@ -32,6 +53,9 @@ class NavigateTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        blocked = _gate(params)
+        if blocked:
+            return blocked
         result = await controller.navigate(params["session_key"], params["url"])
         if not result.get("ok"):
             return ToolResult.failure(
@@ -42,11 +66,11 @@ class NavigateTool(BaseTool):
         obs = result["observation"]
         if obs.get("requires_human"):
             # Do not attempt to solve or evade the gate.
-            return ToolResult.needs_user(obs.get("human_reason") or "Human interaction required.")
+            return _needs_human(params, obs.get("human_reason") or "Human interaction required.")
 
         shot = await controller.screenshot(params["session_key"], "navigate")
         return ToolResult.success(
-            data={"observation": obs, "screenshot_path": shot},
+            data={"observation": obs.__dict__, "screenshot_path": shot},
             evidence={"authoritative": True, "kind": "page_observation", "url": obs.get("url")},
         )
 
@@ -67,10 +91,14 @@ class InspectPageTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        blocked = _gate(params)
+        if blocked:
+            return blocked
         page = await controller.get_page(params["session_key"])
         if page is None:
             return ToolResult.failure("No open page for this session.", category="SESSION_MISSING", retryable=True)
         obs = await controller.inspect(page)
+        hub.browser_sessions.touch(normalize_session_key(params["session_key"]), url=page.url, title=obs.title)
         return ToolResult.success(data={"observation": obs.__dict__})
 
 
@@ -97,13 +125,16 @@ class ClickButtonTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        blocked = _gate(params)
+        if blocked:
+            return blocked
         page = await controller.get_page(params["session_key"])
         if page is None:
             return ToolResult.failure("No open page for this session.", category="SESSION_MISSING", retryable=True)
 
         before = await controller.inspect(page)
         if before.requires_human:
-            return ToolResult.needs_user(before.human_reason or "Human interaction required.")
+            return _needs_human(params, before.human_reason or "Human interaction required.")
 
         try:
             locator = page.get_by_role("button", name=params["button_text"], exact=False)
@@ -118,7 +149,8 @@ class ClickButtonTool(BaseTool):
         except Exception as exc:
             text = str(exc).lower()
             if "captcha" in text:
-                return ToolResult.needs_user("CAPTCHA triggered by this action.")
+                return _needs_human(params, "CAPTCHA triggered by this action.")
+            _event(params, "browser.click_failed", f'Click on "{params["button_text"][:60]}" failed', "error")
             return ToolResult.failure(f"Click failed: {exc}", category="INTERACTION_FAILED", retryable=True)
 
         try:
@@ -129,8 +161,10 @@ class ClickButtonTool(BaseTool):
         after = await controller.inspect(page)
         shot = await controller.screenshot(params["session_key"], "after_click")
 
+        _event(params, "browser.clicked", f'Clicked "{params["button_text"][:60]}" button')
+        hub.browser_sessions.touch(normalize_session_key(params["session_key"]), url=after.url, title=after.title)
         if after.requires_human:
-            return ToolResult.needs_user(after.human_reason or "Human interaction required.")
+            return _needs_human(params, after.human_reason or "Human interaction required.")
 
         expect = params.get("expect_text")
         verified = False
@@ -177,6 +211,9 @@ class FillFormTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        blocked = _gate(params)
+        if blocked:
+            return blocked
         page = await controller.get_page(params["session_key"])
         if page is None:
             return ToolResult.failure("No open page for this session.", category="SESSION_MISSING", retryable=True)
@@ -206,6 +243,8 @@ class FillFormTool(BaseTool):
                 failed.append(f"{name}: {exc}")
 
         observation = await controller.inspect(page)
+        # Field NAMES only: values may be secrets and never go to the activity log.
+        _event(params, "browser.form_filled", f"Filled {len(filled)} form field(s)")
         return ToolResult.success(
             data={
                 "filled": filled,
@@ -234,9 +273,13 @@ class CaptureEvidenceTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        blocked = _gate(params)
+        if blocked:
+            return blocked
         path = await controller.screenshot(params["session_key"], params.get("label", "evidence"))
         if not path:
             return ToolResult.failure("Screenshot capture failed.", category="CAPTURE_FAILED", retryable=True)
+        _event(params, "browser.screenshot", "Screenshot captured")
         return ToolResult.success(
             data={"screenshot_path": path},
             evidence={"authoritative": True, "kind": "screenshot", "uri": path},

@@ -4,7 +4,9 @@ from fastapi import APIRouter
 
 from backend.app.api.v1.endpoints import (
     auth,
+    browser_profiles,
     campaigns,
+    live,
     knowledge,
     system,
     transactions,
@@ -24,3 +26,5 @@ api_router.include_router(settings.router)
 api_router.include_router(wallets.router)
 api_router.include_router(knowledge.router)
 api_router.include_router(ws.router)
+api_router.include_router(live.router)
+api_router.include_router(browser_profiles.router)

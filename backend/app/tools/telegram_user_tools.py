@@ -32,6 +32,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 from urllib.parse import parse_qs
 
 from backend.app.core.config import settings
+from backend.app.live import hub
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
 from backend.app.tools.web_tools import sanitize_external_text
 
@@ -109,6 +110,63 @@ class _TelegramUserSession:
         self._last_action = 0.0
         self._day: Optional[str] = None
         self._count = 0
+        # Live Broadcast state. Only real, observed facts live here.
+        self.ever_used = False
+        self.started_at: Optional[float] = None
+        self.last_action_at: Optional[float] = None
+        self.paused = False
+        self.stopped = False
+        self.waiting_reason: Optional[str] = None
+        self.last_error: Optional[str] = None
+        self.task_id: Optional[str] = None
+        self.task_title: Optional[str] = None
+
+    # -- Live Broadcast helpers ------------------------------------------------
+    SESSION_ID = "telegram:agent"
+
+    def gate_reason(self) -> Optional[str]:
+        if self.stopped:
+            return "The Telegram session was stopped by an operator."
+        if self.paused:
+            return "The Telegram session was paused by an operator."
+        return None
+
+    def is_connected(self) -> bool:
+        try:
+            return bool(self._client is not None and self._client.is_connected())
+        except Exception:
+            return False
+
+    def actions_today(self) -> int:
+        return self._count if self._day == datetime.now(timezone.utc).strftime("%Y-%m-%d") else 0
+
+    def _emit(self, type_: str, message: str, status: Optional[str] = None) -> None:
+        hub.events.emit(
+            integration="telegram", session_id=self.SESSION_ID, type=type_, message=message, status=status
+        )
+
+    def _note_task(self) -> None:
+        try:
+            from backend.app.scheduler.worker_status import state as worker_state
+
+            cur = worker_state.current_task
+        except Exception:
+            cur = None
+        if cur:
+            self.task_id, self.task_title = cur.get("task_id"), cur.get("title")
+
+    def _after(self, label: str, result: ToolResult) -> None:
+        self.last_action_at = time.time()
+        if result.status is ToolResultStatus.SUCCESS:
+            self.waiting_reason = None
+            self.last_error = None
+            self._emit("telegram.action", label, "ok")
+        elif result.status is ToolResultStatus.NEEDS_USER_ACTION:
+            self.waiting_reason = (result.error or "Operator action required")[:200]
+            self._emit("telegram.waiting", f"Waiting for you: {self.waiting_reason}", "waiting")
+        else:
+            self.last_error = f"{result.error_category or 'ERROR'}"
+            self._emit("telegram.error", f"{label} failed ({result.error_category or 'error'})", "error")
 
     async def _connect(self) -> Any:
         if not TELETHON_AVAILABLE:
@@ -140,6 +198,26 @@ class _TelegramUserSession:
         self._last_action = time.monotonic()
 
     async def run(
+        self,
+        fn: Callable[[Any], Awaitable[ToolResult]],
+        *,
+        interactive: bool,
+        label: str = "Telegram action",
+    ) -> ToolResult:
+        if not self.ever_used:
+            self.ever_used = True
+            self.started_at = time.time()
+            self._emit("session.started", "Telegram session started", "ok")
+        self._note_task()
+        blocked = self.gate_reason()
+        if blocked:
+            self._emit("telegram.blocked", f"{label} not run: {blocked}", "paused")
+            return ToolResult.needs_user(blocked)
+        result = await self._run_locked(fn, interactive=interactive)
+        self._after(label, result)
+        return result
+
+    async def _run_locked(
         self, fn: Callable[[Any], Awaitable[ToolResult]], *, interactive: bool
     ) -> ToolResult:
         async with self._lock:
@@ -315,7 +393,7 @@ class TelegramOpenBotTool(BaseTool):
                 evidence=_evidence(message_id=sent.id, reply_count=len(described)),
             )
 
-        return await _session.run(action, interactive=True)
+        return await _session.run(action, interactive=True, label=f"Opened bot @{target['value']}")
 
 
 class TelegramJoinChatTool(BaseTool):
@@ -369,7 +447,7 @@ class TelegramJoinChatTool(BaseTool):
                     )
                 raise
 
-        return await _session.run(action, interactive=True)
+        return await _session.run(action, interactive=True, label=("Joined @" + str(target["value"])) if target["kind"] == "username" else "Joined a chat via invite link")
 
 
 class TelegramReadMessagesTool(BaseTool):
@@ -412,7 +490,7 @@ class TelegramReadMessagesTool(BaseTool):
                 evidence=_evidence(count=len(messages)),
             )
 
-        return await _session.run(action, interactive=False)
+        return await _session.run(action, interactive=False, label=f"Read messages from @{target['value']}")
 
 
 class TelegramSendMessageTool(BaseTool):
@@ -462,7 +540,7 @@ class TelegramSendMessageTool(BaseTool):
                 evidence=_evidence(message_id=sent.id, reply_count=len(described)),
             )
 
-        return await _session.run(action, interactive=True)
+        return await _session.run(action, interactive=True, label=f"Sent a message to @{target['value']} ({len(text)} chars)")
 
 
 class TelegramClickButtonTool(BaseTool):
@@ -534,7 +612,7 @@ class TelegramClickButtonTool(BaseTool):
                 evidence=_evidence(message_id=msg.id, button=button.text),
             )
 
-        return await _session.run(action, interactive=True)
+        return await _session.run(action, interactive=True, label=f"Pressed a button in @{target['value']}")
 
 
 def register_telegram_user_tools(registry) -> bool:

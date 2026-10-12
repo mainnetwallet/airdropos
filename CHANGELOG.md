@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 ### Added
+- Live Broadcast (`/live`): one card per real running browser/Telegram session, live frames, unified activity log, session counts, full-screen session view (desktop + phone), explicit Screen Click Mode with an exclusive control lock and accurate coordinate mapping, human-verification takeover with a verified Resume Agent, and a provider interface for future X.com/Discord sessions. See `docs/LIVE_BROADCAST.md`.
+- Browser Profiles page (`/browser-profiles`) and API (`/api/v1/browser/profiles`): isolated profiles with encrypted saved session state.
+- Worker-side live gateway (`backend/app/live/`), API relay of worker events onto the authenticated WebSocket bus (`live.event`), and `LIVE_*` settings.
 - Mobile/tablet UI redesign (frontend only): light theme tokens, top header with slide-in menu, and a route-driven bottom tab bar (Home, Airdrops, centre Chat, Tasks, Wallets). Desktop sidebar layout is unchanged.
 - New routes `/telegram` (Telegram client readiness from worker status) and `/browser` (browser-capable tools from the registry).
 - New Wallet Management API (`/api/v1/wallets/*`) with full CRUD operations.
@@ -51,6 +54,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 - `README.md` updated to reflect status, test count, and lint/build success.
 - `docs/ARCHITECTURE.md` created.
 - `docs/DEPLOYMENT.md` created.
+
+### Fixed / Security (Live Broadcast hardening, batch 1)
+- Browser profile delete / clear-login now fail closed: if the worker cannot be asked (unreachable, rejected key, unexpected 404) the change is refused with 503 instead of being treated as "no session running". Profile list shows "Status unknown" and keeps destructive buttons disabled.
+- Browser sessions: per-profile start lock (no duplicate contexts), full teardown when a start or first navigation fails, stale page/context cleanup (also in the background sweep), browser-crash recovery, no leaked half-created contexts, ordinary navigation errors no longer destroy the context, and `navigate` no longer fails on every successful load (`PageObservation` is now a proper object).
+- An operator stop can no longer be undone by a late agent call (passive `ensure`/`touch`/context creation leave an operator-stopped session stopped).
+- Browser navigation only opens http(s) pages and refuses loopback/link-local/metadata targets (private LAN ranges need `BROWSER_ALLOW_PRIVATE_NETWORK=true`).
+- Saved session state: only real profiles are persisted, state is bound to its profile inside the ciphertext, owner-only directories, refused in production while `SECRET_KEY` is still the default; session keys that needed rewriting get a hash suffix so different keys can no longer share a context.
+- Manual control: inputs run one at a time per session, the lock is re-checked right before each action, release waits for an in-flight input, pointer input must carry the frame size it was clicked on, non-finite coordinates are rejected.
+- Gateway: malformed JSON bodies return 400, a short `LIVE_GATEWAY_SECRET` is refused when the gateway is reachable beyond loopback, and page titles / status details are redacted. Live events over the WebSocket go only to authenticated sockets in production.
 
 ## [1.0.0] - 2025-10-01
 ### Added
