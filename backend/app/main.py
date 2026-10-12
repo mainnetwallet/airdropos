@@ -27,6 +27,9 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("airdropos.api")
+# httpx logs every request at INFO; the live-event poll runs every second and floods the terminal.
+for _noisy in ("httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 @asynccontextmanager
