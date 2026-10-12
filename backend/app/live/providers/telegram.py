@@ -23,6 +23,9 @@ def _session():
     return tg
 
 
+STOPPED_VISIBLE_SECONDS = 5  # how long a stopped card stays on Live Broadcast
+
+
 class TelegramProvider(SessionProvider):
     integration = "telegram"
     label = "Telegram"
@@ -32,6 +35,8 @@ class TelegramProvider(SessionProvider):
         "screen streaming. One Telegram account is supported. Stop disconnects it and blocks the agent until resumed."
     )
 
+    _stopped_seen = None  # when this provider first saw the session stopped
+
     def configured(self) -> bool:
         return bool(settings.TELEGRAM_USER_ENABLED and settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH)
 
@@ -39,6 +44,16 @@ class TelegramProvider(SessionProvider):
         tg = _session()
         if not tg.ever_used:
             return []  # nothing real to show until the agent has used the account
+        if tg.stopped:
+            # Show "Stopped" briefly, then hide the card. The stopped flag itself stays set, so the
+            # agent remains blocked from using the account until the session is resumed/worker restarted.
+            now = time.time()
+            if self._stopped_seen is None:
+                self._stopped_seen = now
+            if now - max(self._stopped_seen, tg.last_action_at or 0) > STOPPED_VISIBLE_SECONDS:
+                return []
+        else:
+            self._stopped_seen = None
         if tg.stopped:
             status, detail = "stopped", "Stopped by an operator"
         elif tg.paused:  # the operator's own pause is what they need to see first
@@ -107,6 +122,7 @@ class TelegramProvider(SessionProvider):
             return {"status": (await self.get_session(key))["status"], "task_id": tg.task_id, "resumed_from": resumed_from}
         elif action == "stop":
             if not tg.stopped:
+                self._stopped_seen = time.time()
                 tg.stopped = True  # set first: queued agent calls re-check this before they touch the client
                 disconnected = await tg.disconnect_quietly()
                 tg._emit(
