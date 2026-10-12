@@ -76,6 +76,7 @@ def _auth(**overrides) -> SubmissionAuthorization:
         approval_id="appr-1",
         human_approved=True,
         task_id="t-1",
+        allowed_destinations=frozenset({"0x" + "00" * 19 + "01"}),
     )
     base.update(overrides)
     return SubmissionAuthorization(**base)
@@ -105,9 +106,19 @@ def limits(monkeypatch):
     monkeypatch.setattr(settings, "MAX_DAILY_GAS_SPEND_USD", 25.0)
 
 
+class _AcceptingVerifier:
+    """Stands in for the server-side approval store in tests of the OTHER broadcast guards.
+    Approval verification itself is covered in test_security_part3.py."""
+
+    async def verify_and_consume(self, *, approval_id, approved_by, binding) -> bool:
+        return True
+
+
 @pytest.fixture
 def eng(tmp_path, limits):
-    return TransactionEngine(ledger=SpendLedger(str(tmp_path / "ledger.db")))
+    return TransactionEngine(
+        ledger=SpendLedger(str(tmp_path / "ledger.db")), approval_verifier=_AcceptingVerifier()
+    )
 
 
 @pytest.fixture

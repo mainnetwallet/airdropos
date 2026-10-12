@@ -1,0 +1,6 @@
+# Never bake local env files or dependencies into the image.
+.env
+.env.*
+!.env.example
+node_modules
+dist

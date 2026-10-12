@@ -5,7 +5,8 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: airdropos
-      POSTGRES_PASSWORD: airdropos_password
+      # Required: set POSTGRES_PASSWORD in .env (openssl rand -hex 24). No default on purpose.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env before starting the stack}
       POSTGRES_DB: airdropos_db
     ports:
       - "127.0.0.1:5432:5432"
@@ -46,7 +47,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://airdropos:airdropos_password@postgres:5432/airdropos_db
+      DATABASE_URL: postgresql+asyncpg://airdropos:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/airdropos_db
       REDIS_URL: redis://redis:6379/0
       LIVE_GATEWAY_URL: http://worker:8765
     ports:
@@ -54,7 +55,7 @@ services:
     volumes:
       - ./backend:/app/backend
       - ./data:/app/data
-    command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    command: ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   worker:
     build:
@@ -73,7 +74,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://airdropos:airdropos_password@postgres:5432/airdropos_db
+      DATABASE_URL: postgresql+asyncpg://airdropos:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/airdropos_db
       REDIS_URL: redis://redis:6379/0
       # Reachable by the backend container only (no `ports:` entry on purpose).
       # Needs LIVE_GATEWAY_SECRET or a custom SECRET_KEY in .env; the worker refuses to start
@@ -93,7 +94,9 @@ services:
     container_name: airdropos_frontend
     restart: unless-stopped
     ports:
-      - "3000:80"
+      # Reachable on all interfaces by default (RUNNING.md VPS setup). The UI is plain HTTP, so
+      # prefer FRONTEND_BIND=127.0.0.1 in .env with a TLS reverse proxy or an SSH tunnel.
+      - "${FRONTEND_BIND:-0.0.0.0}:3000:80"
     depends_on:
       - backend
     environment:

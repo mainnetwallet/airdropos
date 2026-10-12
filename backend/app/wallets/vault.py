@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -50,6 +51,11 @@ except Exception:  # pragma: no cover - older eth-account has no such guard
 from backend.app.blockchain.chains import all_chain_ids  # noqa: E402
 
 SUPPORTED_CHAIN_IDS: Dict[int, str] = all_chain_ids()
+
+
+_HEX_KEY_RE = re.compile(r"[0-9a-fA-F]{64}")
+# The publicly known development key from config.py. Never acceptable in production.
+_DEV_MASTER_KEY = "0123456789abcdef" * 4
 
 
 class VaultError(Exception):
@@ -90,12 +96,20 @@ class KeyVault:
     """AES-256-GCM envelope encryption for wallet secrets."""
 
     def __init__(self, master_key_hex: Optional[str] = None) -> None:
-        raw = master_key_hex or settings.WALLET_VAULT_MASTER_KEY
-        if raw.startswith("0x"):
+        raw = (master_key_hex or settings.WALLET_VAULT_MASTER_KEY or "").strip()
+        if raw[:2].lower() == "0x":
             raw = raw[2:]
-        if len(raw) != 64:
+        # Exactly 64 hex characters. Checking the format (not only the length) means a typo or a
+        # non-hex value fails here with a clear message instead of as an opaque ValueError, and the
+        # value itself is never echoed.
+        if not _HEX_KEY_RE.fullmatch(raw):
             raise VaultError(
-                "WALLET_VAULT_MASTER_KEY must be exactly 64 hex characters (256-bit key)."
+                "WALLET_VAULT_MASTER_KEY must be exactly 64 hexadecimal characters (256-bit key)."
+            )
+        if settings.ENVIRONMENT == "production" and raw.lower() == _DEV_MASTER_KEY:
+            raise VaultError(
+                "WALLET_VAULT_MASTER_KEY is the publicly known development key; "
+                "refusing to protect wallets with it in production."
             )
         self._master_key = bytes.fromhex(raw)
         self._aesgcm = AESGCM(self._master_key)

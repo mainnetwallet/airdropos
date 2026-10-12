@@ -74,6 +74,11 @@ def create_env_file(env_file: Path) -> None:
     shutil.copy(ROOT / ".env.example", env_file)
     set_env_value(env_file, "SECRET_KEY", secrets.token_hex(32))
     set_env_value(env_file, "WALLET_VAULT_MASTER_KEY", secrets.token_hex(32))
+    # docker compose has no default database password. A fresh .env gets a random one, and the
+    # local DATABASE_URL uses the same value so `docker compose up postgres` and the app agree.
+    db_password = secrets.token_hex(24)
+    set_env_value(env_file, "POSTGRES_PASSWORD", db_password)
+    set_env_value(env_file, "DATABASE_URL", f"postgresql+asyncpg://airdropos:{db_password}@localhost:5432/airdropos_db")
 
 
 MIN_PASSWORD_LEN = 12  # must match MIN_PASSWORD_LENGTH in backend/app/security/auth.py
@@ -150,6 +155,17 @@ def ensure_infra(env_vals: dict[str, str]) -> None:
         return
 
     if host in ("localhost", "127.0.0.1", "::1") and shutil.which("docker"):
+        if not (env_vals.get("POSTGRES_PASSWORD") or os.environ.get("POSTGRES_PASSWORD")):
+            die(
+                "POSTGRES_PASSWORD is not set in .env, and docker compose no longer has a built-in default.\n"
+                "       - New database: add POSTGRES_PASSWORD=<random value> (openssl rand -hex 24) to .env and use\n"
+                "         the same password in DATABASE_URL.\n"
+                "       - Existing database from an older version: set POSTGRES_PASSWORD to the password that database\n"
+                "         was created with (the one in your DATABASE_URL). It is only read when the data volume is first\n"
+                "         created, so it will NOT change an existing database's password. Rotate it afterwards with\n"
+                "         ALTER USER, then update both values.\n"
+                "       - Or run without Docker: py run.py --sqlite"
+            )
         log("PostgreSQL is not running. Starting it with Docker...")
         r = subprocess.run(["docker", "compose", "up", "-d", "postgres"], cwd=ROOT)
         if r.returncode != 0:

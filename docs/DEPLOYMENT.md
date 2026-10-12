@@ -87,11 +87,17 @@ alembic upgrade head
 
 Note: **Alembic 2** (`2_reconcile_schema_with_models.py`) modifies `wallets`, `knowledge_relationships`, `memory_records` to match the ORM. Running `alembic upgrade head` applies all revisions.
 
+### 2b. Migration directories
+`backend/alembic.ini` uses `%(here)s`-relative paths, so `alembic -c backend/alembic.ini ...` works from any directory. The only active chain is `backend/app/migrations/`. `backend/migrations/` is a stale, unused duplicate kept only so no history is deleted (see its `DEPRECATED.md`); never point Alembic at it. Do not run migrations against a production database without a backup.
+
 ### 3. Secrets Management
 
 - **WALLET_VAULT_MASTER_KEY** must be a 64‑character hex string (256 bits). Store securely (e.g., secret manager, `.env` with restricted permissions).
 - **Database passwords** should be stored in environment variables, not in the repo (`.gitignore` excludes `.env`).
 - **Telegram/X/Discord bot tokens** should be kept secret and rotated periodically.
+
+#### Worker egress
+The worker's browser blocks internal destinations in code, but only a network-level egress firewall on the worker container can fully close DNS-rebinding and non-HTTP paths. See `SECURITY.md` section 2.7.1.
 
 ### 4. Resource Limits
 

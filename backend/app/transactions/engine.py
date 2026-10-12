@@ -10,13 +10,13 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Protocol, runtime_checkable
 
 import httpx
 
 from backend.app.core.config import settings
 from backend.app.security.emergency_stop import EmergencyStopError, emergency_stop
-from backend.app.blockchain.chains import ChainError, EvmChainAdapter
+from backend.app.blockchain.chains import ChainError, EvmChainAdapter, get_chain
 from backend.app.transactions.spend_ledger import SpendLedger, SpendLimitExceeded
 
 logger = logging.getLogger(__name__)
@@ -102,6 +102,96 @@ class TransactionIntent:
 NON_HUMAN_APPROVERS = frozenset({"", "agent", "system", "llm", "assistant", "claude", "worker", "none", "auto"})
 
 
+@runtime_checkable
+class ApprovalVerifier(Protocol):
+    """Server-side proof that a named human approved exactly this broadcast.
+
+    The engine never trusts a flag the caller sets. It asks an independent verifier, backed by
+    storage the caller cannot write to, to confirm that ``approval_id`` is a real, unexpired,
+    unused approval issued to ``approved_by`` for exactly the transaction described by
+    ``binding`` (network, chain id, wallet, destination, value, raw-transaction hash and cost),
+    and to mark it used. Return False (or raise) to refuse. Implementations must make the
+    check-and-consume atomic so one approval can authorise one broadcast only.
+    """
+
+    async def verify_and_consume(
+        self, *, approval_id: str, approved_by: str, binding: Mapping[str, str]
+    ) -> bool: ...
+
+
+@dataclass(frozen=True)
+class DecodedRawTransaction:
+    """The fields of a signed raw transaction that destination validation needs."""
+
+    tx_type: int
+    chain_id: Optional[int]
+    to: Optional[str]
+    value: int
+    data: bytes
+
+
+# Signed transaction types whose payload layout is decoded below. Anything else (blob,
+# set-code/EIP-7702, unknown future types) is refused rather than guessed at.
+_TX_LAYOUT = {
+    # type: (index of chainId, index of `to`, index of `value`, index of `data`, field count)
+    1: (0, 4, 5, 6, 11),   # EIP-2930: chainId, nonce, gasPrice, gas, to, value, data, accessList, v, r, s
+    2: (0, 5, 6, 7, 12),   # EIP-1559: chainId, nonce, tip, maxFee, gas, to, value, data, accessList, v, r, s
+}
+
+
+def decode_raw_transaction(raw_tx_hex: str) -> DecodedRawTransaction:
+    """Decode destination, value, calldata and chain id from a signed raw transaction.
+
+    Raises TransactionRejected for anything that cannot be decoded with certainty.
+    """
+    import rlp
+    from hexbytes import HexBytes
+
+    def reject(why: str) -> TransactionRejected:
+        return TransactionRejected(f"Raw transaction rejected: {why}", "UNDECODABLE_TX")
+
+    try:
+        raw = bytes(HexBytes(raw_tx_hex if raw_tx_hex.startswith("0x") else "0x" + raw_tx_hex))
+    except Exception:
+        raise reject("not valid hex") from None
+    if not raw:
+        raise reject("empty payload")
+
+    def to_hex(to_bytes: bytes) -> Optional[str]:
+        if to_bytes == b"":
+            return None  # contract creation
+        if len(to_bytes) != 20:
+            raise reject("malformed destination")
+        return "0x" + to_bytes.hex()
+
+    try:
+        if raw[0] >= 0xC0:  # legacy transaction: a bare RLP list
+            fields = rlp.decode(raw)
+            if not isinstance(fields, list) or len(fields) != 9:
+                raise reject("malformed legacy transaction")
+            v = int.from_bytes(fields[6], "big")
+            chain_id = (v - 35) // 2 if v >= 35 else None  # v of 27/28 carries no chain id
+            return DecodedRawTransaction(0, chain_id, to_hex(fields[3]), int.from_bytes(fields[4], "big"), bytes(fields[5]))
+        layout = _TX_LAYOUT.get(raw[0])
+        if layout is None:
+            raise reject(f"unsupported transaction type 0x{raw[0]:02x}")
+        fields = rlp.decode(raw[1:])
+        c_i, to_i, val_i, data_i, count = layout
+        if not isinstance(fields, list) or len(fields) != count:
+            raise reject("malformed typed transaction")
+        return DecodedRawTransaction(
+            raw[0],
+            int.from_bytes(fields[c_i], "big"),
+            to_hex(fields[to_i]),
+            int.from_bytes(fields[val_i], "big"),
+            bytes(fields[data_i]),
+        )
+    except TransactionRejected:
+        raise
+    except Exception:
+        raise reject("could not be decoded") from None
+
+
 @dataclass(frozen=True)
 class SubmissionAuthorization:
     """Everything `submit_raw` requires before it will broadcast.
@@ -116,16 +206,27 @@ class SubmissionAuthorization:
     estimated_cost_usd: float
     approved_by: str
     approval_id: str
+    # Compatibility only. This flag is caller-supplied, so it proves nothing: it is necessary
+    # (False always refuses) but never sufficient. The engine's ApprovalVerifier is the proof.
     human_approved: bool = False
     task_id: Optional[str] = None
+    # Destinations this broadcast may be sent to. Empty means none: it fails closed.
+    allowed_destinations: frozenset = frozenset()
 
 
 class TransactionEngine:
     """Validates, builds, and submits transactions within hard limits."""
 
-    def __init__(self, ledger: Optional[SpendLedger] = None) -> None:
+    def __init__(
+        self,
+        ledger: Optional[SpendLedger] = None,
+        approval_verifier: Optional[ApprovalVerifier] = None,
+    ) -> None:
         # Spend is persisted and shared across processes; see spend_ledger.py.
         self.ledger = ledger or SpendLedger()
+        # None means raw broadcast stays disabled: there is no server-side approval store yet,
+        # and a caller-supplied `human_approved=True` is not proof of approval.
+        self.approval_verifier = approval_verifier
 
     @property
     def daily_spend_usd(self) -> float:
@@ -331,6 +432,48 @@ class TransactionEngine:
                 f"Raw transaction could not be decoded; refusing to broadcast: {exc}", "UNDECODABLE_TX"
             ) from exc
 
+    @staticmethod
+    def _validate_raw_destination(
+        network: str, raw_tx_hex: str, authorization: SubmissionAuthorization
+    ) -> DecodedRawTransaction:
+        """Judge what a pre-signed transaction actually does, from its own bytes."""
+        decoded = decode_raw_transaction(raw_tx_hex)
+        try:
+            expected_chain = get_chain(network).chain_id
+        except ChainError as exc:
+            raise TransactionRejected(f"Unknown network: {exc}", "UNKNOWN_NETWORK") from exc
+        if decoded.chain_id != expected_chain:
+            # No chain id (pre-EIP-155) is replayable on any chain; a different one is the wrong chain.
+            raise TransactionRejected(
+                f"Raw transaction chain id {decoded.chain_id} does not match network "
+                f"'{network}' ({expected_chain}); refusing to broadcast.",
+                "CHAIN_ID_MISMATCH",
+            )
+        if decoded.to is None:
+            raise TransactionRejected(
+                "Contract-creation transactions cannot be broadcast through submit_raw.", "DESTINATION_NOT_ALLOWED"
+            )
+        to = decoded.to.lower()
+        allowed = {str(a).lower() for a in (authorization.allowed_destinations or ())}
+        if not allowed or to not in allowed:
+            raise TransactionRejected(
+                "Transaction destination is not in the approved destination set; refusing to broadcast.",
+                "DESTINATION_NOT_ALLOWED",
+            )
+        for category, addresses in DENYLIST_CATEGORIES.items():
+            if to in {a.lower() for a in addresses}:
+                raise TransactionRejected(
+                    f"Destination is on the {category} denylist; refusing to broadcast.", "DESTINATION_DENIED"
+                )
+        # Same restricted-operation rules the vault applies when it signs.
+        from backend.app.wallets.vault import KeyVault, SigningDenied
+
+        try:
+            KeyVault._validate_transaction({"to": to, "data": "0x" + decoded.data.hex()})
+        except SigningDenied as exc:
+            raise TransactionRejected(str(exc), "RESTRICTED_OPERATION") from exc
+        return decoded
+
     async def submit_raw(
         self,
         network: str,
@@ -342,10 +485,14 @@ class TransactionEngine:
 
         Fails closed. Before any broadcast this enforces, in order:
           1. Emergency Stop,
-          2. explicit human approval,
+          2. a named human approval, confirmed by the server-side ApprovalVerifier (the
+             caller-supplied ``human_approved`` flag alone is never accepted),
           3. that the transaction was signed by an authorised wallet,
-          4. the per-transaction and rolling daily spend limits (atomic reservation),
-          5. Emergency Stop again, immediately before the RPC call.
+          4. the decoded chain id, destination and calldata (allowed destination, no contract
+             creation, no restricted selectors),
+          5. the approval being consumed for exactly this transaction,
+          6. the per-transaction and rolling daily spend limits (atomic reservation),
+          7. Emergency Stop again, immediately before the RPC call.
         """
         if not emergency_stop.can_submit_transactions():
             raise EmergencyStopError(
@@ -364,6 +511,13 @@ class TransactionEngine:
                 "HUMAN_APPROVAL_REQUIRED",
             )
 
+        if self.approval_verifier is None:
+            raise TransactionRejected(
+                "Broadcast is disabled: no server-side approval verifier is configured, and a "
+                "caller-supplied approval flag is not accepted as proof.",
+                "HUMAN_APPROVAL_REQUIRED",
+            )
+
         authorized = {str(a).lower() for a in (authorization.authorized_addresses or ())}
         if not authorized or str(authorization.wallet_address).lower() not in authorized:
             raise TransactionRejected(
@@ -374,6 +528,35 @@ class TransactionEngine:
             raise TransactionRejected(
                 "Raw transaction signer does not match the authorised wallet; refusing to broadcast.",
                 "NOT_AUTHORIZED",
+            )
+
+        decoded = self._validate_raw_destination(network, raw_tx_hex, authorization)
+
+        try:
+            from eth_utils import keccak
+
+            raw_bytes = bytes.fromhex(raw_tx_hex[2:] if raw_tx_hex.startswith("0x") else raw_tx_hex)
+            approved = await self.approval_verifier.verify_and_consume(
+                approval_id=str(authorization.approval_id),
+                approved_by=str(authorization.approved_by),
+                binding={
+                    "network": str(network).lower(),
+                    "chain_id": str(decoded.chain_id),
+                    "wallet": str(authorization.wallet_address).lower(),
+                    "to": str(decoded.to),
+                    "value_wei": str(decoded.value),
+                    "tx_hash": "0x" + keccak(raw_bytes).hex(),
+                    "estimated_cost_usd": repr(float(authorization.estimated_cost_usd)),
+                },
+            )
+        except Exception as exc:
+            logger.warning("Approval verification failed: %s", type(exc).__name__)
+            approved = False
+        if approved is not True:
+            raise TransactionRejected(
+                "Broadcast requires an approval that the server can verify for this exact "
+                "transaction; none was found.",
+                "HUMAN_APPROVAL_REQUIRED",
             )
 
         reservation_id = await self.reserve_spend(

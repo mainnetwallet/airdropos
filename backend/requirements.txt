@@ -26,7 +26,7 @@ eth-account>=0.12.3
 cryptography>=42.0.7
 
 # Browser Automation
-playwright>=1.44.0
+playwright>=1.48.0
 
 # Host resource readout for Live Broadcast (optional; degrades gracefully)
 psutil>=5.9.8
