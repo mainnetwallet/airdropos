@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
@@ -602,7 +603,11 @@ Produce EXACTLY this JSON shape:
         if plan is None:
             return
 
-        steps = list(plan.steps or [])
+        # Copy every step dict. The JSON column has no mutation tracking, and editing the stored
+        # dicts in place makes the "new" value compare equal to the committed one, so SQLAlchemy
+        # emitted no UPDATE and step statuses were never persisted (a resumed task would then
+        # re-run steps that had already completed).
+        steps = [dict(raw) for raw in (plan.steps or [])]
         for raw in steps:
             if int(raw.get("index", -1)) == step_index:
                 raw["status"] = status
@@ -612,6 +617,7 @@ Produce EXACTLY this JSON shape:
                     raw["failure_reason"] = failure_reason
                 break
         plan.steps = steps
+        flag_modified(plan, "steps")
         await self.db.flush()
 
     # ------------------------------------------------------------------

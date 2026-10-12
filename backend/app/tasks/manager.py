@@ -180,6 +180,37 @@ class TaskManager:
     # ------------------------------------------------------------------
     # Progress recording
     # ------------------------------------------------------------------
+    async def update_progress(
+        self,
+        task: Task,
+        *,
+        progress: Optional[float] = None,
+        next_planned_action: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> Task:
+        """Record progress on a task that is already running, WITHOUT changing its status.
+
+        A worker claims a task straight into IN_PROGRESS, and the state machine (rightly) forbids
+        IN_PROGRESS -> IN_PROGRESS, so per-step bookkeeping must not go through ``transition``.
+        This never alters ``task.status`` and is refused for tasks that are not IN_PROGRESS, so it
+        cannot be used to sidestep transition validation.
+        """
+        current = TaskStatus(task.status)
+        if current is not TaskStatus.IN_PROGRESS:
+            raise ValueError(
+                f"update_progress only applies to IN_PROGRESS tasks; {task.task_id} is {current.value}"
+            )
+        if progress is not None:
+            task.progress = max(0.0, min(1.0, progress))
+        if next_planned_action is not None:
+            task.next_planned_action = next_planned_action
+        await self.db.flush()
+        if note:
+            await self._record_event(
+                task, "PROGRESS_UPDATE", "INFO", {"reason": note, "progress": task.progress}
+            )
+        return task
+
     async def record_action(
         self,
         task: Task,
@@ -237,8 +268,11 @@ class TaskManager:
         """
         from backend.app.core.config import settings
 
+        # Only tasks that are executing occupy a slot. A RETRYING task is parked until its backoff
+        # elapses and then needs a slot to run: counting it here meant that as many waiting retries
+        # as the limit allows blocked every claim, including the retries themselves.
         active_count = await self.db.scalar(
-            select(func.count(Task.id)).where(Task.status.in_([s.value for s in (TaskStatus.IN_PROGRESS, TaskStatus.RETRYING)]))
+            select(func.count(Task.id)).where(Task.status == TaskStatus.IN_PROGRESS.value)
         )
         if (active_count or 0) >= settings.MAX_CONCURRENT_TASKS:
             logger.debug("Concurrency limit reached (%s/%s)", active_count, settings.MAX_CONCURRENT_TASKS)

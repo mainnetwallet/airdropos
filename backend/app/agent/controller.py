@@ -161,7 +161,11 @@ class AgentController:
                                "Restored prior state", 0)
                 )
 
-            while iteration < budget:
+            # The budget bounds THIS run. Iteration numbers keep counting up across runs (they
+            # order checkpoints and executions), so an absolute cap would leave a resumed task
+            # with no iterations left and it could never get past a budget exhaustion.
+            run_limit = iteration + budget
+            while iteration < run_limit:
                 iteration += 1
                 iteration_started = time.perf_counter()
 
@@ -212,18 +216,104 @@ class AgentController:
                 await self.db.commit()
             else:
                 # Loop exhausted its budget without reaching a terminal state.
-                report.outcome = LoopOutcome.BUDGET_EXHAUSTED
-                report.blockers.append(
-                    f"Reached the {budget}-iteration limit without completing. "
-                    "Work is checkpointed and resumable."
-                )
-                await self._checkpoint(task, iteration, "budget_exhausted")
+                await self._settle_budget_exhausted(task, iteration, budget, report)
 
             report.duration_ms = int((time.perf_counter() - started) * 1000)
             await self._apply_final_status(task, report)
             return report
         finally:
             await self.leases.release(task, lease.lease_token)
+
+    # ------------------------------------------------------------------
+    async def _settle_budget_exhausted(
+        self, task: Task, iteration: int, budget: int, report: LoopReport
+    ) -> None:
+        """Give a task whose run hit the iteration budget an honest, non-stuck status.
+
+        Without this the task stayed IN_PROGRESS: not claimable (workers only claim READY or
+        RETRYING), not terminal, and invisible to everything except a worker restart.
+
+        * If the persisted plan is in fact fully processed (finalization simply needs one more
+          iteration than the steps themselves), finalize it. That path verifies against evidence,
+          so it yields COMPLETED only when every step was proven, otherwise PARTIALLY_COMPLETED.
+        * Otherwise work remains: PARTIALLY_COMPLETED ("some actions succeeded; more remain").
+          This is deliberately not RETRYING: hitting the budget is not a failure, so it must not
+          consume the retry budget or schedule automatic re-runs. An operator resumes it
+          (PARTIALLY_COMPLETED -> READY/RETRYING). Completed steps, checkpoints, executions and
+          evidence are left untouched; the plan's persisted step statuses drive the resume.
+        """
+        # Read the persisted plan: the in-memory spec can be stale after a replan.
+        plan = await self.planner.load_plan_spec(task)
+
+        if plan is not None and plan.steps and plan.is_complete():
+            final_iteration = iteration + 1
+            step, _terminal, outcome = await self._finalize_plan(task, final_iteration, plan, report)
+            report.steps.append(step)
+            await self.tasks.save_execution(
+                task,
+                iteration=final_iteration,
+                plan={"action": step.action_description, "tool": None},
+                observation={"verified": step.verified, "notes": step.notes},
+                reasoning=step.notes,
+                result=step.tool_result or {},
+                status="SUCCESS" if step.verified else "UNVERIFIED",
+                duration_ms=0,
+            )
+            report.outcome = outcome
+            await self._checkpoint(task, final_iteration, "plan_finalized")
+            return
+
+        report.outcome = LoopOutcome.BUDGET_EXHAUSTED
+        report.blockers.append(
+            f"Reached the {budget}-iteration limit without completing. "
+            "Work is checkpointed and resumable."
+        )
+        await self._checkpoint(task, iteration, "budget_exhausted")
+
+        if task.status != TaskStatus.IN_PROGRESS.value:
+            return  # something already moved the task to a deliberate status; keep it
+        remaining = plan.ready_steps() if plan is not None else []
+        await self.tasks.transition(
+            task,
+            TaskStatus.PARTIALLY_COMPLETED,
+            reason=(
+                f"Iteration budget of {budget} exhausted with work remaining; "
+                "progress is checkpointed and the task can be resumed."
+            ),
+            progress=self._plan_progress(plan) if plan is not None else task.progress,
+            next_planned_action=(
+                remaining[0].description if remaining else task.next_planned_action
+            ),
+        )
+
+    async def _record_progress(
+        self,
+        task: Task,
+        *,
+        reason: str,
+        progress: Optional[float] = None,
+        next_planned_action: Optional[str] = None,
+        note: Optional[str] = None,
+    ) -> None:
+        """Record per-step progress without a redundant status transition.
+
+        A claimed task is already IN_PROGRESS and the state machine forbids
+        IN_PROGRESS -> IN_PROGRESS, so only progress and the next planned action are updated.
+        A task that is not IN_PROGRESS yet (not how the worker calls us) still goes through the
+        validated transition, so validation is never bypassed.
+        """
+        if task.status == TaskStatus.IN_PROGRESS.value:
+            await self.tasks.update_progress(
+                task, progress=progress, next_planned_action=next_planned_action, note=note
+            )
+        else:
+            await self.tasks.transition(
+                task,
+                TaskStatus.IN_PROGRESS,
+                reason=reason,
+                progress=progress,
+                next_planned_action=next_planned_action,
+            )
 
     # ------------------------------------------------------------------
     async def _ensure_plan(self, task: Task, report: LoopReport) -> ExecutionPlanSpec:
@@ -448,9 +538,8 @@ class AgentController:
         task.actual_cost_usd = round(task.actual_cost_usd + step.estimated_cost_usd, 6)
 
         upcoming = plan.ready_steps()
-        await self.tasks.transition(
+        await self._record_progress(
             task,
-            TaskStatus.IN_PROGRESS,
             reason="Plan step processed",
             progress=self._plan_progress(plan),
             next_planned_action=upcoming[0].description if upcoming else "All plan steps processed",
@@ -639,11 +728,11 @@ class AgentController:
         )
         await self._checkpoint(task, iteration, f"replanned_{trigger.value.lower()}")
         upcoming = new_plan.ready_steps() if new_plan else []
-        await self.tasks.transition(
+        await self._record_progress(
             task,
-            TaskStatus.IN_PROGRESS,
             reason=f"Replanned: {reason[:300]}",
             next_planned_action=upcoming[0].description if upcoming else "No executable steps remain",
+            note=f"Replanned: {reason[:300]}",
         )
         return (
             StepResult(iteration, f"replanned ({trigger.value})", None, None, False, reason[:300], 0),
