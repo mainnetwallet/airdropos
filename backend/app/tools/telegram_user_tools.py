@@ -33,6 +33,7 @@ from urllib.parse import parse_qs
 
 from backend.app.core.config import settings
 from backend.app.live import hub
+from backend.app.live.events import redact_text
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
 from backend.app.tools.web_tools import sanitize_external_text
 
@@ -95,6 +96,18 @@ def looks_like_secret(text: str) -> bool:
 
 class _NotLoggedIn(Exception):
     pass
+
+
+class _GateBlocked(Exception):
+    """An operator paused or stopped the session after this call was already queued."""
+
+
+def _safe_exc_text(exc: BaseException) -> str:
+    """Exception text fit for results, events and logs: credential-looking values and anything
+    shaped like a phone number (Telethon errors can echo the account's number) are removed."""
+    text = redact_text(" ".join(str(exc).split()))
+    text = re.sub(r"\+?\d[\d ()\-]{7,}\d", "[number]", text)
+    return text[:200] or type(exc).__name__
 
 
 class _RateLimited(Exception):
@@ -177,11 +190,30 @@ class _TelegramUserSession:
                 int(settings.TELEGRAM_API_ID),
                 str(settings.TELEGRAM_API_HASH),
             )
+        newly_connected = False
         if not self._client.is_connected():
             await self._client.connect()
+            newly_connected = True
         if not await self._client.is_user_authorized():
             raise _NotLoggedIn()
+        if newly_connected:
+            self._emit("telegram.connected", "Connected to Telegram", "ok")
         return self._client
+
+    async def disconnect_quietly(self) -> bool:
+        """Drop the connection. Returns whether it is really down; never raises."""
+        client, ok = self._client, True
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception as exc:
+                ok = False
+                logger.warning("Telegram disconnect failed (%s)", type(exc).__name__)
+            try:
+                ok = ok and not client.is_connected()
+            except Exception:
+                pass
+        return ok
 
     async def _pace(self) -> None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -207,13 +239,18 @@ class _TelegramUserSession:
         if not self.ever_used:
             self.ever_used = True
             self.started_at = time.time()
-            self._emit("session.started", "Telegram session started", "ok")
+            self._emit("session.started", "The agent began using the Telegram account", "ok")
         self._note_task()
         blocked = self.gate_reason()
         if blocked:
             self._emit("telegram.blocked", f"{label} not run: {blocked}", "paused")
             return ToolResult.needs_user(blocked)
-        result = await self._run_locked(fn, interactive=interactive)
+        try:
+            result = await self._run_locked(fn, interactive=interactive)
+        except _GateBlocked as late:
+            # The operator paused/stopped while this call waited for the lock or for pacing.
+            self._emit("telegram.blocked", f"{label} not run: {late}", "paused")
+            return ToolResult.needs_user(str(late))
         self._after(label, result)
         return result
 
@@ -222,10 +259,21 @@ class _TelegramUserSession:
     ) -> ToolResult:
         async with self._lock:
             try:
+                # Re-checked under the lock: a call queued behind another one must not run after
+                # an operator paused or stopped the session, and a stop must not be undone by a
+                # late call reconnecting the client.
+                late = self.gate_reason()
+                if late:
+                    raise _GateBlocked(late)
                 client = await self._connect()
                 if interactive:
                     await self._pace()
+                    late = self.gate_reason()  # pacing can sleep for a long time
+                    if late:
+                        raise _GateBlocked(late)
                 return await fn(client)
+            except _GateBlocked:
+                raise
             except _NotLoggedIn:
                 return ToolResult.needs_user(
                     "Telegram session is not logged in. Run `python scripts/telegram_login.py` "
@@ -251,11 +299,22 @@ class _TelegramUserSession:
                         retryable=False,
                     )
                 if name in ("AuthKeyUnregisteredError", "SessionRevokedError", "SessionExpiredError",
-                            "UserDeactivatedError", "UserDeactivatedBanError"):
-                    return ToolResult.needs_user(
-                        f"Telegram session is no longer valid ({name}). Log in again with "
-                        "`python scripts/telegram_login.py`."
-                    )
+                            "UserDeactivatedError", "UserDeactivatedBanError", "AuthKeyDuplicatedError",
+                            "SessionPasswordNeededError", "ApiIdInvalidError"):
+                    # Credentials/session problems are never retried: drop the connection and wait for a human.
+                    await self.disconnect_quietly()
+                    if name == "AuthKeyDuplicatedError":
+                        text = ("The Telegram session was used from two places at once and was invalidated. "
+                                "Use it from one place only, then log in again with `python scripts/telegram_login.py`.")
+                    elif name == "SessionPasswordNeededError":
+                        text = ("Telegram needs the two-step password. Log in again with "
+                                "`python scripts/telegram_login.py`; the agent never handles it.")
+                    elif name == "ApiIdInvalidError":
+                        text = "TELEGRAM_API_ID / TELEGRAM_API_HASH were rejected by Telegram. Check the configuration."
+                    else:
+                        text = (f"Telegram session is no longer valid ({name}). Log in again with "
+                                "`python scripts/telegram_login.py`.")
+                    return ToolResult.needs_user(text)
                 if name in ("UsernameNotOccupiedError", "UsernameInvalidError", "InviteHashExpiredError",
                             "InviteHashInvalidError", "ChannelPrivateError"):
                     return ToolResult.failure(f"Telegram target not available: {name}",
@@ -263,8 +322,9 @@ class _TelegramUserSession:
                 if name in ("ChatWriteForbiddenError", "UserBannedInChannelError", "ChatAdminRequiredError"):
                     return ToolResult.failure(f"Telegram refused the action: {name}",
                                               category="FORBIDDEN", retryable=False)
-                logger.exception("Telegram tool error")
-                return ToolResult.failure(f"Telegram error ({name}): {exc}", category="PROVIDER_ERROR",
+                # No traceback and no raw message: either can carry the phone number or session details.
+                logger.error("Telegram tool error (%s)", name)
+                return ToolResult.failure(f"Telegram error ({name}): {_safe_exc_text(exc)}", category="PROVIDER_ERROR",
                                           retryable=True)
 
 

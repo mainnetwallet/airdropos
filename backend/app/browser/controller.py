@@ -11,6 +11,8 @@ import asyncio
 import ipaddress
 import logging
 import re
+import socket
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,7 +23,7 @@ from backend.app.browser import profiles as profile_store
 from backend.app.browser.profiles import normalize_session_key
 from backend.app.core.config import settings
 from backend.app.live import hub
-from backend.app.live.events import safe_url
+from backend.app.live.events import redact_text, safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -64,15 +66,40 @@ class PageObservation:
 
 _DEAD_MARKERS = ("target closed", "has been closed", "browser has been closed", "crash", "context or browser")
 _BLOCKED_HOSTS = ("localhost", "metadata.google.internal", "metadata")
+# Cloud metadata endpoints that must never be reachable, even with BROWSER_ALLOW_PRIVATE_NETWORK.
+_METADATA_IPS = frozenset(
+    ipaddress.ip_address(a) for a in ("169.254.169.254", "169.254.170.2", "100.100.100.200", "fd00:ec2::254")
+)
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _unwrap_ip(ip):
+    """IPv4 hidden inside IPv6 (::ffff:a.b.c.d, NAT64) is judged as the IPv4 it really is."""
+    if isinstance(ip, ipaddress.IPv6Address):
+        if ip.ipv4_mapped is not None:
+            return ip.ipv4_mapped
+        if ip in _NAT64:
+            return ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    return ip
+
+
+def _ip_block_reason(ip) -> Optional[str]:
+    ip = _unwrap_ip(ip)
+    if ip in _METADATA_IPS or ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
+        return "loopback, link-local and metadata addresses are not allowed"
+    # Private LAN, carrier-grade NAT, reserved and any other non-global range.
+    if not ip.is_global and not getattr(settings, "BROWSER_ALLOW_PRIVATE_NETWORK", False):
+        return "private network addresses are not allowed (BROWSER_ALLOW_PRIVATE_NETWORK)"
+    return None
 
 
 def url_block_reason(url: str) -> Optional[str]:
-    """Why a navigation target must be refused, or None when it is allowed.
+    """Why a navigation target must be refused, or None when it is allowed (literal checks only).
 
     Only http(s) pages are opened. Loopback / link-local / cloud-metadata targets are always
     refused (the worker's own loopback hosts the live gateway, and the live view would show
     whatever the browser loads to every viewer). Private ranges need BROWSER_ALLOW_PRIVATE_NETWORK.
-    Hostnames that merely RESOLVE to such addresses are not checked here.
+    Hostnames are NOT resolved here; see ``destination_block_reason`` for the resolving check.
     """
     try:
         parts = urlsplit((url or "").strip())
@@ -84,14 +111,68 @@ def url_block_reason(url: str) -> Optional[str]:
     if host in _BLOCKED_HOSTS or host.endswith(".localhost") or host.endswith(".internal"):
         return "local and internal hosts are not allowed"
     try:
-        ip = ipaddress.ip_address(host)
+        return _ip_block_reason(ipaddress.ip_address(host))
     except ValueError:
-        return None  # a normal hostname
-    if ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast:
-        return "loopback, link-local and metadata addresses are not allowed"
-    if (ip.is_private or ip.is_reserved) and not getattr(settings, "BROWSER_ALLOW_PRIVATE_NETWORK", False):
-        return "private network addresses are not allowed (BROWSER_ALLOW_PRIVATE_NETWORK)"
-    return None
+        return None  # a hostname (or a legacy numeric form; the resolving check handles those)
+
+
+_RESOLVE_TTL_SECONDS = 2.0
+_resolve_cache: Dict[str, "tuple[float, Optional[str]]"] = {}
+
+
+async def destination_block_reason(url: str) -> Optional[str]:
+    """Like ``url_block_reason`` but also resolves the hostname and judges EVERY address it maps to.
+
+    Fails closed: if the name cannot be resolved here, the destination cannot be verified, so it is
+    refused. This also covers legacy numeric hosts such as ``2130706433`` or ``0x7f.1``, which the
+    resolver turns into addresses. Limitation: Chromium resolves the name again itself, so a DNS
+    server that answers differently the second time is only narrowed, not eliminated, by checking
+    every request right before it is sent. An egress firewall remains the complete answer.
+    """
+    reason = url_block_reason(url)
+    if reason:
+        return reason
+    parts = urlsplit((url or "").strip())
+    host = (parts.hostname or "").lower().rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+        return None  # a literal address, already judged above
+    except ValueError:
+        pass
+    now = time.monotonic()
+    cached = _resolve_cache.get(host)
+    if cached is not None and now - cached[0] < _RESOLVE_TTL_SECONDS:
+        return cached[1]
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    verdict: Optional[str] = None
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=5
+        )
+        if not infos:
+            verdict = "the hostname could not be verified"
+        for info in infos:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+            verdict = _ip_block_reason(ip)
+            if verdict:
+                verdict = "the hostname resolves to an address that is not allowed"
+                break
+    except Exception:
+        verdict = "the hostname could not be verified"
+    if len(_resolve_cache) > 512:
+        _resolve_cache.clear()
+    _resolve_cache[host] = (now, verdict)
+    return verdict
+
+
+def _safe_error(exc: BaseException, url: str = "") -> str:
+    """An error message that is safe to hand to the agent, events and logs: no URL query
+    strings, no credentials, no Playwright call logs."""
+    text = str(exc).split("Call log:")[0]
+    if url:
+        text = text.replace(url, safe_url(url))
+    text = re.sub(r"https?://\S+", lambda m: safe_url(m.group(0)), text)
+    return redact_text(" ".join(text.split()))[:200] or type(exc).__name__
 
 
 class BrowserController:
@@ -130,7 +211,7 @@ class BrowserController:
                 return True
             except Exception as exc:
                 self._healthy = False
-                self._last_error = str(exc)
+                self._last_error = _safe_error(exc)
                 logger.error("Browser automation failed to start: %s", exc)
                 if self._playwright:
                     try:
@@ -250,6 +331,9 @@ class BrowserController:
             "viewport": {"width": width, "height": height},
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
             "ignore_https_errors": False,
+            # Service workers can answer requests without the network layer ever seeing them,
+            # which would skip the destination guard below.
+            "service_workers": "block",
         }
         if profile and profile.locale:
             options["locale"] = profile.locale
@@ -267,8 +351,11 @@ class BrowserController:
             context = await self._browser.new_context(**options)
             context.set_default_timeout(settings.BROWSER_ACTION_TIMEOUT_MS)
             context.set_default_navigation_timeout(settings.BROWSER_NAVIGATION_TIMEOUT_MS)
+            # Every request (redirect hops, iframes, scripts, fetches) is checked, not just the
+            # first URL the agent asked for.
+            await context.route("**/*", self._make_route_guard(session_key))
         except Exception as exc:
-            logger.error("Failed to create context for '%s': %s", session_key, exc)
+            logger.error("Failed to create context for '%s': %s", session_key, _safe_error(exc))
             await self._safe_close(context)  # never leave a half-configured context behind
             try:
                 if self._browser is not None and not self._browser.is_connected():
@@ -285,6 +372,48 @@ class BrowserController:
         )
         logger.info("Created isolated browser context for session '%s'", session_key)
         return context
+
+    def _make_route_guard(self, session_key: str):
+        async def guard(route) -> None:
+            request = route.request
+            url = request.url
+            scheme = urlsplit(url).scheme.lower()
+            if scheme in ("data", "blob", "about"):
+                await self._route_continue(route)  # no network destination
+                return
+            try:
+                reason = await destination_block_reason(url)
+            except Exception:
+                reason = "the destination could not be verified"
+            if reason is None:
+                await self._route_continue(route)
+                return
+            try:
+                await route.abort("blockedbyclient")
+            except Exception:
+                pass  # the page went away while we were deciding
+            try:
+                is_nav = bool(request.is_navigation_request())
+            except Exception:
+                is_nav = False
+            if is_nav:  # one event per blocked page load; blocked subresources would flood the log
+                hub.events.emit(
+                    integration="browser",
+                    session_id=f"browser:{session_key}",
+                    type="browser.blocked",
+                    status="blocked",
+                    message=f"Blocked a request to {safe_url(url)}: {reason}",
+                )
+            logger.warning("Blocked browser request for '%s' to %s: %s", session_key, safe_url(url), reason)
+
+        return guard
+
+    @staticmethod
+    async def _route_continue(route) -> None:
+        try:
+            await route.continue_()
+        except Exception:
+            pass  # request already cancelled (page closed or navigated away)
 
     async def get_page(self, session_key: str):
         """Get or create a page within the session's context. Reuses open tabs."""
@@ -323,7 +452,9 @@ class BrowserController:
     # ------------------------------------------------------------------
     async def navigate(self, session_key: str, url: str) -> Dict[str, Any]:
         session_key = normalize_session_key(session_key)
-        blocked = url_block_reason(url)
+        if hub.browser_sessions.is_operator_stopped(session_key):
+            return {"ok": False, "reason": "operator_stopped", "detail": "This session was stopped by an operator."}
+        blocked = await destination_block_reason(url)
         if blocked:
             # Not a session fault: nothing is marked failed, no browser is opened for it.
             return {"ok": False, "reason": "blocked_url", "detail": blocked}
@@ -337,12 +468,16 @@ class BrowserController:
             response = await page.goto(url, wait_until="domcontentloaded")
         except Exception as exc:
             text = str(exc).lower()
+            if "err_blocked_by_client" in text:
+                # Our own destination guard refused a redirect hop or the page itself: not retryable,
+                # not a session fault.
+                return {"ok": False, "reason": "blocked_url", "detail": "the page or a redirect led to an address that is not allowed"}
             if not (page.is_closed() or any(marker in text for marker in _DEAD_MARKERS)):
                 # An ordinary failure (DNS error, timeout, refused connection). The browser and its
                 # login state are fine, so keep them instead of tearing the whole context down.
                 logger.warning("Navigation to %s failed: %s", safe_url(url), type(exc).__name__)
                 hub.browser_sessions.mark_error(session_key, "Navigation failed")
-                return {"ok": False, "reason": "navigation_failed", "detail": str(exc)}
+                return {"ok": False, "reason": "navigation_failed", "detail": _safe_error(exc, url)}
             # The page/context died: drop it and try once more on a fresh one.
             logger.warning("Page for '%s' died during navigation (%s). Recreating context.", session_key, type(exc).__name__)
             await self.close_session(session_key)
@@ -354,12 +489,23 @@ class BrowserController:
                 response = await page.goto(url, wait_until="domcontentloaded")
             except Exception as exc2:
                 hub.browser_sessions.mark_error(session_key, "Navigation failed")
-                return {"ok": False, "reason": "navigation_failed", "detail": str(exc2)}
+                return {"ok": False, "reason": "navigation_failed", "detail": _safe_error(exc2, url)}
 
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass  # Networkidle is best-effort; many sites never reach it.
+
+        # A late agent call must not report or persist anything after an operator stopped the session.
+        if hub.browser_sessions.is_operator_stopped(session_key):
+            return {"ok": False, "reason": "operator_stopped", "detail": "This session was stopped by an operator."}
+        # Defence in depth: whatever the page ended up on (after redirects) is judged again.
+        if url_block_reason(page.url) and page.url not in ("about:blank", ""):
+            try:
+                await page.goto("about:blank")
+            except Exception:
+                pass
+            return {"ok": False, "reason": "blocked_url", "detail": "the page redirected to an address that is not allowed"}
 
         observation = await self.inspect(page)
         observation.http_status = response.status if response else None
@@ -380,7 +526,7 @@ class BrowserController:
             content = await page.content()
         except Exception as exc:
             return PageObservation(
-                url=page.url, title="", text_excerpt=f"Inspection failed: {exc}",
+                url=page.url, title="", text_excerpt=f"Inspection failed: {_safe_error(exc)}",
                 requires_human=True, human_reason="Page could not be read",
             )
 

@@ -192,10 +192,13 @@ class Settings(BaseSettings):
         default=None,
         description="Shared secret between API and worker gateway. Derived from SECRET_KEY when unset.",
     )
-    LIVE_CONTROL_LOCK_TTL_SECONDS: int = 45
-    LIVE_HUMAN_WAIT_TIMEOUT_SECONDS: int = 1800
-    LIVE_FRAME_JPEG_QUALITY_FULL: int = 72
-    LIVE_FRAME_JPEG_QUALITY_THUMB: int = 40
+    # Bounded so a typo cannot disable lock expiry or exhaust the host.
+    LIVE_CONTROL_LOCK_TTL_SECONDS: int = Field(default=45, ge=10, le=600)
+    LIVE_HUMAN_WAIT_TIMEOUT_SECONDS: int = Field(default=1800, ge=60, le=86400)
+    LIVE_FRAME_JPEG_QUALITY_FULL: int = Field(default=72, ge=20, le=95)
+    LIVE_FRAME_JPEG_QUALITY_THUMB: int = Field(default=40, ge=20, le=95)
+    # Each running browser session is a Chromium context in the worker.
+    LIVE_MAX_BROWSER_SESSIONS: int = Field(default=6, ge=1, le=50)
 
     # =========================================================================
     # 24/7 SCHEDULER & RECURRING CYCLES

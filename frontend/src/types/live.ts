@@ -59,6 +59,8 @@ export interface LiveResources {
 
 export interface LiveOverview {
   gateway: { available: boolean; reason: string | null }
+  /** Integrations whose session list could not be read this time (their sessions are NOT shown). */
+  degraded?: string[]
   integrations: IntegrationInfo[]
   sessions: LiveSession[]
   counts: Record<SessionStatus | 'total', number>

@@ -10,7 +10,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.app.browser import profiles as profile_store
-from backend.app.browser.controller import controller, url_block_reason
+from backend.app.browser.controller import controller, url_block_reason, destination_block_reason
 from backend.app.browser.profiles import normalize_session_key
 from backend.app.core.config import settings
 from backend.app.live import hub
@@ -176,11 +176,18 @@ class BrowserProvider(SessionProvider):
         url = str(payload.get("url") or profile.start_url or "").strip()
         if url and not re.match(r"^https?://[^\s]+$", url, re.I):
             raise Conflict("URL must begin with http:// or https://", "bad_url")
-        blocked = url_block_reason(url) if url else None
+        # Resolves the hostname too, so a name that points at an internal address is refused up front.
+        blocked = await destination_block_reason(url) if url else None
         if blocked:
             raise Conflict(f"That address cannot be opened: {blocked}.", "bad_url")
 
         reg = hub.browser_sessions
+        active = sum(1 for r in reg.records.values() if not r.stopped and r.key != key)
+        if active >= settings.LIVE_MAX_BROWSER_SESSIONS:
+            raise Conflict(
+                f"The limit of {settings.LIVE_MAX_BROWSER_SESSIONS} running browser sessions is reached. Stop one first.",
+                "session_limit",
+            )
         # Two quick clicks on "Start" must not build two contexts for one profile (the second used to
         # overwrite the first and leak it).
         async with self._create_locks.setdefault(key, asyncio.Lock()):

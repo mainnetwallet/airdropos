@@ -77,7 +77,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       # Reachable by the backend container only (no `ports:` entry on purpose).
       # Needs LIVE_GATEWAY_SECRET or a custom SECRET_KEY in .env; the worker refuses to start
-      # the gateway on a non-loopback address otherwise.
+      # the gateway on a non-loopback address otherwise. Every request also needs the shared secret.
+      # The worker's browser refuses internal Docker service names and private addresses unless
+      # BROWSER_ALLOW_PRIVATE_NETWORK=true; an egress firewall on this container is still advised.
       LIVE_GATEWAY_HOST: 0.0.0.0
     volumes:
       - ./backend:/app/backend

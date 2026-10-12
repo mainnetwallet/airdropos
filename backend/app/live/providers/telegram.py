@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from backend.app.core.config import settings
 from backend.app.live import hub
+from backend.app.live.events import redact_text
 from backend.app.live.models import Capabilities, Conflict, NotSupported, SessionNotFound
 from backend.app.live.providers.base import SessionProvider
 
@@ -26,7 +27,10 @@ class TelegramProvider(SessionProvider):
     integration = "telegram"
     label = "Telegram"
     capabilities = Capabilities(visual=False, events=True, pause_resume=True, stop=True, manual_control=False)
-    note = "API session (Telethon). Shows real activity events; it has no graphical screen."
+    note = (
+        "API session (Telethon). It shows real activity events only: there is no graphical screen and no "
+        "screen streaming. One Telegram account is supported. Stop disconnects it and blocks the agent until resumed."
+    )
 
     def configured(self) -> bool:
         return bool(settings.TELEGRAM_USER_ENABLED and settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH)
@@ -37,10 +41,10 @@ class TelegramProvider(SessionProvider):
             return []  # nothing real to show until the agent has used the account
         if tg.stopped:
             status, detail = "stopped", "Stopped by an operator"
-        elif tg.waiting_reason:
-            status, detail = "waiting_for_user", tg.waiting_reason
-        elif tg.paused:
+        elif tg.paused:  # the operator's own pause is what they need to see first
             status, detail = "paused", "Paused by an operator"
+        elif tg.waiting_reason:
+            status, detail = "waiting_for_user", redact_text(tg.waiting_reason)
         else:
             status, detail = "running", None
         created = tg.started_at or time.time()
@@ -65,10 +69,10 @@ class TelegramProvider(SessionProvider):
                 "viewport": None,
                 "capabilities": self.capabilities.as_dict(),
                 "control": None,
-                "waiting": {"reason": tg.waiting_reason, "since": None, "timed_out": False}
+                "waiting": {"reason": redact_text(tg.waiting_reason), "since": None, "timed_out": False}
                 if tg.waiting_reason
                 else None,
-                "error": tg.last_error,
+                "error": redact_text(tg.last_error) if tg.last_error else None,
                 "meta": {
                     "connected": tg.is_connected(),
                     "actions_today": tg.actions_today(),
@@ -83,21 +87,33 @@ class TelegramProvider(SessionProvider):
             raise SessionNotFound(key)
         who = str(payload.get("operator") or "operator")
         if action == "pause":
-            tg.paused = True
-            tg._emit("session.paused", f"Paused by {who}", "paused")
+            if tg.stopped:
+                raise Conflict("The Telegram session is stopped. Resume it first.", "stopped")
+            if not tg.paused:  # a repeated click must not log a second pause
+                tg.paused = True
+                tg._emit("session.paused", f"Paused by {who}", "paused")
         elif action == "resume":
+            resumed_from: List[str] = []
+            if tg.stopped:
+                resumed_from.append("stopped")
+            if tg.paused:
+                resumed_from.append("paused")
+            if tg.waiting_reason:
+                resumed_from.append("waiting_for_user")
             tg.paused = tg.stopped = False
             tg.waiting_reason = None  # re-evaluated by the next real action
-            tg._emit("session.resumed", f"Resumed by {who}", "ok")
-            return {"status": "running", "task_id": tg.task_id, "resumed_from": ["paused"]}
+            if resumed_from:
+                tg._emit("session.resumed", f"Resumed by {who}", "ok")
+            return {"status": (await self.get_session(key))["status"], "task_id": tg.task_id, "resumed_from": resumed_from}
         elif action == "stop":
-            tg.stopped = True
-            try:
-                if tg._client is not None:
-                    await tg._client.disconnect()
-            except Exception:
-                pass
-            tg._emit("session.stopped", f"Disconnected and stopped by {who}", "stopped")
+            if not tg.stopped:
+                tg.stopped = True  # set first: queued agent calls re-check this before they touch the client
+                disconnected = await tg.disconnect_quietly()
+                tg._emit(
+                    "session.stopped",
+                    f"Stopped by {who}" + (" and disconnected" if disconnected else "; the disconnect did not complete"),
+                    "stopped",
+                )
         elif action.startswith("control."):
             raise NotSupported("Telegram API sessions have no screen to control.")
         else:
