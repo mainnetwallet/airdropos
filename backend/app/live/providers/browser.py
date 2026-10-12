@@ -19,6 +19,7 @@ from backend.app.live.models import Capabilities, Conflict, Frame, NotSupported,
 from backend.app.live.providers.base import SessionProvider
 from backend.app.live.sessions import SessionRecord
 
+STOPPED_VISIBLE_SECONDS = 5  # how long a stopped card stays on Live Broadcast
 TASK_DONE_GRACE_SECONDS = 8  # let the last frame/event show before the browser closes
 
 # Keys an operator may press. Anything else is refused rather than guessed at.
@@ -148,7 +149,16 @@ class BrowserProvider(SessionProvider):
 
     async def list_sessions(self) -> List[Dict[str, Any]]:
         await self.reconcile()
-        recs = sorted(hub.browser_sessions.records.values(), key=lambda r: r.ordinal)
+        now = time.time()
+        # A stopped session stays on screen briefly ("Stopped"), then its card disappears.
+        # The record itself is kept so an operator stop still blocks the agent.
+        recs = sorted(
+            (
+                r for r in hub.browser_sessions.records.values()
+                if not r.stopped or now - (r.stopped_at or now) <= STOPPED_VISIBLE_SECONDS
+            ),
+            key=lambda r: r.ordinal,
+        )
         return [self._public(r) for r in recs]
 
     async def get_session(self, key: str) -> Dict[str, Any]:
