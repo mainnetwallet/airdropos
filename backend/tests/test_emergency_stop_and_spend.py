@@ -225,7 +225,7 @@ class TestEmergencyStopSharedAndPersistent:
     def test_resume_that_cannot_be_persisted_keeps_the_stop(self, tmp_path, monkeypatch):
         controller = EmergencyStopController(str(tmp_path / "stop.json"))
         controller.activate("incident", "operator")
-        monkeypatch.setattr(controller, "_persist", lambda: (_ for _ in ()).throw(OSError("disk full")))
+        monkeypatch.setattr(controller, "_persist", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
 
         with pytest.raises(OSError):
             controller.resume("operator")

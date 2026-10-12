@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -26,6 +27,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Callable, Deque, Dict, List, Optional
 
 from fastapi import Depends, HTTPException, Request, status
@@ -207,9 +209,65 @@ RATE_LIMITS = {
 }
 
 
+@lru_cache(maxsize=8)
+def _parse_trusted_proxies(raw: str) -> tuple:
+    """Parse TRUSTED_PROXIES (comma-separated IPs/CIDRs) into networks. Bad entries are skipped.
+
+    A skipped entry can only make a proxy *untrusted*, which collapses clients into the proxy's
+    bucket (safe, noisy) and never lets an unlisted address vouch for a forwarded header.
+    """
+    networks = []
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logger.error("Ignoring invalid TRUSTED_PROXIES entry %r", item)
+    return tuple(networks)
+
+
+def _normalize_ip(value: str) -> Optional[ipaddress._BaseAddress]:
+    try:
+        addr = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def client_ip(request: Request) -> str:
+    """The address rate limits are keyed on.
+
+    ``X-Forwarded-For`` is client-controlled, so it is consulted ONLY when the directly connected
+    peer is one of ``settings.TRUSTED_PROXIES``. The header is then read right to left, skipping
+    addresses that are themselves trusted proxies; the first address that is not trusted is the
+    client. Anything unusable (no trusted proxy configured, an untrusted peer, a malformed header)
+    falls back to the peer address, so a spoofed header can never choose its own bucket.
+    """
+    peer_raw = request.client.host if request.client else None
+    if not peer_raw:
+        return "unknown"
+    networks = _parse_trusted_proxies(getattr(settings, "TRUSTED_PROXIES", "") or "")
+    peer = _normalize_ip(peer_raw)
+    if not networks or peer is None or not any(peer in net for net in networks):
+        return peer_raw
+
+    hops = [h for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+    for hop in reversed(hops):
+        addr = _normalize_ip(hop)
+        if addr is None:
+            return peer_raw  # malformed header: do not guess
+        if not any(addr in net for net in networks):
+            return str(addr)
+    return peer_raw
+
+
 def enforce_rate_limit(request: Request, bucket: str) -> None:
     limit, window = RATE_LIMITS.get(bucket, RATE_LIMITS["read"])
-    client = request.client.host if request.client else "unknown"
+    client = client_ip(request)
     allowed, retry_after = rate_limiter.check(f"{bucket}:{client}", limit, window)
     if not allowed:
         logger.warning("Rate limit exceeded for %s on %s", client, bucket)
@@ -237,6 +295,9 @@ class Principal:
     session_token: Optional[str] = None
     channel: str = "rest"  # rest | telegram | system
     is_operator: bool = False
+    # When the session this principal came from stops being valid (UTC). Lets long-lived
+    # connections end exactly at expiry instead of waiting for the next database revalidation.
+    session_expires_at: Optional[datetime] = None
 
     def has(self, scope: Scope) -> bool:
         return scope.value in self.scopes
@@ -270,8 +331,11 @@ SYSTEM_PRINCIPAL = Principal(
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
-async def resolve_session(db: AsyncSession, token: Optional[str]) -> Principal:
+async def resolve_session(db: AsyncSession, token: Optional[str], touch: bool = True) -> Principal:
     """Resolve a raw session token into a Principal. The single source of truth.
+
+    ``touch=False`` is for periodic revalidation of an already-open connection: it performs every
+    check but does not write ``last_used_at``, so frequent revalidation costs a read, not a write.
 
     Both REST (`get_principal`) and the WebSocket endpoint call this, so a
     revoked, expired, unknown or inactive-account session is refused identically
@@ -307,7 +371,8 @@ async def resolve_session(db: AsyncSession, token: Optional[str]) -> Principal:
     granted = session.scopes if isinstance(session.scopes, (list, tuple, set)) else []
     scopes = frozenset(s for s in granted if isinstance(s, str) and s in ALL_SCOPES)
 
-    session.last_used_at = now
+    if touch:
+        session.last_used_at = now
 
     return Principal(
         user_id=str(user.id),
@@ -316,6 +381,7 @@ async def resolve_session(db: AsyncSession, token: Optional[str]) -> Principal:
         session_token=token,
         channel="rest",
         is_operator=bool(user.is_superuser),
+        session_expires_at=expires,
     )
 
 

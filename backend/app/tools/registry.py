@@ -349,12 +349,16 @@ class ToolRegistry:
                         f"{tool.name}:{task_id}",
                         "Emergency stop is active; signing and submission are blocked.",
                     )
-            elif tool.side_effect is SideEffect.WEB_INTERACTION:
+            elif tool.side_effect in (SideEffect.WEB_INTERACTION, SideEffect.STATE_MUTATION):
+                # STATE_MUTATION tools act outside the process too (e.g. send_notification posts to
+                # Telegram), so they stop with task execution. Pure reads (NONE, EXTERNAL_READ) stay
+                # available for diagnostics.
                 if not emergency_stop.can_execute_tasks():
                     from backend.app.security.emergency_stop import EmergencyStopError
 
                     raise EmergencyStopError(
-                        f"{tool.name}:{task_id}", "Emergency stop is active; web interaction is blocked."
+                        f"{tool.name}:{task_id}",
+                        "Emergency stop is active; web interaction and state changes are blocked.",
                     )
         except Exception as exc:  # EmergencyStopError and any guard failure
             return ToolResult(

@@ -25,12 +25,44 @@ from typing import Dict, Optional
 
 from backend.app.core.config import settings
 
-try:  # POSIX only; on other platforms the in-process lock is all that is available.
+try:  # POSIX advisory locks.
     import fcntl
 except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
+try:  # Windows byte-range locks.
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None  # type: ignore[assignment]
+
 logger = logging.getLogger(__name__)
+
+# Sentinel: "do not check the state file's signature before replacing it".
+_ANY_SIGNATURE = object()
+
+
+def _try_lock(handle) -> None:
+    """Take an exclusive, non-blocking cross-process lock on ``handle``.
+
+    Raises ``OSError`` when the lock is held elsewhere OR when this platform has no locking
+    primitive at all. The latter is deliberate: a missing lock must surface as a failure the
+    caller handles, never as silently running without one.
+    """
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    elif msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        raise OSError("no cross-process file-locking primitive is available on this platform")
+
+
+def _unlock(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 class StopPolicy:
@@ -86,6 +118,7 @@ class EmergencyStopController:
     """
 
     MAX_HISTORY = 50
+    LOCK_TIMEOUT_SECONDS = 3.0
 
     def __init__(self, state_file: Optional[str] = None) -> None:
         self._state_file = Path(state_file or settings.EMERGENCY_STOP_STATE_FILE)
@@ -168,39 +201,41 @@ class EmergencyStopController:
         """In-process lock plus a cross-process file lock around read-modify-write transitions.
 
         Without it an API process resuming and a worker process activating can interleave and the
-        stop is silently lost. ``required`` callers (resume) refuse to proceed unlocked; activation
-        never waits indefinitely, because engaging the stop must not be blockable.
+        stop is silently lost. ``required`` callers (resume) refuse to proceed unlocked, on every
+        platform: if no lock can be taken, the state is left unchanged and the stop stays engaged.
+        Activation never waits indefinitely, because engaging the stop must not be blockable; it
+        proceeds without the lock (loudly), which is safe because a concurrent resume re-checks the
+        state file's signature before it writes (see ``resume``) and so cannot overwrite it.
         """
         with self._lock:
             handle = None
-            if fcntl is not None:
-                try:
-                    self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-                    handle = open(self._lock_path, "a+")
-                    deadline = time.monotonic() + 3.0
-                    while True:
-                        try:
-                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                            break
-                        except OSError:
-                            if time.monotonic() >= deadline:
-                                raise
-                            time.sleep(0.02)
-                except OSError as exc:
-                    if handle is not None:
-                        handle.close()
-                        handle = None
-                    if required:
-                        raise EmergencyStopPersistenceError(
-                            f"Could not lock the emergency stop state ({type(exc).__name__}); state unchanged."
-                        ) from exc
-                    logger.critical("Emergency stop lock unavailable (%s); proceeding without it.", exc)
+            try:
+                self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = open(self._lock_path, "a+")
+                deadline = time.monotonic() + self.LOCK_TIMEOUT_SECONDS
+                while True:
+                    try:
+                        _try_lock(handle)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.02)
+            except OSError as exc:
+                if handle is not None:
+                    handle.close()
+                    handle = None
+                if required:
+                    raise EmergencyStopPersistenceError(
+                        f"Could not lock the emergency stop state ({type(exc).__name__}); state unchanged."
+                    ) from exc
+                logger.critical("Emergency stop lock unavailable (%s); proceeding without it.", exc)
             try:
                 yield
             finally:
                 if handle is not None:
                     try:
-                        fcntl.flock(handle, fcntl.LOCK_UN)
+                        _unlock(handle)
                     finally:
                         handle.close()
 
@@ -240,7 +275,14 @@ class EmergencyStopController:
                 self._policy = set(StopPolicy.ALLOWED)
             self._file_sig = sig
 
-    def _persist(self) -> None:
+    def _persist(self, expected_signature: object = _ANY_SIGNATURE) -> None:
+        """Atomically replace the state file.
+
+        ``expected_signature`` makes the write a compare-and-swap: if the file changed since the
+        caller read it, nothing is written and :class:`EmergencyStopPersistenceError` is raised.
+        Resume uses this so a stop engaged by another process in the meantime is never overwritten,
+        even when the cross-process lock could not be taken.
+        """
         with self._lock:
             payload = {
                 "stopped": self._stopped,
@@ -257,6 +299,11 @@ class EmergencyStopController:
                     json.dump(payload, handle)
                     handle.flush()
                     os.fsync(handle.fileno())
+                if expected_signature is not _ANY_SIGNATURE and self._signature() != expected_signature:
+                    raise EmergencyStopPersistenceError(
+                        "The emergency stop state changed while it was being updated; "
+                        "nothing was written. Re-check the state and retry."
+                    )
                 os.replace(tmp, self._state_file)
             except Exception:
                 try:
@@ -374,6 +421,8 @@ class EmergencyStopController:
             )
         with self._exclusive(required=True):
             self._refresh()
+            # The state this release is based on; _persist refuses to write over anything newer.
+            based_on = self._file_sig
             previous = (self._stopped, self._activated_at, self._activated_by, self._reason, self._policy)
             was_stopped = self._stopped
             self._stopped = False
@@ -389,7 +438,7 @@ class EmergencyStopController:
             }
             self._history.append(event)
             try:
-                self._persist()
+                self._persist(expected_signature=based_on)
                 self._persist_error = None
             except Exception:
                 # If the resume cannot be shared, stay stopped everywhere

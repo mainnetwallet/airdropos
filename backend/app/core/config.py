@@ -60,6 +60,15 @@ class Settings(BaseSettings):
         ),
     )
     SESSION_TTL_HOURS: int = Field(default=24, description="Operator session lifetime")
+    TRUSTED_PROXIES: str = Field(
+        default="",
+        description=(
+            "Comma-separated IPs/CIDRs of reverse proxies allowed to set X-Forwarded-For (e.g. "
+            "the frontend nginx container's network). Empty (default) trusts no forwarded header, "
+            "so rate limits are keyed on the connecting address. Never list a range that clients "
+            "can connect from directly."
+        ),
+    )
     TELEGRAM_WEBHOOK_SECRET: Optional[str] = Field(
         default=None,
         description="Shared secret for authenticating Telegram webhook requests",

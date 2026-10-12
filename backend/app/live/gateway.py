@@ -27,8 +27,23 @@ from backend.app.live import hub
 from backend.app.live.models import Conflict, NotSupported, SessionNotFound
 from backend.app.live.providers import PROVIDERS
 from backend.app.live.security import GATEWAY_HEADER, bind_allowed, secret_matches
+from backend.app.security.emergency_stop import emergency_stop
 
 logger = logging.getLogger("airdropos.live.gateway")
+
+
+def _refuse_while_stopped(what: str) -> None:
+    """Enforce the Emergency Stop at the worker, not only in the API that fronts it.
+
+    The API checks too, but the gateway is the process that actually starts browsers and hands
+    control back to the agent, and it accepts any caller holding the shared secret. Reads (listing,
+    frames, events) stay available so the operator can still look at what is happening.
+    """
+    if emergency_stop.is_stopped:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "emergency_stop", "message": f"Emergency stop is active; cannot {what}."},
+        )
 
 
 async def _require_secret(x_live_gateway_key: Optional[str] = Header(default=None, alias=GATEWAY_HEADER)) -> None:
@@ -151,6 +166,7 @@ def build_app() -> FastAPI:
 
     @app.post("/sessions", dependencies=deps)
     async def create_session(request: Request) -> Dict[str, Any]:
+        _refuse_while_stopped("start a session")
         body = await _json_body(request)
         provider = _provider(str(body.get("integration") or ""))
         try:
@@ -190,6 +206,8 @@ def build_app() -> FastAPI:
     @app.post("/sessions/{integration}/{key}/action", dependencies=deps)
     async def action(integration: str, key: str, request: Request) -> Dict[str, Any]:
         body = await _json_body(request)
+        if str(body.get("action") or "") == "resume":
+            _refuse_while_stopped("resume the agent")
         try:
             return await _provider(integration).action(key, str(body.get("action") or ""), body)
         except HTTPException:

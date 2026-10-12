@@ -50,6 +50,9 @@ services:
       DATABASE_URL: postgresql+asyncpg://airdropos:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/airdropos_db
       REDIS_URL: redis://redis:6379/0
       LIVE_GATEWAY_URL: http://worker:8765
+      # Reverse proxies whose X-Forwarded-For the API may believe for rate limiting (comma-separated
+      # IPs/CIDRs, e.g. the compose network's subnet). Empty = trust no forwarded header. See DEPLOYMENT.md.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:

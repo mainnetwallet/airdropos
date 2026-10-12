@@ -27,7 +27,14 @@ from backend.app.security.emergency_stop import emergency_stop
 logger = logging.getLogger(__name__)
 
 MAX_WS_CLIENTS = 200
-WS_REVALIDATE_SECONDS = 60
+# How often an open socket's session is re-read from the database. This bounds how long a session
+# revoked by anything other than this process's own logout (account deactivation, a direct database
+# revoke, a second API process) can keep streaming. Session EXPIRY does not wait for this: the
+# watcher ends the socket at the exact expiry time. Each check is one indexed read (no write).
+WS_REVALIDATE_SECONDS = 10
+# Consecutive failed checks (database down, etc.) after which the socket is closed rather than left
+# streaming on a session nobody can verify. One or two blips do not drop legitimate connections.
+WS_MAX_CHECK_FAILURES = 3
 # Browsers cannot set an Authorization header on a WebSocket, so the token rides in
 # the `Sec-WebSocket-Protocol` handshake: `new WebSocket(url, ["bearer", token])`.
 # Unlike a `?token=` query string it is not written to URLs, access logs or history.
@@ -142,41 +149,84 @@ def _extract_ws_token(websocket: WebSocket) -> Optional[str]:
     return None
 
 
-async def _authenticate_websocket(token: Optional[str]) -> Optional[Principal]:
+async def _authenticate_websocket(token: Optional[str], touch: bool = True) -> Optional[Principal]:
     """Resolve a WebSocket caller through the same code path REST uses.
 
     Returns None when the token is absent, unknown, expired, revoked, belongs to
     an inactive account, or lacks the `read` scope that every live-data REST
-    route also requires.
+    route also requires. Anything else (e.g. the database being unreachable) is
+    raised, not mistaken for "valid".
+
+    ``touch=False`` is for periodic revalidation: all checks, no ``last_used_at`` write.
     """
     if not token:
         return None
 
     async with AsyncSessionLocal() as db:
         try:
-            principal = await resolve_session(db, token)
+            principal = await resolve_session(db, token, touch=touch)
         except AuthError:
             return None
-        await db.commit()  # persists last_used_at
+        if touch:
+            await db.commit()  # persists last_used_at
 
     if not principal.has(Scope.READ):
         return None
     return replace(principal, channel="websocket")
 
 
-async def _watch_session(websocket: WebSocket, token: str) -> None:
+async def _close_quietly(websocket: WebSocket, code: int, reason: str) -> None:
+    try:
+        await websocket.close(code=code, reason=reason)
+    except Exception:  # already gone
+        pass
+
+
+async def _watch_session(
+    websocket: WebSocket, token: str, expires_at: Optional[datetime] = None
+) -> None:
     """Close the socket as soon as its session stops being valid.
 
     Revalidation must not depend on the client sending a heartbeat: a client that
     never pings would otherwise keep streaming after logout or expiry.
+
+    * Expiry is enforced at the exact expiry time, without a database round trip.
+    * Revocation is picked up on the next revalidation (``WS_REVALIDATE_SECONDS``).
+    * A check that cannot be completed is not treated as success: after
+      ``WS_MAX_CHECK_FAILURES`` consecutive failures the socket is closed (fail closed).
+      The watcher never dies silently, which would leave the socket unchecked forever.
     """
+    failures = 0
     while True:
-        await asyncio.sleep(WS_REVALIDATE_SECONDS)
-        if await _authenticate_websocket(token) is None:
-            try:
-                await websocket.close(code=4401, reason="Session ended")
-            except Exception:
-                pass
+        delay = WS_REVALIDATE_SECONDS
+        if expires_at is not None:
+            remaining = (expires_at - datetime.now(timezone.utc)).total_seconds()
+            if remaining <= 0:
+                await _close_quietly(websocket, 4401, "Session ended")
+                return
+            delay = min(delay, remaining)
+        await asyncio.sleep(delay)
+
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+            await _close_quietly(websocket, 4401, "Session ended")
+            return
+        try:
+            principal = await _authenticate_websocket(token, touch=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            failures += 1
+            logger.warning(
+                "WebSocket session check failed (%s), attempt %s/%s",
+                type(exc).__name__, failures, WS_MAX_CHECK_FAILURES,
+            )
+            if failures >= WS_MAX_CHECK_FAILURES:
+                await _close_quietly(websocket, 1011, "Session could not be verified")
+                return
+            continue
+        failures = 0
+        if principal is None:
+            await _close_quietly(websocket, 4401, "Session ended")
             return
 
 
@@ -232,7 +282,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             }
         )
         if principal is not None and token:
-            watcher = asyncio.create_task(_watch_session(websocket, token))
+            watcher = asyncio.create_task(
+                _watch_session(websocket, token, principal.session_expires_at)
+            )
         while True:
             # Client heartbeats keep the socket alive and detect disconnects.
             message = await websocket.receive_text()
