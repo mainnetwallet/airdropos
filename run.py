@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -140,6 +141,106 @@ def port_open(host: str, port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def _listening_pids(port: int) -> set[int]:
+    """PIDs of processes listening on a TCP port (empty if none, or if no lookup tool exists)."""
+    pids: set[int] = set()
+    try:
+        if IS_WIN:
+            r = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, errors="replace")
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) < 5 or parts[0].upper() != "TCP":
+                    continue
+                local, foreign, pid = parts[1], parts[2], parts[-1]
+                # A listening socket has no remote peer (0.0.0.0:0 / [::]:0). Checking that instead of the
+                # word LISTENING keeps this working on non-English Windows.
+                if local.rsplit(":", 1)[-1] == str(port) and foreign.rsplit(":", 1)[-1] == "0" and pid.isdigit():
+                    pids.add(int(pid))
+        elif shutil.which("lsof"):
+            r = subprocess.run(
+                ["lsof", "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], capture_output=True, text=True
+            )
+            pids.update(int(x) for x in r.stdout.split() if x.isdigit())
+        elif shutil.which("ss"):
+            r = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True)
+            pids.update(int(x) for x in re.findall(r"pid=(\d+)", r.stdout))
+    except OSError:
+        pass
+    return pids
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        if IS_WIN:
+            ps = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, errors="replace",
+            )
+        else:
+            r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True)
+        return r.stdout.strip()
+    except OSError:
+        return ""
+
+
+def _is_ours(cmdline: str) -> bool:
+    """True if the command line points into this project folder (venv python, node_modules, ...)."""
+    norm = lambda s: s.replace("\\", "/").lower()  # noqa: E731
+    return bool(cmdline) and norm(str(ROOT)) in norm(cmdline)
+
+
+def _kill_tree(pid: int) -> None:
+    if IS_WIN:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return
+    try:
+        pgid = os.getpgid(pid)
+        if pgid != os.getpgid(0):
+            os.killpg(pgid, signal.SIGTERM)  # children were started in their own session
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    for _ in range(20):  # up to ~5s to exit cleanly, then force
+        time.sleep(0.25)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def free_ports(ports: dict[int, str]) -> None:
+    """Stop leftover AirdropOS processes that still hold our ports from an earlier run.
+
+    Only processes whose command line points into this project folder are stopped. Anything else
+    that uses a port is left alone and reported, so an unrelated program is never killed.
+    """
+    me = os.getpid()
+    killed: set[int] = set()
+    for port, name in ports.items():
+        for pid in sorted(_listening_pids(port) - {me}):
+            if _is_ours(_cmdline(pid)):
+                log(f"Port {port} ({name}) is held by an old AirdropOS process (PID {pid}). Stopping it...")
+                _kill_tree(pid)
+                killed.add(port)
+            else:
+                log(f"WARNING: port {port} ({name}) is used by another program (PID {pid}). Not touching it.")
+    deadline = time.time() + 10
+    while killed and time.time() < deadline:
+        killed = {p for p in killed if _listening_pids(p) - {me}}
+        if killed:
+            time.sleep(0.5)
+    if killed:
+        log(f"WARNING: port(s) {', '.join(map(str, sorted(killed)))} still busy after stopping the old process.")
 
 
 def ensure_infra(env_vals: dict[str, str]) -> None:
@@ -272,6 +373,7 @@ def main() -> None:
     ap.add_argument("--hide-password", action="store_true", help="with --set-password: do not show the password while typing")
     ap.add_argument("--host", default="127.0.0.1", help="backend bind address (default 127.0.0.1)")
     ap.add_argument("--reload", action="store_true", help="auto-reload backend on code changes")
+    ap.add_argument("--keep-existing", action="store_true", help="do not stop old AirdropOS processes that still hold the ports")
     args = ap.parse_args()
 
     if sys.version_info < (3, 10):
@@ -308,11 +410,21 @@ def main() -> None:
     child_env["PYTHONIOENCODING"] = "utf-8"
     child_env["FORCE_COLOR"] = "0"
 
-    log("Initialising database...")
-    run_checked([str(VENV_PY), "-m", "backend.app.services.init_db"], env=child_env)
-
     host = args.host
     port = env_vals.get("BACKEND_PORT", "8000")
+
+    if not args.keep_existing:
+        # A previous `py run.py` that is still running (another terminal, closed window, crash) would
+        # hold these ports. Stop it so this run starts fresh instead of clashing with it.
+        ports: dict[int, str] = {int(port): "backend"}
+        if not args.no_worker and env_vals.get("LIVE_GATEWAY_ENABLED", "true").lower() != "false":
+            ports[int(env_vals.get("LIVE_GATEWAY_PORT", "8765"))] = "worker gateway"
+        if npm:
+            ports[5173] = "dashboard"
+        free_ports(ports)
+
+    log("Initialising database...")
+    run_checked([str(VENV_PY), "-m", "backend.app.services.init_db"], env=child_env)
 
     procs: list[Proc] = []
     uvicorn_cmd = [str(VENV_PY), "-m", "uvicorn", "backend.app.main:app", "--host", host, "--port", port]

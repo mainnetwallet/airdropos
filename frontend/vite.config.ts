@@ -22,6 +22,16 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         ws: true,
+        configure: (proxy) => {
+          // The dashboard reconnects its WebSocket on every reload (and twice in dev because of
+          // React StrictMode). Writing to the already-closed socket throws ECONNABORTED/ECONNRESET,
+          // which is harmless, so keep it out of the terminal.
+          proxy.on('error', (err) => {
+            const code = (err as NodeJS.ErrnoException).code
+            if (code === 'ECONNABORTED' || code === 'ECONNRESET' || code === 'EPIPE') return
+            console.error('[proxy]', err.message)
+          })
+        },
       },
     },
   },
