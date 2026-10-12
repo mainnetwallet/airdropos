@@ -123,6 +123,9 @@ class EmergencyStopController:
     def __init__(self, state_file: Optional[str] = None) -> None:
         self._state_file = Path(state_file or settings.EMERGENCY_STOP_STATE_FILE)
         self._lock_path = self._state_file.with_name(self._state_file.name + ".lock")
+        # Written after the first successful persist. If it exists but the state file does not,
+        # the state was lost (deleted, wrong volume) and a restart must not read that as first boot.
+        self._marker_path = self._state_file.with_name(self._state_file.name + ".initialized")
         self._lock = threading.RLock()
         self._file_sig: Optional[tuple] = None
         self._stopped: bool = False
@@ -152,6 +155,15 @@ class EmergencyStopController:
             # the worker or survive a restart, so start stopped rather than pretend to be safe.
             self._fail_closed("Emergency stop state storage is not writable; cannot guarantee a stop would persist.")
             self._persist_error = "state storage is not writable"
+        elif not self._state_file.exists() and (
+            self._marker_path.exists() or bool(getattr(settings, "EMERGENCY_STOP_REQUIRE_STATE", False))
+        ):
+            # The state file is missing although state was written here before (marker), or the
+            # operator declared that a missing file is never acceptable. Whatever it said is unknown,
+            # so start stopped. Only an operator resume (which recreates the file) clears this.
+            self._fail_closed(
+                "Emergency stop state file is missing at startup; failing closed until an operator resumes."
+            )
         else:
             self._refresh()
 
@@ -312,6 +324,10 @@ class EmergencyStopController:
                     pass
                 raise
             self._file_sig = self._signature()
+            try:  # best effort: the marker only ever makes a later missing file fail closed
+                self._marker_path.touch(exist_ok=True)
+            except OSError:
+                logger.warning("Could not write the emergency stop marker file.", exc_info=True)
 
     # ------------------------------------------------------------------
     # State inspection

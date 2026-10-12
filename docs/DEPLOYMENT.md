@@ -160,13 +160,17 @@ mount the same `./data` volume (the bundled compose file does). Know its limits:
 
 - If the activation cannot be written, the stop is engaged **only in that process**, and the API returns an error
   instead of success. Treat that as "not engaged elsewhere" and restart or retry. Nothing falls back silently.
-- A state file that is corrupt or unreadable fails **closed** (stopped). A file that is *missing at process start*
-  cannot be told apart from a first boot, so losing the `./data` volume loses the stop. Durable shared state in
-  PostgreSQL would remove this limit but needs a schema migration (see the security review notes); it is not done yet.
+- A state file that is corrupt or unreadable fails **closed** (stopped). A marker file
+  (`<state file>.initialized`) is written after the first successful save; if the state file is later missing but the
+  marker is present, startup fails **closed** until an operator resumes. If the whole `./data` directory is lost
+  (marker included), a missing file still looks like a first boot, unless you set `EMERGENCY_STOP_REQUIRE_STATE=true`:
+  then a missing file always means "stopped" until an operator resumes (including on the very first boot).
+  Durable shared state in PostgreSQL would remove this limit but needs a schema migration; it is not done yet.
 - Cross-process locking uses `fcntl` (Linux/macOS) or `msvcrt` (Windows). If no lock can be taken, a release
   (resume) is **refused** and the stop stays engaged; engaging a stop is never blocked by a lock failure. A release
   also re-checks the file just before writing, so it can never overwrite a stop engaged in the meantime.
-- Operator-driven manual input to an open live session is not blocked by the stop (only the agent and session start/resume are).
+- While stopped, the live gateway refuses session start, agent resume and manual input to a session. Reads (listing,
+  frames, events) and pause stay available.
 
 ### 10. WebSocket session revocation window
 

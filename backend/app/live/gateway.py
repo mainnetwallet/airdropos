@@ -219,6 +219,7 @@ def build_app() -> FastAPI:
 
     @app.post("/sessions/{integration}/{key}/input", dependencies=deps)
     async def send_input(integration: str, key: str, request: Request) -> Dict[str, Any]:
+        _refuse_while_stopped("send input to a live session")
         body = await _json_body(request)
         try:
             return await _provider(integration).input(key, body)

@@ -18,7 +18,7 @@ import pytest  # noqa: E402
 
 
 def _reset_shared_state() -> None:
-    for name in ("emergency_stop.json", "spend_ledger.db"):
+    for name in ("emergency_stop.json", "emergency_stop.json.initialized", "spend_ledger.db"):
         try:
             (_STATE_DIR / name).unlink()
         except FileNotFoundError:

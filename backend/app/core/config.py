@@ -116,6 +116,15 @@ class Settings(BaseSettings):
         default=False,
         description="Global kill-switch stopping all execution and transactions",
     )
+    EMERGENCY_STOP_REQUIRE_STATE: bool = Field(
+        default=False,
+        description=(
+            "When true, a missing emergency stop state file at startup means 'stopped' until an "
+            "operator resumes, even on first boot. A file that existed before is always detected "
+            "via a marker next to it; this flag additionally covers the case where the whole data "
+            "directory was lost."
+        ),
+    )
     EMERGENCY_STOP_STATE_FILE: str = Field(
         default="./data/emergency_stop.json",
         description=(
