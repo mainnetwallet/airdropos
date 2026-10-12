@@ -35,6 +35,7 @@ def _reset_shared_state() -> None:
     emergency_stop._policy = set(StopPolicy.ALLOWED)
     emergency_stop._history = []
     emergency_stop._file_sig = None
+    emergency_stop._persist_error = None
 
 
 @pytest.fixture(autouse=True)

@@ -72,6 +72,14 @@ class AuthorizationPolicy:
 
     def permits(self, tool: BaseTool) -> tuple[bool, str]:
         required = set(tool.required_permissions)
+        # Fail closed: a tool that declares NO permissions would otherwise be allowed by every
+        # policy, including the deny-all default, because the empty set is a subset of anything.
+        # Only a pure, side-effect-free tool may omit them.
+        if not required and tool.side_effect is not SideEffect.NONE:
+            return False, (
+                f"Tool '{tool.name}' declares no required permissions but has side effect "
+                f"'{tool.side_effect.value}'; refusing."
+            )
         if not required.issubset(self.enabled_permissions):
             missing = sorted(required - self.enabled_permissions)
             return False, f"Permission(s) not granted: {', '.join(missing)}"
@@ -139,7 +147,12 @@ class AuthorizationPolicy:
         }
 
 
-DEFAULT_POLICY = AuthorizationPolicy(enabled_permissions=[])
+DEFAULT_POLICY = AuthorizationPolicy(
+    enabled_permissions=[],
+    allow_web_interaction=False,
+    allow_transaction_submission=False,
+    allow_wallet_signing=False,
+)
 
 
 class ToolRegistry:

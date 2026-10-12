@@ -250,7 +250,7 @@ class TestEmergencyStopSharedAndPersistent:
 class _SubmitTool(BaseTool):
     name = "submit_tool"
     description = "pretend submission"
-    required_permissions: list = []
+    required_permissions: list = ["tx.submit"]
     side_effect = SideEffect.TRANSACTION_SUBMISSION
     input_schema = {"type": "object", "properties": {}, "required": []}
     executed = 0
@@ -270,7 +270,7 @@ class TestEmergencyStopEnforcement:
         emergency_stop.activate("narrow", "test", policy={StopPolicy.HALT_TRANSACTION_SUBMISSION})
         assert emergency_stop.can_sign()  # signing itself is still allowed
 
-        result = await registry.invoke("submit_tool", {}, policy=AuthorizationPolicy())
+        result = await registry.invoke("submit_tool", {}, policy=AuthorizationPolicy(enabled_permissions=["tx.submit"]))
 
         assert result.error_category == "EMERGENCY_STOP"
         assert _SubmitTool.executed == 0
@@ -280,7 +280,7 @@ class TestEmergencyStopEnforcement:
         _SubmitTool.executed = 0
         registry = ToolRegistry()
         registry.register(_SubmitTool())
-        result = await registry.invoke("submit_tool", {}, policy=AuthorizationPolicy())
+        result = await registry.invoke("submit_tool", {}, policy=AuthorizationPolicy(enabled_permissions=["tx.submit"]))
         assert result.ok
         assert _SubmitTool.executed == 1
 

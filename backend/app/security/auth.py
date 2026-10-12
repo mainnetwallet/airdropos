@@ -136,6 +136,21 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(candidate, digest)
 
 
+_DUMMY_PASSWORD_HASH: Optional[str] = None
+
+
+def verify_against_dummy(password: str) -> None:
+    """Burn the same PBKDF2 work as a real check, for logins naming an unknown account.
+
+    Without it an unknown email answers in microseconds and a known one takes a full PBKDF2
+    round, so response time reveals which accounts exist.
+    """
+    global _DUMMY_PASSWORD_HASH
+    if _DUMMY_PASSWORD_HASH is None:
+        _DUMMY_PASSWORD_HASH = hash_password("dummy-password-for-timing-equalisation")
+    verify_password(password, _DUMMY_PASSWORD_HASH)
+
+
 def hash_token(token: str) -> str:
     """Session tokens are stored hashed so a DB leak yields no usable sessions."""
     return hashlib.sha256(token.encode("utf-8")).hexdigest()

@@ -31,6 +31,7 @@ from backend.app.security.auth import (
     hash_token,
     is_valid_password_hash,
     require_system_admin,
+    verify_against_dummy,
     verify_password,
     write_audit,
 )
@@ -65,7 +66,9 @@ async def login(
     enforce_rate_limit(request, "auth")
 
     user = await db.scalar(select(User).where(User.email == payload.email.lower().strip()))
-    # Constant-ish behaviour whether the account exists or the password is wrong.
+    # Same work whether the account exists or not, so timing does not reveal valid emails.
+    if user is None:
+        verify_against_dummy(payload.password)
     if user is None or not verify_password(payload.password, user.hashed_password):
         logger.warning("Failed login attempt for %s from %s", payload.email,
                        request.client.host if request.client else "unknown")
