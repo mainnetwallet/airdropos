@@ -3,28 +3,10 @@
 Autonomous AI agent platform for crypto airdrop research, execution and monitoring.
 One backend, one background worker and a web dashboard, driven by a single LLM that you configure.
 
-## Quick Start
+## How to run
 
-Full step-by-step guides for Windows PowerShell, Windows CMD, Ubuntu and VPS: **[DEVELOPMENT.md](DEVELOPMENT.md)**
-
-```bash
-git clone https://github.com/mainnetwallet/airdropos.git
-cd airdropos
-
-python run.py --set-password   # first time only: creates .env, sets your login password (Windows: py run.py ...)
-python run.py                  # start backend + worker + dashboard
-
-# Next time
-git pull origin main
-python run.py
-
-# Docker (recommended for a VPS)
-docker compose up -d --build
-```
-
-- Dashboard: http://localhost:5173 (`run.py`) or http://localhost:3000 (Docker)
-- API docs: http://localhost:8000/docs
-- Tests: `python -m pytest backend/tests/ -q`
+To run AirdropOS, follow the guide in **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+It covers Windows PowerShell, Windows CMD, Ubuntu and VPS (Docker), step by step: install, clone, `.env`, start, and update.
 
 ## Features
 
