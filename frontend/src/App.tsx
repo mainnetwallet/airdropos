@@ -11,6 +11,9 @@ import Wallets from '@/pages/Wallets'
 import SecuritySettings from '@/pages/SecuritySettings'
 import Telegram from '@/pages/Telegram'
 import BrowserAutomation from '@/pages/BrowserAutomation'
+import BrowserProfiles from '@/pages/BrowserProfiles'
+import LiveBroadcast from '@/pages/LiveBroadcast'
+import LiveSessionPage from '@/pages/LiveSession'
 import Login from '@/pages/Login'
 import { ErrorState } from '@/components/ui'
 import { api, ApiError, UNAUTHORIZED_EVENT } from '@/services/api'
@@ -47,6 +50,9 @@ const router = createBrowserRouter([
       { path: 'goals', element: <Goals /> },
       { path: 'automation', element: <Automation /> },
       { path: 'browser', element: <BrowserAutomation /> },
+      { path: 'browser-profiles', element: <BrowserProfiles /> },
+      { path: 'live', element: <LiveBroadcast /> },
+      { path: 'live/:integration/:key', element: <LiveSessionPage /> },
       { path: 'telegram', element: <Telegram /> },
       { path: 'airdrops', element: <Airdrops /> },
       { path: 'tasks', element: <TaskManagerPage /> },

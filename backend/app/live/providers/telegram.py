@@ -1,0 +1,105 @@
+"""Telegram (MTProto / Telethon) session.
+
+This is an API session, not a screen: there is NO picture and NO clickable
+surface. The card shows genuine activity events and metadata only.
+"""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+from backend.app.core.config import settings
+from backend.app.live import hub
+from backend.app.live.models import Capabilities, Conflict, NotSupported, SessionNotFound
+from backend.app.live.providers.base import SessionProvider
+
+
+def _session():
+    from backend.app.tools.telegram_user_tools import _session as tg
+
+    return tg
+
+
+class TelegramProvider(SessionProvider):
+    integration = "telegram"
+    label = "Telegram"
+    capabilities = Capabilities(visual=False, events=True, pause_resume=True, stop=True, manual_control=False)
+    note = "API session (Telethon). Shows real activity events; it has no graphical screen."
+
+    def configured(self) -> bool:
+        return bool(settings.TELEGRAM_USER_ENABLED and settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH)
+
+    async def list_sessions(self) -> List[Dict[str, Any]]:
+        tg = _session()
+        if not tg.ever_used:
+            return []  # nothing real to show until the agent has used the account
+        if tg.stopped:
+            status, detail = "stopped", "Stopped by an operator"
+        elif tg.waiting_reason:
+            status, detail = "waiting_for_user", tg.waiting_reason
+        elif tg.paused:
+            status, detail = "paused", "Paused by an operator"
+        else:
+            status, detail = "running", None
+        created = tg.started_at or time.time()
+        return [
+            {
+                "id": tg.SESSION_ID,
+                "integration": "telegram",
+                "key": "agent",
+                "ordinal": 1,
+                "name": "Telegram #1",
+                "subtitle": tg.task_title,
+                "profile": None,
+                "account": Path(settings.TELEGRAM_SESSION_PATH).name or "agent",
+                "status": status,
+                "status_detail": detail,
+                "created_at": created,
+                "elapsed_seconds": max(0, int(time.time() - created)),
+                "last_activity_at": tg.last_action_at or created,
+                "task": {"id": tg.task_id, "title": tg.task_title} if tg.task_id else None,
+                "url": "",
+                "title": "",
+                "viewport": None,
+                "capabilities": self.capabilities.as_dict(),
+                "control": None,
+                "waiting": {"reason": tg.waiting_reason, "since": None, "timed_out": False}
+                if tg.waiting_reason
+                else None,
+                "error": tg.last_error,
+                "meta": {
+                    "connected": tg.is_connected(),
+                    "actions_today": tg.actions_today(),
+                    "daily_action_limit": settings.TELEGRAM_USER_DAILY_ACTION_LIMIT,
+                },
+            }
+        ]
+
+    async def action(self, key: str, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        tg = _session()
+        if key != "agent" or not tg.ever_used:
+            raise SessionNotFound(key)
+        who = str(payload.get("operator") or "operator")
+        if action == "pause":
+            tg.paused = True
+            tg._emit("session.paused", f"Paused by {who}", "paused")
+        elif action == "resume":
+            tg.paused = tg.stopped = False
+            tg.waiting_reason = None  # re-evaluated by the next real action
+            tg._emit("session.resumed", f"Resumed by {who}", "ok")
+            return {"status": "running", "task_id": tg.task_id, "resumed_from": ["paused"]}
+        elif action == "stop":
+            tg.stopped = True
+            try:
+                if tg._client is not None:
+                    await tg._client.disconnect()
+            except Exception:
+                pass
+            tg._emit("session.stopped", f"Disconnected and stopped by {who}", "stopped")
+        elif action.startswith("control."):
+            raise NotSupported("Telegram API sessions have no screen to control.")
+        else:
+            raise NotSupported(f"Unknown action '{action}'.")
+        return {"status": (await self.get_session(key))["status"], "task_id": tg.task_id}

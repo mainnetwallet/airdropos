@@ -76,12 +76,14 @@ export default function BrowserAutomation() {
 
       <Card title="Sessions & settings">
         <p className="text-sm text-slate-400">
-          Proxy, headless mode and session isolation are set on the server, and the dashboard does not
-          change them. Live session tracking is not exposed by the backend yet.
+          Proxy and headless mode are set on the server. Create isolated browser profiles on the Browser
+          Profiles page, and watch or take over running sessions on Live Broadcast.
         </p>
-        <Link to="/settings" className="mt-3 inline-block text-sm font-medium text-accent">
-          View integrations in Settings →
-        </Link>
+        <div className="mt-3 flex flex-wrap gap-4 text-sm font-medium text-accent">
+          <Link to="/browser-profiles">Browser Profiles →</Link>
+          <Link to="/live">Live Broadcast →</Link>
+          <Link to="/settings">Integrations in Settings →</Link>
+        </div>
       </Card>
 
       <p className="flex items-start gap-2 px-1 text-xs text-slate-500">

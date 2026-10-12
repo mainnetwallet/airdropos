@@ -3,6 +3,7 @@
 import type { LucideIcon } from 'lucide-react'
 import {
   Activity,
+  AppWindow,
   Bot,
   Brain,
   Compass,
@@ -16,6 +17,7 @@ import {
   LifeBuoy,
   ListChecks,
   Radio,
+  RadioTower,
   Send,
   Settings,
   Target,
@@ -37,10 +39,12 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { to: '/', label: 'Mission Control', icon: Gauge, end: true },
       { to: '/agent', label: 'AI Agent Console', icon: Bot },
+      { to: '/live', label: 'Live Broadcast', icon: RadioTower },
       { to: '/worker', label: 'Live Worker', icon: Activity },
       { to: '/goals', label: 'Goals & Strategy', icon: Target },
       { to: '/automation', label: '24/7 Automation', icon: Zap },
       { to: '/browser', label: 'Browser Automation', icon: Globe },
+      { to: '/browser-profiles', label: 'Browser Profiles', icon: AppWindow },
     ],
   },
   {
@@ -105,6 +109,8 @@ const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
   ['/goals', 'tasks'],
   ['/automation', 'tasks'],
   ['/browser', 'tasks'],
+  ['/browser-profiles', 'tasks'],
+  ['/live', 'tasks'],
   ['/wallets', 'wallets'],
   ['/transactions', 'wallets'],
   ['/worker', 'wallets'],

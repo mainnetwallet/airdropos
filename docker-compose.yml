@@ -48,6 +48,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://airdropos:airdropos_password@postgres:5432/airdropos_db
       REDIS_URL: redis://redis:6379/0
+      LIVE_GATEWAY_URL: http://worker:8765
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -74,6 +75,10 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://airdropos:airdropos_password@postgres:5432/airdropos_db
       REDIS_URL: redis://redis:6379/0
+      # Reachable by the backend container only (no `ports:` entry on purpose).
+      # Needs LIVE_GATEWAY_SECRET or a custom SECRET_KEY in .env; the worker refuses to start
+      # the gateway on a non-loopback address otherwise.
+      LIVE_GATEWAY_HOST: 0.0.0.0
     volumes:
       - ./backend:/app/backend
       - ./data:/app/data

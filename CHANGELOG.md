@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 ### Added
+- Live Broadcast (`/live`): one card per real running browser/Telegram session, live frames, unified activity log, session counts, full-screen session view (desktop + phone), explicit Screen Click Mode with an exclusive control lock and accurate coordinate mapping, human-verification takeover with a verified Resume Agent, and a provider interface for future X.com/Discord sessions. See `docs/LIVE_BROADCAST.md`.
+- Browser Profiles page (`/browser-profiles`) and API (`/api/v1/browser/profiles`): isolated profiles with encrypted saved session state.
+- Worker-side live gateway (`backend/app/live/`), API relay of worker events onto the authenticated WebSocket bus (`live.event`), and `LIVE_*` settings.
 - Mobile/tablet UI redesign (frontend only): light theme tokens, top header with slide-in menu, and a route-driven bottom tab bar (Home, Airdrops, centre Chat, Tasks, Wallets). Desktop sidebar layout is unchanged.
 - New routes `/telegram` (Telegram client readiness from worker status) and `/browser` (browser-capable tools from the registry).
 - New Wallet Management API (`/api/v1/wallets/*`) with full CRUD operations.

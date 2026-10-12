@@ -37,6 +37,9 @@ AirdropOS operates autonomously on financial and web environments. Because it co
 - Anti-bot and CAPTCHA detection triggers a `NEEDS_USER_ACTION` state rather than attempting illicit evasion.
 - No arbitrary JavaScript injection from external sites is executed.
 
+### 2.5.1 Live Broadcast & Manual Control
+Manual browser control is opt-in per session: view-only by default, an exclusive server-issued lock per session, input bound to (operator, session, lock token, sequence), agent tools refuse to act while an operator holds the lock or the session is paused/stopped/waiting, and every acquire/release is audited. The worker gateway is internal (shared secret, loopback or private network only). Saved browser cookies are encrypted at rest. Details: `docs/LIVE_BROADCAST.md`.
+
 ### 2.6 Dynamic Tool Isolation
 
 Agent-authored tool code is **never executed inside the API process**.

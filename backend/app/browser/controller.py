@@ -15,7 +15,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from backend.app.browser import profiles as profile_store
+from backend.app.browser.profiles import normalize_session_key
 from backend.app.core.config import settings
+from backend.app.live import hub
+from backend.app.live.events import safe_url
 
 logger = logging.getLogger(__name__)
 
@@ -130,26 +134,41 @@ class BrowserController:
         Cookies and storage are partitioned per session_key so separate accounts
         never share authentication state.
         """
+        session_key = normalize_session_key(session_key)
         if session_key in self._contexts:
             return self._contexts[session_key]
 
         if not await self.ensure_running():
             return None
 
-        storage_dir = None
+        profile = profile_store.get_profile(session_key)
+        width = (profile.viewport_width if profile and profile.viewport_width else settings.BROWSER_VIEWPORT_WIDTH)
+        height = (profile.viewport_height if profile and profile.viewport_height else settings.BROWSER_VIEWPORT_HEIGHT)
+        options: Dict[str, Any] = {
+            "viewport": {"width": width, "height": height},
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+            "ignore_https_errors": False,
+        }
+        if profile and profile.locale:
+            options["locale"] = profile.locale
+        if profile and profile.timezone_id:
+            options["timezone_id"] = profile.timezone_id
         if persistent:
-            USER_DATA_ROOT.mkdir(parents=True, exist_ok=True)
-            storage_dir = USER_DATA_ROOT / f"session_{session_key}"
+            # Cookies/local storage survive restarts (encrypted at rest, see profiles.py).
+            saved = profile_store.load_state(session_key)
+            if saved:
+                options["storage_state"] = saved
 
         try:
-            context = await self._browser.new_context(
-                viewport={"width": settings.BROWSER_VIEWPORT_WIDTH, "height": settings.BROWSER_VIEWPORT_HEIGHT},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
-                ignore_https_errors=False,
-            )
+            context = await self._browser.new_context(**options)
             context.set_default_timeout(settings.BROWSER_ACTION_TIMEOUT_MS)
             context.set_default_navigation_timeout(settings.BROWSER_NAVIGATION_TIMEOUT_MS)
             self._contexts[session_key] = context
+            hub.browser_sessions.ensure(
+                session_key,
+                profile_id=profile.id if profile else None,
+                profile_name=profile.name if profile else None,
+            )
             logger.info("Created isolated browser context for session '%s'", session_key)
             return context
         except Exception as exc:
@@ -158,6 +177,7 @@ class BrowserController:
 
     async def get_page(self, session_key: str):
         """Get or create a page within the session's context. Reuses open tabs."""
+        session_key = normalize_session_key(session_key)
         if session_key in self._pages:
             page = self._pages[session_key]
             if not page.is_closed():
@@ -174,6 +194,8 @@ class BrowserController:
             return None
 
     async def close_session(self, session_key: str) -> None:
+        session_key = normalize_session_key(session_key)
+        await self.save_state(session_key)
         page = self._pages.pop(session_key, None)
         if page and not page.is_closed():
             try:
@@ -191,8 +213,10 @@ class BrowserController:
     # Navigation & observation
     # ------------------------------------------------------------------
     async def navigate(self, session_key: str, url: str) -> Dict[str, Any]:
+        session_key = normalize_session_key(session_key)
         page = await self.get_page(session_key)
         if page is None:
+            hub.browser_sessions.mark_error(session_key, "Browser unavailable")
             return {"ok": False, "reason": "browser_unavailable", "detail": self._last_error}
 
         try:
@@ -207,6 +231,7 @@ class BrowserController:
             try:
                 response = await page.goto(url, wait_until="domcontentloaded")
             except Exception as exc2:
+                hub.browser_sessions.mark_error(session_key, "Navigation failed")
                 return {"ok": False, "reason": "navigation_failed", "detail": str(exc2)}
 
         try:
@@ -216,6 +241,15 @@ class BrowserController:
 
         observation = await self.inspect(page)
         observation["http_status"] = response.status if response else None
+        hub.browser_sessions.touch(session_key, url=page.url, title=observation.title)
+        hub.events.emit(
+            integration="browser",
+            session_id=f"browser:{session_key}",
+            type="browser.navigated",
+            status="ok",
+            message=f"Navigated to {safe_url(page.url)}",
+        )
+        await self.save_state(session_key)
         return {"ok": True, "observation": observation}
 
     async def inspect(self, page) -> PageObservation:
@@ -289,6 +323,7 @@ class BrowserController:
         return False, None
 
     async def screenshot(self, session_key: str, label: str = "evidence") -> Optional[str]:
+        session_key = normalize_session_key(session_key)
         page = await self.get_page(session_key)
         if page is None:
             return None
@@ -301,6 +336,54 @@ class BrowserController:
         except Exception as exc:
             logger.error("Screenshot failed for '%s': %s", session_key, exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Live view support (read-only; never creates a page)
+    # ------------------------------------------------------------------
+    def peek_page(self, session_key: str):
+        """The existing open page of a session, or None. Never opens anything."""
+        page = self._pages.get(normalize_session_key(session_key))
+        if page is not None and not page.is_closed():
+            return page
+        return None
+
+    def open_keys(self) -> List[str]:
+        return [k for k, p in self._pages.items() if not p.is_closed()]
+
+    def viewport(self, session_key: str) -> Optional[Dict[str, int]]:
+        page = self.peek_page(session_key)
+        if page is None:
+            return None
+        vp = page.viewport_size or {
+            "width": settings.BROWSER_VIEWPORT_WIDTH,
+            "height": settings.BROWSER_VIEWPORT_HEIGHT,
+        }
+        return {"width": int(vp["width"]), "height": int(vp["height"])}
+
+    async def capture_jpeg(self, session_key: str, quality: int) -> Optional[Dict[str, Any]]:
+        """One JPEG of the CURRENT viewport in CSS pixels (so click coordinates map 1:1)."""
+        page = self.peek_page(session_key)
+        if page is None:
+            return None
+        vp = self.viewport(session_key)
+        try:
+            data = await page.screenshot(type="jpeg", quality=quality, scale="css", timeout=6000)
+        except Exception as exc:
+            logger.debug("Frame capture failed for '%s': %s", session_key, exc)
+            return None
+        return {"data": data, "width": vp["width"], "height": vp["height"]}
+
+    async def save_state(self, session_key: str) -> None:
+        """Persist cookies/local storage of a session (best effort)."""
+        session_key = normalize_session_key(session_key)
+        context = self._contexts.get(session_key)
+        if context is None:
+            return
+        try:
+            state = await context.storage_state()
+            await asyncio.get_running_loop().run_in_executor(None, profile_store.save_state, session_key, state)
+        except Exception as exc:
+            logger.debug("Could not save state for '%s': %s", session_key, exc)
 
     def health(self) -> Dict[str, Any]:
         return {

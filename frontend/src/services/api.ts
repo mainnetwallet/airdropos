@@ -19,6 +19,15 @@ import type {
   WalletView,
   WorkerStatus,
 } from '@/types'
+import type {
+  BrowserProfileInfo,
+  BrowserProfileInput,
+  ControlGrant,
+  InputEvent,
+  LiveEventsResponse,
+  LiveOverview,
+  LiveSession,
+} from '@/types/live'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api/v1'
 
@@ -265,6 +274,144 @@ export const api = {
     }),
   releaseStop: () => request<Record<string, unknown>>('/emergency-stop/resume', { method: 'POST' }),
 }
+
+// --- Live Broadcast ----------------------------------------------------------
+const ref = (integration: string, key: string) =>
+  `/live/sessions/${encodeURIComponent(integration)}/${encodeURIComponent(key)}`
+
+export interface FetchedFrame {
+  blob: Blob
+  width: number
+  height: number
+  frameId: string
+  capturedAt: number
+}
+
+/**
+ * One frame of a session. Fetched with the Authorization header (never a token in the
+ * URL) and turned into a blob by the caller.
+ */
+export async function fetchFrame(
+  integration: string,
+  key: string,
+  quality: 'thumb' | 'full',
+  signal?: AbortSignal,
+): Promise<FetchedFrame> {
+  const token = getToken()
+  const response = await fetch(`${API_BASE}${ref(integration, key)}/frame?quality=${quality}`, {
+    signal,
+    cache: 'no-store',
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearSession()
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
+    throw new ApiError(`Frame request failed with ${response.status}`, response.status)
+  }
+  const blob = await response.blob()
+  return {
+    blob,
+    width: Number(response.headers.get('X-Frame-Width')) || 0,
+    height: Number(response.headers.get('X-Frame-Height')) || 0,
+    frameId: response.headers.get('X-Frame-Id') ?? '',
+    capturedAt: Number(response.headers.get('X-Captured-At')) || 0,
+  }
+}
+
+/** Best-effort release when the page is closing; a normal fetch would be cancelled. */
+export function releaseControlOnUnload(integration: string, key: string, token: string): void {
+  try {
+    const auth = getToken()
+    void fetch(`${API_BASE}${ref(integration, key)}/control/release`, {
+      method: 'POST',
+      keepalive: true,
+      headers: { 'Content-Type': 'application/json', ...(auth ? { Authorization: `Bearer ${auth}` } : {}) },
+      body: JSON.stringify({ token }),
+    })
+  } catch {
+    // The lock also expires on its own after a short time without heartbeats.
+  }
+}
+
+Object.assign(api, {
+  liveOverview: () => request<LiveOverview>('/live/overview'),
+  liveEvents: (params: { session?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams()
+    if (params.session) q.set('session', params.session)
+    q.set('limit', String(params.limit ?? 100))
+    return request<LiveEventsResponse>(`/live/events?${q.toString()}`)
+  },
+  liveCreateSession: (profileId: string, url?: string) =>
+    request<{ session: LiveSession }>('/live/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ integration: 'browser', profile_id: profileId, url: url || null }),
+    }),
+  livePause: (integration: string, key: string) =>
+    request<Record<string, unknown>>(`${ref(integration, key)}/pause`, { method: 'POST' }),
+  liveResume: (integration: string, key: string) =>
+    request<{ status: string; task_requeued?: string | null; resumed_from?: string[] }>(
+      `${ref(integration, key)}/resume`,
+      { method: 'POST' },
+    ),
+  liveStop: (integration: string, key: string) =>
+    request<Record<string, unknown>>(`${ref(integration, key)}/stop`, { method: 'POST' }),
+  liveAcquireControl: (integration: string, key: string, mode: 'click' | 'full') =>
+    request<ControlGrant>(`${ref(integration, key)}/control`, {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
+  liveRenewControl: (integration: string, key: string, token: string) =>
+    request<Record<string, unknown>>(`${ref(integration, key)}/control/renew`, {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    }),
+  liveReleaseControl: (integration: string, key: string, token: string) =>
+    request<{ released: boolean; counts?: Record<string, number> }>(`${ref(integration, key)}/control/release`, {
+      method: 'POST',
+      body: JSON.stringify({ token }),
+    }),
+  liveInput: (integration: string, key: string, token: string, seq: number, event: InputEvent) =>
+    request<Record<string, unknown>>(`${ref(integration, key)}/input`, {
+      method: 'POST',
+      body: JSON.stringify({ token, seq, ...event }),
+    }),
+
+  // --- Browser profiles ---------------------------------------------------
+  browserProfiles: () => request<{ profiles: BrowserProfileInfo[] }>('/browser/profiles'),
+  createBrowserProfile: (body: BrowserProfileInput) =>
+    request<BrowserProfileInfo>('/browser/profiles', { method: 'POST', body: JSON.stringify(body) }),
+  updateBrowserProfile: (id: string, body: Partial<BrowserProfileInput>) =>
+    request<BrowserProfileInfo>(`/browser/profiles/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  deleteBrowserProfile: (id: string) =>
+    request<{ deleted: string }>(`/browser/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  clearBrowserProfileState: (id: string) =>
+    request<{ cleared: string }>(`/browser/profiles/${encodeURIComponent(id)}/state`, { method: 'DELETE' }),
+})
+
+/** Typed view of the methods attached above (keeps the main `api` literal untouched). */
+export type LiveApi = {
+  liveOverview: () => Promise<LiveOverview>
+  liveEvents: (p?: { session?: string; limit?: number }) => Promise<LiveEventsResponse>
+  liveCreateSession: (profileId: string, url?: string) => Promise<{ session: LiveSession }>
+  livePause: (i: string, k: string) => Promise<Record<string, unknown>>
+  liveResume: (i: string, k: string) => Promise<{ status: string; task_requeued?: string | null; resumed_from?: string[] }>
+  liveStop: (i: string, k: string) => Promise<Record<string, unknown>>
+  liveAcquireControl: (i: string, k: string, mode: 'click' | 'full') => Promise<ControlGrant>
+  liveRenewControl: (i: string, k: string, token: string) => Promise<Record<string, unknown>>
+  liveReleaseControl: (i: string, k: string, token: string) => Promise<{ released: boolean; counts?: Record<string, number> }>
+  liveInput: (i: string, k: string, token: string, seq: number, e: InputEvent) => Promise<Record<string, unknown>>
+  browserProfiles: () => Promise<{ profiles: BrowserProfileInfo[] }>
+  createBrowserProfile: (b: BrowserProfileInput) => Promise<BrowserProfileInfo>
+  updateBrowserProfile: (id: string, b: Partial<BrowserProfileInput>) => Promise<BrowserProfileInfo>
+  deleteBrowserProfile: (id: string) => Promise<{ deleted: string }>
+  clearBrowserProfileState: (id: string) => Promise<{ cleared: string }>
+}
+export const liveApi = api as typeof api & LiveApi
 
 const WS_BASE =
   import.meta.env.VITE_WS_URL ??

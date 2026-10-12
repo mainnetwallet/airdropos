@@ -5,6 +5,7 @@ Run with: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from fastapi.responses import JSONResponse
 
 from backend.app.api.v1.router import api_router
 from backend.app.core.config import settings
+from backend.app.live.relay import relay_loop
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tools.bootstrap import bootstrap_tools
 from backend.app.tools.registry import registry  # noqa: F401  (re-exported for callers)
@@ -36,7 +38,12 @@ async def lifespan(app: FastAPI):
     if emergency_stop.is_stopped:
         logger.warning("EMERGENCY STOP ACTIVE at startup: %s", emergency_stop.status()["reason"])
     logger.info("=" * 70)
+    relay_stop = asyncio.Event()
+    relay_task = asyncio.create_task(relay_loop(relay_stop)) if settings.LIVE_GATEWAY_ENABLED else None
     yield
+    relay_stop.set()
+    if relay_task is not None:
+        relay_task.cancel()
     logger.info("AirdropOS backend shutting down")
 
 
@@ -61,7 +68,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Process-Time"],
+    expose_headers=["X-Process-Time", "X-Frame-Id", "X-Frame-Width", "X-Frame-Height", "X-Captured-At"],
 )
 
 
