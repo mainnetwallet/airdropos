@@ -126,7 +126,7 @@ python -m pytest backend/tests/ -q
 | Component | Authentication | Authorization |
 |-----------|----------------|--------------|
 | **All REST endpoints** | `get_principal` required | Scope per endpoint (`wallet_read`, `wallet_write`, `system_admin`, etc.) |
-| **WebSocket** | Token in query param (`?token=...`) | Session resolves to live, unexpired `UserSession` with required scopes |
+| **WebSocket** | Token in the `Sec-WebSocket-Protocol` handshake (`["bearer", token]`) or `Authorization` header; never the URL | Same `resolve_session` as REST: live, unexpired, unrevoked session with the `read` scope; revalidated while connected |
 | **Tools** | Implicit (LLM calls via registry) | Registry policy checks `required_permissions`; emergency stop blocks signing/submission |
 
 ### Secrets & Encryption

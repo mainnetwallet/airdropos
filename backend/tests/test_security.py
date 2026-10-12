@@ -110,8 +110,8 @@ class TestVaultIsolation:
             chain_id=1,
             transaction={"to": "0x" + "22" * 20, "data": "0xf2fde38b000000000000000000000000" + "33" * 20},
         )
-        with pytest.raises(SigningDenied):
-            vault.validate_request(request)
+        with pytest.raises(SigningDenied, match="restricted operation"):
+            vault.validate_request(request, {request.wallet_address})
 
     def test_unsupported_chain_refused(self):
         vault = KeyVault("0" * 64)
@@ -120,5 +120,5 @@ class TestVaultIsolation:
             chain_id=999_999,
             message="hello",
         )
-        with pytest.raises(SigningDenied):
-            vault.validate_request(request)
+        with pytest.raises(SigningDenied, match="Unsupported chain_id"):
+            vault.validate_request(request, {request.wallet_address})

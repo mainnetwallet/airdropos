@@ -29,6 +29,7 @@ from backend.app.security.auth import (
     generate_token,
     get_principal,
     hash_token,
+    is_valid_password_hash,
     require_system_admin,
     verify_password,
     write_audit,
@@ -132,6 +133,10 @@ async def logout(
         if session is not None:
             session.revoked_at = datetime.now(timezone.utc)
             await db.commit()
+        # End any live event streams opened with this session right away.
+        from backend.app.api.v1.endpoints.ws import bus
+
+        await bus.close_session(principal.session_token)
     return {"revoked": True}
 
 
@@ -180,6 +185,17 @@ async def bootstrap_operator(
                     "import hash_password; print(hash_password('your-password'))\" "
                     "and set it in .env. No default password exists by design."
                 ),
+            },
+        )
+
+    if not is_valid_password_hash(settings.OPERATOR_PASSWORD_HASH):
+        # A plaintext password, a truncated paste, or a deliberately cheap hash
+        # must never become the operator credential.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "OPERATOR_PASSWORD_HASH is not a valid pbkdf2$rounds$salt$hash value.",
+                "hint": "Regenerate it with hash_password() and set it in .env.",
             },
         )
 

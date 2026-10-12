@@ -1,7 +1,7 @@
 /** Real-time WebSocket event hook with automatic reconnection. */
 
 import { useEffect, useRef, useState } from 'react'
-import { wsUrl } from '@/services/api'
+import { wsProtocols, wsUrl } from '@/services/api'
 import type { WsEvent } from '@/types'
 
 export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
@@ -19,7 +19,7 @@ export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
 
     const connect = () => {
       if (closed) return
-      const socket = new WebSocket(wsUrl())
+      const socket = new WebSocket(wsUrl(), wsProtocols())
       socketRef.current = socket
 
       socket.onopen = () => {

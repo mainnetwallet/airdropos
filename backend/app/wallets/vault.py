@@ -208,8 +208,14 @@ class KeyVault:
                 f"Known chains: {sorted(SUPPORTED_CHAIN_IDS)}"
             )
 
-        if authorized_addresses and request.wallet_address.lower() not in {
-            a.lower() for a in authorized_addresses
+        # Fail closed: a missing or empty authorized set means "nothing is
+        # authorized", not "no restriction".
+        if not authorized_addresses:
+            raise SigningDenied(
+                "No authorized wallet set was provided; refusing to sign."
+            )
+        if str(request.wallet_address).lower() not in {
+            str(a).lower() for a in authorized_addresses
         }:
             raise SigningDenied(
                 f"Wallet {request.wallet_address} is not in the authorized wallet set."

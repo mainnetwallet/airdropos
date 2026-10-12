@@ -2,8 +2,7 @@
 
 Designed for a single-operator VPS deployment:
   * A single operator account is defined by configuration, not hardcoded.
-  * Passwords are stored as Argon2id-equivalent PBKDF2 hashes (hashlib.scrypt),
-    never plaintext.
+  * Passwords are stored as salted PBKDF2-HMAC-SHA256 hashes, never plaintext.
   * Sessions are opaque random tokens stored hashed in PostgreSQL, so a database
     leak does not yield usable session tokens.
   * Every session carries a scope set. Sensitive operations require specific
@@ -27,7 +26,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Optional
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -40,7 +39,14 @@ from backend.app.models import AuditLog, User, UserSession
 
 logger = logging.getLogger(__name__)
 
-PBKDF2_ROUNDS = 390_000  # OWASP 2023 guidance for PBKDF2-HMAC-SHA256
+PBKDF2_ROUNDS = 600_000  # OWASP guidance for PBKDF2-HMAC-SHA256
+# Hashes written with an older work factor (e.g. 390_000) keep verifying; anything
+# below this floor, or above the ceiling, is refused rather than trusted blindly.
+PBKDF2_MIN_ROUNDS = 100_000
+PBKDF2_MAX_ROUNDS = 10_000_000
+MIN_SALT_BYTES = 16
+MIN_PASSWORD_LENGTH = 12
+MAX_PASSWORD_LENGTH = 256  # must match LoginRequest.password max_length
 SESSION_TTL_HOURS = 24
 
 
@@ -80,25 +86,54 @@ class AuthError(Exception):
 # ======================================================================
 def hash_password(password: str, salt: Optional[bytes] = None) -> str:
     """Hash a password with PBKDF2-HMAC-SHA256. Format: pbkdf2$rounds$salt$hash."""
-    if len(password) < 4:
-        raise ValueError("Operator password must be at least 4 characters.")
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Operator password must be at least {MIN_PASSWORD_LENGTH} characters."
+        )
+    if len(password) > MAX_PASSWORD_LENGTH:
+        raise ValueError(
+            f"Operator password must be at most {MAX_PASSWORD_LENGTH} characters."
+        )
     salt = salt or os.urandom(16)
+    if len(salt) < MIN_SALT_BYTES:
+        raise ValueError(f"Salt must be at least {MIN_SALT_BYTES} bytes.")
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
     return f"pbkdf2${PBKDF2_ROUNDS}${salt.hex()}${digest.hex()}"
 
 
-def verify_password(password: str, stored: str) -> bool:
-    """Constant-time password verification."""
+def _parse_password_hash(stored: object) -> Optional[tuple[int, bytes, bytes]]:
+    """Return (rounds, salt, digest) for a well-formed, acceptable hash, else None."""
+    if not isinstance(stored, str):
+        return None
     try:
-        algorithm, rounds, salt_hex, digest_hex = stored.split("$")
+        algorithm, rounds_s, salt_hex, digest_hex = stored.split("$")
         if algorithm != "pbkdf2":
-            return False
-        candidate = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(rounds)
-        )
-        return hmac.compare_digest(candidate.hex(), digest_hex)
-    except (ValueError, AttributeError):
+            return None
+        rounds = int(rounds_s)
+        salt = bytes.fromhex(salt_hex)
+        digest = bytes.fromhex(digest_hex)
+    except ValueError:
+        return None
+    if not (PBKDF2_MIN_ROUNDS <= rounds <= PBKDF2_MAX_ROUNDS):
+        return None
+    if len(salt) < MIN_SALT_BYTES or len(digest) != 32:
+        return None
+    return rounds, salt, digest
+
+
+def is_valid_password_hash(stored: object) -> bool:
+    """True when `stored` is a usable pbkdf2$rounds$salt$hash value."""
+    return _parse_password_hash(stored) is not None
+
+
+def verify_password(password: str, stored: str) -> bool:
+    """Constant-time password verification. Fails closed on malformed or weak hashes."""
+    parsed = _parse_password_hash(stored)
+    if parsed is None or not isinstance(password, str):
         return False
+    rounds, salt, digest = parsed
+    candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return hmac.compare_digest(candidate, digest)
 
 
 def hash_token(token: str) -> str:
@@ -220,18 +255,70 @@ SYSTEM_PRINCIPAL = Principal(
 bearer_scheme = HTTPBearer(auto_error=False)
 
 
+async def resolve_session(db: AsyncSession, token: Optional[str]) -> Principal:
+    """Resolve a raw session token into a Principal. The single source of truth.
+
+    Both REST (`get_principal`) and the WebSocket endpoint call this, so a
+    revoked, expired, unknown or inactive-account session is refused identically
+    everywhere. Raises `AuthError` (401) on any failure.
+
+    Scopes are deny-by-default: a session holds exactly the scopes written onto
+    it at login. An empty or missing scope list grants nothing; it never falls
+    back to the account's role, which would turn a deliberately narrowed (or
+    corrupted) session into full operator access.
+    """
+    if not token:
+        raise AuthError("Authentication required.")
+
+    session = await db.scalar(
+        select(UserSession).where(UserSession.token == hash_token(token))
+    )
+    if session is None or session.revoked_at is not None:
+        raise AuthError("Invalid or revoked session.")
+
+    now = datetime.now(timezone.utc)
+    expires = session.expires_at
+    if expires is None:
+        raise AuthError("Invalid or revoked session.")
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    if expires <= now:
+        raise AuthError("Session expired. Log in again.")
+
+    user = await db.get(User, session.user_id)
+    if user is None or not user.is_active:
+        raise AuthError("Account is inactive.")
+
+    granted = session.scopes if isinstance(session.scopes, (list, tuple, set)) else []
+    scopes = frozenset(s for s in granted if isinstance(s, str) and s in ALL_SCOPES)
+
+    session.last_used_at = now
+
+    return Principal(
+        user_id=str(user.id),
+        email=user.email,
+        scopes=scopes,
+        session_token=token,
+        channel="rest",
+        is_operator=bool(user.is_superuser),
+    )
+
+
 async def get_principal(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> Principal:
-    """Resolve the caller from a bearer session token."""
-    # The WebSocket uses a query-string token; REST uses the Authorization header.
+    """Resolve the caller from a bearer session token in the Authorization header.
+
+    Tokens are accepted ONLY from the Authorization header. A query-string token
+    would end up in access logs, proxy logs, browser history and Referer headers.
+    (The WebSocket endpoint, which browsers cannot send headers to, uses the
+    `Sec-WebSocket-Protocol` handshake instead; see `endpoints/ws.py`.)
+    """
     token: Optional[str] = None
     if credentials is not None and credentials.credentials:
         token = credentials.credentials
-    else:
-        token = request.query_params.get("token")
 
     # Explicit opt-out exists for local development only. In production the
     # application refuses to serve unauthenticated traffic at all, so a
@@ -267,61 +354,14 @@ async def get_principal(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    session = await db.scalar(
-        select(UserSession).where(UserSession.token == hash_token(token))
-    )
-    if session is None:
+    try:
+        return await resolve_session(db, token)
+    except AuthError as exc:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "Invalid or revoked session."},
+            status_code=exc.status_code,
+            detail={"error": str(exc)},
             headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    now = datetime.now(timezone.utc)
-    expires = session.expires_at
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires <= now:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "Session expired. Log in again."},
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    user = await db.get(User, session.user_id)
-    if user is None or not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"error": "Account is inactive."},
-        )
-
-    # A session may hold fewer scopes than the user's role permits. An explicit
-    # empty scope list grants nothing, so scope narrowing works as intended.
-    session_scopes = session.scopes or []
-    if session_scopes:
-        scopes = frozenset(s for s in session_scopes if s in ALL_SCOPES)
-    else:
-        scopes = frozenset(_scopes_for(user))
-
-    session.last_used_at = datetime.now(timezone.utc)
-
-    return Principal(
-        user_id=str(user.id),
-        email=user.email,
-        scopes=scopes,
-        session_token=token,
-        channel="rest",
-        is_operator=bool(user.is_superuser),
-    )
-
-
-def _scopes_for(user: User) -> Sequence[str]:
-    """Scopes are derived from the user's role. Deny-by-default."""
-    if user.is_superuser:
-        return list(ALL_SCOPES)
-    if user.is_active:
-        return list(READONLY_SCOPES)
-    return []
+        ) from exc
 
 
 def require_scopes(*scopes: Scope) -> Callable:

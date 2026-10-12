@@ -396,12 +396,12 @@ def ws_client(db_session_factory, monkeypatch):
 def test_websocket_rejects_arbitrary_token(ws_client):
     """A random string must not open the event stream.
 
-    The token query parameter used to be checked only for emptiness, which meant
-    any non-empty value connected. It must be a real, unexpired session token.
+    The token used to be checked only for emptiness, which meant any non-empty
+    value connected. It must be a real, unexpired session token.
     """
-    for query in ("?token=totally-made-up", "?token=", ""):
+    for protocols in (["bearer", "totally-made-up"], ["bearer"], []):
         with pytest.raises(WebSocketDisconnect):
-            with ws_client.websocket_connect(f"/api/v1/ws{query}") as ws:
+            with ws_client.websocket_connect("/api/v1/ws", subprotocols=protocols) as ws:
                 ws.receive_text()
 
 
@@ -409,7 +409,7 @@ def test_websocket_rejects_expired_session(ws_client, db_session_factory):
     """An expired session must not keep a live stream open."""
     token = _run(_make_expired_session(db_session_factory))
     with pytest.raises(WebSocketDisconnect):
-        with ws_client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+        with ws_client.websocket_connect("/api/v1/ws", subprotocols=["bearer", token]) as ws:
             ws.receive_text()
 
 
@@ -419,7 +419,7 @@ def test_websocket_rejects_session_without_read_scope(ws_client, db_session_fact
         _make_user(db_session_factory, scopes={Scope.TASK_WRITE.value})
     )
     with pytest.raises(WebSocketDisconnect):
-        with ws_client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+        with ws_client.websocket_connect("/api/v1/ws", subprotocols=["bearer", token]) as ws:
             ws.receive_text()
 
 
@@ -428,7 +428,7 @@ def test_websocket_accepts_valid_session(ws_client, db_session_factory):
     token, _ = _run(
         _make_user(db_session_factory, scopes={Scope.READ.value})
     )
-    with ws_client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+    with ws_client.websocket_connect("/api/v1/ws", subprotocols=["bearer", token]) as ws:
         event = ws.receive_json()
         assert event["type"] == "connected"
         assert event["payload"]["authenticated"] is True
@@ -444,7 +444,7 @@ def test_websocket_updates_session_last_used(ws_client, db_session_factory):
     token, _ = _run(
         _make_user(db_session_factory, scopes={Scope.READ.value})
     )
-    with ws_client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+    with ws_client.websocket_connect("/api/v1/ws", subprotocols=["bearer", token]) as ws:
         ws.receive_json()
 
     stored = _run(_get_session_by_token(db_session_factory, token))

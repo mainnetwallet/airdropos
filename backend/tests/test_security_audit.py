@@ -197,18 +197,25 @@ def client_no_db():
     """A raw ASGI client for WebSocket tests, which do not use dependency injection."""
     return TestClient(app)
 @pytest.mark.asyncio
-async def test_websocket_rejects_arbitrary_token(db_session_factory):
+async def test_websocket_rejects_arbitrary_token(db_session_factory, monkeypatch):
     """A random string must not open the event stream."""
+    from backend.app.api.v1.endpoints import ws as ws_module
+
+    monkeypatch.setattr(ws_module, "AsyncSessionLocal", db_session_factory)
     ws_client = client_no_db()
-    for query in ("?token=totally-made-up", "?token=", ""):
+    for protocols in (["bearer", "totally-made-up"], ["bearer"], []):
         with pytest.raises(Exception):  # WebSocketDisconnect
-            with ws_client.websocket_connect(f"/api/v1/ws{query}") as ws:
+            with ws_client.websocket_connect("/api/v1/ws", subprotocols=protocols) as ws:
                 ws.receive_text()
 @pytest.mark.asyncio
-async def test_websocket_requires_valid_session(db_session_factory):
+async def test_websocket_requires_valid_session(db_session_factory, monkeypatch):
     """Only valid, unexpired sessions should be accepted."""
     from datetime import datetime, timedelta, timezone
     import uuid
+
+    from backend.app.api.v1.endpoints import ws as ws_module
+
+    monkeypatch.setattr(ws_module, "AsyncSessionLocal", db_session_factory)
 
     # Create a user with valid session
     email = f"valid-{uuid.uuid4().hex[:8]}@test.local"
@@ -235,7 +242,7 @@ async def test_websocket_requires_valid_session(db_session_factory):
 
     # This should work
     ws_client = client_no_db()
-    with ws_client.websocket_connect(f"/api/v1/ws?token={token}") as ws:
+    with ws_client.websocket_connect("/api/v1/ws", subprotocols=["bearer", token]) as ws:
         event = ws.receive_json()
         assert event["type"] == "connected"
         assert event["payload"]["authenticated"] is True

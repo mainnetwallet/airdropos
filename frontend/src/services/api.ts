@@ -419,8 +419,17 @@ const WS_BASE =
     ? `${API_BASE.replace(/^http/, 'ws')}/ws`
     : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}${API_BASE}/ws`)
 
-/** WebSocket URL including the session token (the backend reads it from ?token=). */
+/** WebSocket URL. The session token is never placed in the URL (it would leak into logs). */
 export function wsUrl(): string {
+  return WS_BASE
+}
+
+/**
+ * WebSocket subprotocols carrying the session token: ["bearer", token].
+ * Browsers cannot set an Authorization header on a WebSocket, so the token rides in
+ * the Sec-WebSocket-Protocol handshake; the server echoes only "bearer".
+ */
+export function wsProtocols(): string[] {
   const token = getToken()
-  return token ? `${WS_BASE}?token=${encodeURIComponent(token)}` : WS_BASE
+  return token ? ['bearer', token] : []
 }
