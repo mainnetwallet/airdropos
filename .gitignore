@@ -71,3 +71,5 @@ Thumbs.db
 data/
 *.session
 *.session-journal
+
+airdropos.db-journal*

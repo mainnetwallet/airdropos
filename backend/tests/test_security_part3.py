@@ -297,7 +297,7 @@ class TestDeploymentFiles:
             if path.suffix in {".py", ".yml", ".yaml", ".conf", ".example", ".ini", ".json", ""} or path.name == "Dockerfile":
                 try:
                     if "airdropos_password" in path.read_text(errors="ignore"):
-                        offenders.append(str(path.relative_to(REPO)))
+                        offenders.append(path.relative_to(REPO).as_posix())
                 except OSError:
                     pass
         assert offenders == ["backend/app/core/config.py"], offenders
