@@ -20,7 +20,7 @@ import LiveScreen from '@/components/live/LiveScreen'
 import ActivityList from '@/components/live/ActivityList'
 import SessionActions from '@/components/live/SessionActions'
 import { IntegrationBadge, StatusBadge, STATUS_DOT, STATUS_LABEL } from '@/components/live/meta'
-import { formatElapsed, useElapsed, useLiveFeed, useMediaQuery, useSessionControl, type StreamState } from '@/hooks/useLive'
+import { formatElapsed, useElapsed, useLiveFeed, useMediaQuery, useSessionControl, useStale, type StreamState } from '@/hooks/useLive'
 import type { LiveSession } from '@/types/live'
 
 type ControlApi = ReturnType<typeof useSessionControl>
@@ -214,7 +214,9 @@ export default function LiveSessionPage() {
   const { overview, events } = useLiveFeed({ session: sid })
   const data = overview.data
   const session = data?.sessions.find((s) => s.id === sid)
-  const canControl = !!data?.can_control
+  const { stale, ageSeconds } = useStale(overview)
+  // Never act on a view that may be out of date, or while the worker is unreachable.
+  const canControl = !!data?.can_control && !stale && !!data?.gateway.available
   const isDesktop = useMediaQuery('(min-width: 1024px)')
 
   const rootRef = useRef<HTMLDivElement>(null)
@@ -229,6 +231,9 @@ export default function LiveSessionPage() {
 
   // "Enable Click" pressed on a card: turn it on here, once, as an explicit operator action.
   const autoDone = useRef(false)
+  useEffect(() => {
+    autoDone.current = false // a different session is a different explicit request
+  }, [sid])
   const wantsClick = (location.state as { enableClick?: boolean } | null)?.enableClick === true
   useEffect(() => {
     if (!wantsClick || autoDone.current || !session || !canControl) return
@@ -273,7 +278,7 @@ export default function LiveSessionPage() {
     </div>
   )
   if (overview.isLoading) return shell(<><Loader2 className="h-6 w-6 animate-spin text-slate-400" /><p className="text-slate-400">Loading session…</p></>)
-  if (overview.error || !data) return shell(<><WifiOff className="h-7 w-7 text-slate-400" /><p className="text-slate-300">Could not load live data.</p></>)
+  if (!data) return shell(<><WifiOff className="h-7 w-7 text-slate-400" /><p className="text-slate-300">Could not load live data.</p></>)
   if (!data.gateway.available) return shell(<><WifiOff className="h-7 w-7 text-amber-500" /><p className="max-w-sm text-slate-300">{data.gateway.reason}</p></>)
   if (!session) return shell(<><p className="text-lg font-semibold text-slate-100">Session not found</p><p className="max-w-sm text-sm text-slate-400">It may have ended or the worker restarted. Running sessions are listed on the Live Broadcast page.</p></>)
 
@@ -306,6 +311,12 @@ export default function LiveSessionPage() {
       <ActivityList events={events} emptyText="No activity yet" />
     </div>
   )
+
+  const staleBanner = stale ? (
+    <p className="mb-1 rounded-lg bg-amber-500/90 px-3 py-1 text-center text-xs font-semibold text-white">
+      Not refreshed for {ageSeconds}s: this view may be out of date and controls are disabled.
+    </p>
+  ) : null
 
   const activityPanel = (
     <div className="space-y-3">
@@ -364,7 +375,7 @@ export default function LiveSessionPage() {
 
         <div className="flex min-h-0 flex-1">
           <main className="flex min-w-0 flex-1 flex-col">
-            <div className="min-h-0 flex-1 bg-slate-950/95 p-2">{screen}</div>
+            <div className="min-h-0 flex-1 bg-slate-950/95 p-2">{staleBanner}{screen}</div>
             <div className="border-t border-surface-300 bg-surface-100 px-4 py-3">
               <ControlBar session={session} control={control} canControl={canControl} immersive={immersive} onToggleFullscreen={() => (immersive ? exitFullscreen() : enterFullscreen())} />
             </div>
@@ -389,7 +400,7 @@ export default function LiveSessionPage() {
             <button type="button" onClick={() => setDrawer((d) => !d)} aria-label="Activity log" className="ml-auto rounded-lg p-2 hover:bg-white/15"><ClipboardList className="h-5 w-5" /></button>
           </div>
         </div>
-        <div className="min-h-0 flex-1 p-1">{screen}</div>
+        <div className="min-h-0 flex-1 p-1">{staleBanner}{screen}</div>
         <div className="bg-black/60 px-3 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-2 text-white">
           <ControlBar session={session} control={control} canControl={canControl} immersive onToggleFullscreen={exitFullscreen} dark />
         </div>
@@ -419,6 +430,7 @@ export default function LiveSessionPage() {
       </div>
 
       <div className="space-y-3 px-4">
+        {staleBanner}
         <VerificationBanner session={session} />
 
         {caps.visual ? (

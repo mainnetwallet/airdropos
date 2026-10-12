@@ -13,6 +13,7 @@ nobody else:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -35,10 +36,25 @@ async def _require_secret(x_live_gateway_key: Optional[str] = Header(default=Non
         raise HTTPException(status_code=401, detail="bad gateway key")
 
 
+MAX_BODY_BYTES = 16 * 1024  # the largest legitimate body is a 200-character text input
+
+
 async def _json_body(request: Request) -> Dict[str, Any]:
-    """The request body as a JSON object; anything else is a clean 400 instead of a 500."""
+    """The request body as a JSON object; anything else is a clean 400 instead of a 500.
+
+    The size is capped while reading, so a chunked body without a Content-Length cannot make the
+    worker buffer an unbounded amount of data.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        raise HTTPException(status_code=413, detail={"code": "too_large", "message": "Request body is too large."})
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > MAX_BODY_BYTES:
+            raise HTTPException(status_code=413, detail={"code": "too_large", "message": "Request body is too large."})
     try:
-        body = await request.json()
+        body = json.loads(bytes(raw))
     except Exception:
         body = None
     if not isinstance(body, dict):
@@ -118,12 +134,20 @@ def build_app() -> FastAPI:
     @app.get("/sessions", dependencies=deps)
     async def sessions() -> Dict[str, Any]:
         out: List[Dict[str, Any]] = []
+        degraded: List[str] = []
         for provider in PROVIDERS.values():
             try:
                 out.extend(await provider.list_sessions())
-            except Exception:
-                logger.exception("Provider %s failed to list sessions", provider.integration)
-        return {"sessions": out, "epoch": hub.events.epoch, "resources": _with_network(resources())}
+            except Exception as exc:
+                # Say so: an integration that failed to list must not look like "no sessions".
+                degraded.append(provider.integration)
+                logger.error("Provider %s failed to list sessions (%s)", provider.integration, type(exc).__name__)
+        return {
+            "sessions": out,
+            "degraded": degraded,
+            "epoch": hub.events.epoch,
+            "resources": _with_network(resources()),
+        }
 
     @app.post("/sessions", dependencies=deps)
     async def create_session(request: Request) -> Dict[str, Any]:

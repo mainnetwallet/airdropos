@@ -38,7 +38,7 @@ AirdropOS operates autonomously on financial and web environments. Because it co
 - No arbitrary JavaScript injection from external sites is executed.
 
 ### 2.5.1 Live Broadcast & Manual Control
-Manual browser control is opt-in per session: view-only by default, an exclusive server-issued lock per session, input bound to (operator, session, lock token, sequence), agent tools refuse to act while an operator holds the lock or the session is paused/stopped/waiting, and every acquire/release is audited. The worker gateway is internal (shared secret, loopback or private network only). Saved browser cookies are encrypted at rest. Details: `docs/LIVE_BROADCAST.md`.
+Manual browser control is opt-in per session: view-only by default, an exclusive server-issued lock per session, input bound to (operator, session, lock token, sequence), agent tools refuse to act while an operator holds the lock or the session is paused/stopped/waiting, and every acquire/release is audited. The worker gateway is internal (shared secret, loopback or private network only). Saved browser cookies are encrypted at rest. Browser navigation is guarded against SSRF per request (hostname resolution, redirects, sub-requests); DNS rebinding is narrowed but only an egress firewall closes it. Details: `docs/LIVE_BROADCAST.md`.
 
 ### 2.6 Dynamic Tool Isolation
 

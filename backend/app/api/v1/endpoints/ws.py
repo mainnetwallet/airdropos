@@ -6,6 +6,7 @@ Live progress never bypasses authentication or authorization (Part 32).
 from __future__ import annotations
 
 import asyncio
+import time
 import json
 import logging
 from datetime import datetime, timezone
@@ -28,6 +29,9 @@ from backend.app.security.auth import (
 from backend.app.security.emergency_stop import emergency_stop
 
 logger = logging.getLogger(__name__)
+
+MAX_WS_CLIENTS = 200
+WS_REVALIDATE_SECONDS = 60
 
 router = APIRouter()
 
@@ -210,6 +214,9 @@ async def websocket_endpoint(
 
     # Live session activity needs a real, verified principal. Anonymous sockets are only tolerated
     # outside production (auth disabled for local development); in production they never receive it.
+    if bus.client_count >= MAX_WS_CLIENTS:
+        await websocket.close(code=1013, reason="Too many connections")
+        return
     await bus.connect(websocket, live_ok=principal is not None or settings.ENVIRONMENT != "production")
     try:
         await websocket.send_json(
@@ -224,10 +231,17 @@ async def websocket_endpoint(
                 "at": datetime.now(timezone.utc).isoformat(),
             }
         )
+        last_check = time.monotonic()
         while True:
             # Client heartbeats keep the socket alive and detect disconnects.
             message = await websocket.receive_text()
             if message == "ping":
+                # A logged-out, revoked or expired session must stop receiving live activity.
+                if principal is not None and time.monotonic() - last_check > WS_REVALIDATE_SECONDS:
+                    last_check = time.monotonic()
+                    if await _authenticate_websocket(token) is None:
+                        await websocket.close(code=4401, reason="Session ended")
+                        break
                 await websocket.send_json({"type": "pong", "payload": {}})
     except WebSocketDisconnect:
         pass

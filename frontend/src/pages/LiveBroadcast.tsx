@@ -9,7 +9,7 @@ import SessionCard from '@/components/live/SessionCard'
 import ActivityList from '@/components/live/ActivityList'
 import NewSessionModal from '@/components/live/NewSessionModal'
 import { IntegrationBadge, STATUS_DOT, STATUS_LABEL, STATUS_TILE } from '@/components/live/meta'
-import { useLiveFeed } from '@/hooks/useLive'
+import { useLiveFeed, useStale } from '@/hooks/useLive'
 import type { LiveResources, LiveSession, SessionStatus } from '@/types/live'
 
 const STATUS_ORDER: SessionStatus[] = ['running', 'waiting_for_user', 'paused', 'failed', 'stopped']
@@ -38,6 +38,7 @@ export default function LiveBroadcast() {
   const [params, setParams] = useSearchParams()
   const filter = params.get('f') ?? 'all'
   const { overview, events, socketConnected } = useLiveFeed()
+  const { stale, ageSeconds } = useStale(overview)
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
   const [showNew, setShowNew] = useState(false)
   const [logCleared, setLogCleared] = useState(0)
@@ -54,7 +55,8 @@ export default function LiveBroadcast() {
   )
 
   if (overview.isLoading) return <Loading label="Loading live sessions" />
-  if (overview.error || !data) return <ErrorState error={overview.error} onRetry={() => overview.refetch()} />
+  // A failed refresh with data already on screen keeps the data (marked stale) instead of blanking the page.
+  if (!data) return <ErrorState error={overview.error} onRetry={() => overview.refetch()} />
 
   const open = (s: LiveSession, enableClick: boolean) =>
     navigate(`/live/${encodeURIComponent(s.integration)}/${encodeURIComponent(s.key)}`, { state: { enableClick } })
@@ -65,11 +67,19 @@ export default function LiveBroadcast() {
   ]
   const activeIntegration = data.integrations.find((i) => i.id === filter)
   const fetchedAt = overview.dataUpdatedAt || Date.now()
+  // Controls only act on what is on screen when that is current and the worker is reachable.
+  const canControl = data.can_control && !stale && data.gateway.available
   const res = data.resources as Partial<LiveResources>
   const hasRes = [res.cpu_percent, res.ram_percent, res.disk_percent, res.network_kbps].some((v) => v != null)
 
   const newButton = (
-    <button type="button" onClick={() => setShowNew(true)} className="btn btn-primary hidden lg:inline-flex">
+    <button
+      type="button"
+      onClick={() => setShowNew(true)}
+      disabled={!canControl || data.emergency_stop}
+      title={data.emergency_stop ? 'Emergency stop is active' : !canControl ? 'Unavailable right now' : undefined}
+      className="btn btn-primary hidden disabled:cursor-not-allowed disabled:opacity-50 lg:inline-flex"
+    >
       <Plus className="h-4 w-4" /> New Session
     </button>
   )
@@ -86,6 +96,16 @@ export default function LiveBroadcast() {
         action={newButton}
       />
 
+      {stale && (
+        <Alert kind="warning" title="Showing the last known state">
+          The view has not refreshed for {ageSeconds}s, so it may be out of date. Controls are disabled until it updates.
+        </Alert>
+      )}
+      {(data.degraded?.length ?? 0) > 0 && (
+        <Alert kind="warning" title="Some sessions could not be listed">
+          The worker could not read: {data.degraded?.join(', ')}. Sessions from those integrations are missing from this view, not necessarily stopped.
+        </Alert>
+      )}
       {!data.gateway.available && (
         <Alert kind="warning" title="No live data from the worker">
           {data.gateway.reason} Sessions live inside the worker process, so none can be shown until it is reachable.
@@ -174,7 +194,7 @@ export default function LiveBroadcast() {
                   key={s.id}
                   session={s}
                   fetchedAt={fetchedAt}
-                  canControl={data.can_control}
+                  canControl={canControl}
                   events={events}
                   onOpen={open}
                   dense

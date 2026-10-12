@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from backend.app.browser.controller import controller
+from backend.app.browser.controller import _safe_error, controller
 from backend.app.browser.profiles import normalize_session_key
 from backend.app.live import hub
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult
@@ -151,13 +151,16 @@ class ClickButtonTool(BaseTool):
             if "captcha" in text:
                 return _needs_human(params, "CAPTCHA triggered by this action.")
             _event(params, "browser.click_failed", f'Click on "{params["button_text"][:60]}" failed', "error")
-            return ToolResult.failure(f"Click failed: {exc}", category="INTERACTION_FAILED", retryable=True)
+            return ToolResult.failure(f"Click failed: {_safe_error(exc)}", category="INTERACTION_FAILED", retryable=True)
 
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
 
+        if hub.browser_sessions.is_operator_stopped(normalize_session_key(params["session_key"])):
+            # The operator stopped the session while the click was in flight: report nothing as done.
+            return ToolResult.needs_user("This session was stopped by an operator while the click was running.")
         after = await controller.inspect(page)
         shot = await controller.screenshot(params["session_key"], "after_click")
 
@@ -240,8 +243,14 @@ class FillFormTool(BaseTool):
                     continue
                 filled.append(name)
             except Exception as exc:
-                failed.append(f"{name}: {exc}")
+                # The message may echo the value being typed (a password, a token): scrub it.
+                detail = _safe_error(exc)
+                if len(str(value)) >= 3:
+                    detail = detail.replace(str(value), "***")
+                failed.append(f"{name}: {detail}")
 
+        if hub.browser_sessions.is_operator_stopped(normalize_session_key(params["session_key"])):
+            return ToolResult.needs_user("This session was stopped by an operator while the form was being filled.")
         observation = await controller.inspect(page)
         # Field NAMES only: values may be secrets and never go to the activity log.
         _event(params, "browser.form_filled", f"Filled {len(filled)} form field(s)")

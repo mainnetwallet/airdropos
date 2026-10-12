@@ -81,10 +81,32 @@ Changing `SECRET_KEY` makes saved sessions unreadable (they are ignored, not cra
 * Activity messages are redacted with the worker's credential redactor; URLs lose query strings/fragments/credentials.
 * No new LLM, model routing, shell, SQL, filesystem or network access for the agent; wallet vault, approvals and the emergency stop are untouched.
 
+## Batch 2 hardening
+
+* **Network destinations (SSRF).** Every browser request, not only the first URL, is checked right before it is sent: redirect hops, iframes, scripts and fetches included.
+  Hostnames are resolved and *every* address they map to must be allowed (unresolvable names are refused). Loopback, link-local, multicast, unspecified, cloud-metadata
+  (169.254.169.254, 169.254.170.2, 100.100.100.200, fd00:ec2::254) and non-global ranges are refused; private LAN ranges need `BROWSER_ALLOW_PRIVATE_NETWORK=true`.
+  IPv4-mapped IPv6 and NAT64 forms are judged as the IPv4 address they carry; legacy numeric hosts (`2130706433`, `0x7f.1`) are caught because they resolve to loopback.
+  Service workers are blocked (they would bypass the check). A page that ends on a refused address is sent to `about:blank`. Internal Docker service names resolve to private
+  addresses and are therefore refused too.
+* **DNS rebinding is narrowed, not eliminated.** Chromium resolves the name again itself after our check, so a DNS server that answers differently the second time can still win a race.
+  The complete answer is an egress firewall (or a pinning proxy) on the worker; this code cannot provide that on its own. WebSocket connections opened by a page are not intercepted by this check.
+* **Stop wins.** A late agent call cannot reopen, navigate, or report success on a session an operator stopped (navigate, click and form-fill re-check after their awaits). The same for Telegram:
+  pause/stop are re-checked under the client lock and after pacing, so a call that was already queued cannot run (or reconnect the client) after the operator acted.
+* **Telegram.** Still an API session: real activity events and metadata only, no screen, one account. Session/auth problems (revoked or duplicated session, two-step password needed, bad API id) drop
+  the connection and park the session for a human; they are never retried. Pause/resume/stop are idempotent and only log what really changed. Error text is stripped of credentials and phone-number-like values and no tracebacks are logged.
+* **Errors and sensitive data.** Browser errors returned to the agent, events and logs lose URL query strings, credentials and Playwright call logs (which can echo typed values); form-fill errors also scrub the value being typed.
+* **Events.** The event cursor now returns the oldest events after it, so a burst larger than one page is delivered in order instead of silently dropping the middle. The session list reports `degraded` integrations instead of showing them as empty.
+* **Gateway/API/WebSocket.** Gateway request bodies are capped at 16 KB while streaming. WebSocket clients are capped at 200 and re-validated every 60 s, so a logged-out, revoked or expired session stops receiving live events.
+  Starting a session is refused while the emergency stop is active, and `LIVE_MAX_BROWSER_SESSIONS` limits concurrent browser sessions.
+* **Frontend.** A failed or old refresh keeps the last data on screen, marked stale, with controls disabled. The manual-control lock is dropped when switching sessions and a lock granted after you left is released.
+  New Session is disabled for read-only logins, while the emergency stop is active, and when the worker is unreachable.
+
 ## Limits (honest list)
 
 * Streaming is repeated JPEG capture, not video (no audio, no drag-and-drop, no right-click/hover, no multi-touch).
 * Telegram has no screen. A graphical Telegram session would need a browser-based Telegram Web session (use a browser profile) or a desktop client stream; neither exists in the codebase.
-* The agent that is mid-tool-call when you pause finishes that call; it stops at the next tool boundary.
+* The agent that is mid-tool-call when you pause finishes that call; it stops at the next tool boundary. Stop additionally suppresses that call's result (see "Stop wins").
+* No complete DNS-rebinding defence without an egress firewall (see Batch 2 hardening).
 * One worker process: sessions are listed from the worker the API's `LIVE_GATEWAY_URL` points at.
 * Resource figures come from the worker host (`psutil` if installed, otherwise load average for CPU only).

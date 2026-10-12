@@ -73,11 +73,15 @@ async def overview(principal: Principal = Depends(require_read)) -> Dict[str, An
     sessions: List[Dict[str, Any]] = []
     resources: Dict[str, Any] = {}
     integrations = [p.descriptor().as_dict() for p in PROVIDERS.values()]
+    degraded: List[str] = []
     try:
         data = await client.get_json("/sessions")
+        integrations = (await client.get_json("/integrations"))["integrations"]
+        # Only adopt the session list once BOTH calls worked: a half-answered overview must not
+        # show sessions next to a "worker unreachable" banner (or the reverse).
         sessions = data["sessions"]
         resources = data.get("resources", {})
-        integrations = (await client.get_json("/integrations"))["integrations"]
+        degraded = [str(d) for d in data.get("degraded", [])]
     except client.GatewayUnavailable as exc:
         gateway = {
             "available": False,
@@ -97,6 +101,7 @@ async def overview(principal: Principal = Depends(require_read)) -> Dict[str, An
 
     return {
         "gateway": gateway,
+        "degraded": degraded,
         "integrations": integrations,
         "sessions": sessions,
         "counts": {**counts, "total": len(sessions)},
@@ -167,6 +172,8 @@ async def create_session(
     principal: Principal = Depends(require_task_write),
 ) -> Dict[str, Any]:
     enforce_rate_limit(request, "write")
+    if emergency_stop.is_stopped:
+        raise HTTPException(status_code=409, detail={"error": "Emergency stop is active. Release it before starting a session."})
     result = await _gateway(client.post_json("/sessions", {**body.model_dump(), **_owner(principal)}))
     sid = result["session"]["id"]
     await write_audit(db, principal, "LIVE_SESSION_START", "live_session", sid,

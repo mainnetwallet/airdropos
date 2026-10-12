@@ -88,7 +88,9 @@ class EventLog:
 
     def since(self, after: int, *, limit: int = 200, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         out = [e for e in self._events if e["seq"] > after and (session_id is None or e["session_id"] == session_id)]
-        return out[-limit:]
+        # The OLDEST events after the cursor: a caller that advances its cursor to the last one it
+        # received must never skip events in between (taking the newest would silently drop them).
+        return out[:limit]
 
     def recent(self, *, limit: int = 100, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
         out = [e for e in self._events if session_id is None or e["session_id"] == session_id]

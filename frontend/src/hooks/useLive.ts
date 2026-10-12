@@ -81,6 +81,20 @@ export function useLiveFeed(opts: { session?: string } = {}) {
   return { overview, events, socketConnected: connected }
 }
 
+/**
+ * Whether the data on screen is old. The overview polls every few seconds, so a failed refresh or a
+ * long gap means what is shown may no longer be true; callers disable controls and say so.
+ */
+export function useStale(q: { isError: boolean; dataUpdatedAt: number }): { stale: boolean; ageSeconds: number } {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 5000)
+    return () => window.clearInterval(t)
+  }, [])
+  const ageSeconds = q.dataUpdatedAt ? Math.max(0, Math.floor((now - q.dataUpdatedAt) / 1000)) : 0
+  return { stale: q.isError || ageSeconds > 15, ageSeconds }
+}
+
 export function sessionRef(s: Pick<LiveSession, 'integration' | 'key'>): string {
   return `${s.integration}:${s.key}`
 }
@@ -251,8 +265,14 @@ export function useSessionControl(integration: string, sessionKey: string, onInp
   const enable = useCallback(
     async (mode: 'click' | 'full') => {
       setState((s) => ({ ...s, busy: true, note: null }))
+      const epoch = epochRef.current
       try {
         const grant = await api.liveAcquireControl(integration, sessionKey, mode)
+        if (epoch !== epochRef.current) {
+          // The view moved to another session (or closed) while the lock was being granted.
+          void api.liveReleaseControl(integration, sessionKey, grant.token).catch(() => undefined)
+          return
+        }
         seqRef.current = Math.max(seqRef.current, grant.last_seq ?? 0)
         lockRef.current = { token: grant.token, mode: grant.mode }
         setState({ active: true, mode: grant.mode, busy: false, note: null })
@@ -324,6 +344,10 @@ export function useSessionControl(integration: string, sessionKey: string, onInp
       window.removeEventListener('pagehide', onHide)
       onHide()
       epochRef.current += 1
+      // This hook instance can be reused for another session: nothing of the old lock may carry over.
+      lockRef.current = null
+      seqRef.current = 0
+      setState({ active: false, mode: null, busy: false, note: null })
     }
   }, [integration, sessionKey])
 

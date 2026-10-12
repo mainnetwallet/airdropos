@@ -5,6 +5,15 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Security (Live Broadcast, batch 2)
+- Browser destination guard now resolves hostnames and checks every request (redirects, iframes, fetches), blocks service workers, unwraps IPv4-mapped/NAT64 addresses and blocks cloud-metadata addresses even with `BROWSER_ALLOW_PRIVATE_NETWORK=true`.
+- Telegram: pause/stop re-checked under the client lock, auth/session errors never retried, idempotent pause/resume/stop with accurate events, no raw exception text or tracebacks in logs.
+- Browser errors, activity events and form-fill failures are stripped of URL queries, credentials and typed values.
+- Gateway: 16 KB body cap, `degraded` integrations reported; WebSocket: connection cap and periodic session re-validation.
+- Event cursor returns the oldest events after it (no skipped events on bursts); `LIVE_MAX_BROWSER_SESSIONS` and range-checked `LIVE_*` settings; session start refused during emergency stop.
+- Frontend: stale/offline indicator with controls disabled, manual-control lock reset on session switch, gated New Session.
+- No automated checks were run for this batch.
+
 ### Added
 - Live Broadcast (`/live`): one card per real running browser/Telegram session, live frames, unified activity log, session counts, full-screen session view (desktop + phone), explicit Screen Click Mode with an exclusive control lock and accurate coordinate mapping, human-verification takeover with a verified Resume Agent, and a provider interface for future X.com/Discord sessions. See `docs/LIVE_BROADCAST.md`.
 - Browser Profiles page (`/browser-profiles`) and API (`/api/v1/browser/profiles`): isolated profiles with encrypted saved session state.
