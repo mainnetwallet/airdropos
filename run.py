@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import os
 import re
 import secrets
@@ -171,25 +172,64 @@ def _listening_pids(port: int) -> set[int]:
     return pids
 
 
+def _process_table() -> dict[int, tuple[int, str]]:
+    """Windows only: {pid: (parent_pid, command_line)} for every running process."""
+    ps = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        data = json.loads(r.stdout) if r.stdout.strip() else []
+    except (OSError, ValueError):
+        return {}
+    if isinstance(data, dict):  # PowerShell emits a bare object when there is only one row
+        data = [data]
+    table: dict[int, tuple[int, str]] = {}
+    for row in data:
+        try:
+            table[int(row["ProcessId"])] = (int(row.get("ParentProcessId") or 0), row.get("CommandLine") or "")
+        except (KeyError, TypeError, ValueError):
+            continue
+    return table
+
+
 def _cmdline(pid: int) -> str:
     try:
-        if IS_WIN:
-            ps = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                capture_output=True, text=True, errors="replace",
-            )
-        else:
-            r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True)
+        r = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True)
         return r.stdout.strip()
     except OSError:
         return ""
 
 
-def _is_ours(cmdline: str) -> bool:
-    """True if the command line points into this project folder (venv python, node_modules, ...)."""
+def _is_ours(pid: int, table: dict[int, tuple[int, str]] | None = None, root: str | None = None) -> bool:
+    """True if this process, or one of its ancestors, was started from this project folder.
+
+    On Windows the venv's python.exe is only a launcher: it spawns the *base* python, whose command
+    line has no project path. So the process that owns the port looks foreign when judged alone.
+    Walking up to the launcher (whose command line does contain the venv path) fixes that.
+    """
     norm = lambda s: s.replace("\\", "/").lower()  # noqa: E731
-    return bool(cmdline) and norm(str(ROOT)) in norm(cmdline)
+    marker = norm(root if root is not None else str(ROOT))
+    if not IS_WIN and table is None:
+        cmd = _cmdline(pid)
+        return bool(cmd) and marker in norm(cmd)
+    if table is None:
+        table = _process_table()
+    seen: set[int] = set()
+    cur = pid
+    for _ in range(8):  # bounded walk; also guards against PID-reuse cycles
+        if cur in seen or cur not in table:
+            break
+        seen.add(cur)
+        ppid, cmd = table[cur]
+        if cmd and marker in norm(cmd):
+            return True
+        cur = ppid
+    return False
 
 
 def _kill_tree(pid: int) -> None:
@@ -226,9 +266,10 @@ def free_ports(ports: dict[int, str]) -> None:
     """
     me = os.getpid()
     killed: set[int] = set()
+    table = _process_table() if IS_WIN else None
     for port, name in ports.items():
         for pid in sorted(_listening_pids(port) - {me}):
-            if _is_ours(_cmdline(pid)):
+            if _is_ours(pid, table):
                 log(f"Port {port} ({name}) is held by an old AirdropOS process (PID {pid}). Stopping it...")
                 _kill_tree(pid)
                 killed.add(port)
