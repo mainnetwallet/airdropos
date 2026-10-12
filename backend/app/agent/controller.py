@@ -136,6 +136,7 @@ class AgentController:
         if emergency_stop.is_stopped and not emergency_stop.can_execute_tasks():
             report.outcome = LoopOutcome.STOPPED
             report.blockers.append("Emergency stop is active; execution not started.")
+            await self._park_for_emergency_stop(task)
             return report
 
         # Take an execution lease so a dead worker's task is recoverable and a
@@ -154,6 +155,7 @@ class AgentController:
         try:
             plan_spec = await self._ensure_plan(task, report)
             await self.db.commit()
+            known_revision = await self._plan_revision(task)
             iteration = await self._resume_iteration(task)
             if iteration:
                 report.steps.append(
@@ -190,6 +192,15 @@ class AgentController:
                     report.outcome = LoopOutcome.FAILED
                     await self._checkpoint(task, iteration, "planning_error")
                     break
+
+                # A replan persists a NEW revision. Keep iterating over the persisted truth, not
+                # the superseded in-memory plan, or removed/changed steps would still be executed.
+                revision = await self._plan_revision(task)
+                if revision != known_revision:
+                    refreshed = await self.planner.load_plan_spec(task)
+                    if refreshed is not None and refreshed.steps:
+                        plan_spec = refreshed
+                    known_revision = revision
 
                 step.duration_ms = int((time.perf_counter() - iteration_started) * 1000)
                 report.steps.append(step)
@@ -286,6 +297,29 @@ class AgentController:
             ),
         )
 
+    async def _park_for_emergency_stop(self, task: Task) -> None:
+        """Do not leave a halted task IN_PROGRESS.
+
+        IN_PROGRESS is not claimable and the dashboard shows it as running, so a task halted by
+        the emergency stop would look live until the next worker restart. The stop is checked
+        before a step starts, so nothing is in flight. NEEDS_USER_ACTION is the lifecycle's
+        "an operator must decide" state; the operator resumes it (-> READY) once the stop is
+        lifted. Completed work and checkpoints are untouched and no retry is consumed.
+        """
+        if task.status != TaskStatus.IN_PROGRESS.value:
+            return
+        await self.tasks.transition(
+            task,
+            TaskStatus.NEEDS_USER_ACTION,
+            reason="Emergency stop engaged; execution halted before the next step. Resume after review.",
+            progress=task.progress,
+            next_planned_action="Operator: lift the emergency stop, then resume the task",
+        )
+
+    async def _plan_revision(self, task: Task) -> Optional[int]:
+        current = await self.planner.current_plan(task)
+        return current.revision if current is not None else None
+
     async def _record_progress(
         self,
         task: Task,
@@ -369,6 +403,7 @@ class AgentController:
         """
         if emergency_stop.is_stopped and not emergency_stop.can_execute_tasks():
             report.blockers.append("Emergency stop engaged mid-execution.")
+            await self._park_for_emergency_stop(task)
             return (
                 StepResult(iteration, "halted", None, None, False, "Emergency stop", 0),
                 True,

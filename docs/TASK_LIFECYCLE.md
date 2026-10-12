@@ -70,6 +70,18 @@ A worker claims a task with `TaskManager.claim_next_task()`:
 
 Permanent failures are never retried indefinitely.
 
+## Interruptions, Budget and Emergency Stop
+
+| Situation | Resulting status |
+|---|---|
+| Run hits its iteration budget, plan fully processed | Finalized: `COMPLETED` only with verified evidence, otherwise `PARTIALLY_COMPLETED` |
+| Run hits its iteration budget, work remains | `PARTIALLY_COMPLETED` (no retry consumed; an operator resumes it to `READY`). The budget applies per run. |
+| Emergency stop engaged mid-run | `NEEDS_USER_ACTION`; completed work is kept; resume to `READY` once the stop is lifted |
+| Worker crash, read-only work interrupted | `RETRYING` (counts as a retry); `FAILED` once `max_retries` is spent |
+| Worker crash with a `transact` step running/completed or an `interact` step running | `NEEDS_USER_ACTION`; never auto-resumed so nothing uncertain or irreversible runs twice |
+
+After a replan the controller continues with the newly persisted plan revision.
+
 ## Blockers
 
 `NEEDS_USER_ACTION` is used only when human intervention is genuinely unavoidable:

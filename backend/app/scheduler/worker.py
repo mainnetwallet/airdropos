@@ -432,33 +432,104 @@ async def task_execution_loop() -> None:
 # ----------------------------------------------------------------------
 # Recovery
 # ----------------------------------------------------------------------
-async def recover_interrupted_tasks() -> int:
-    """Reset tasks stuck IN_PROGRESS after a crash so they can be resumed."""
-    from sqlalchemy import update
+# Step kinds whose side effects cannot be undone or safely repeated. A crash while one of these
+# was running leaves the real-world outcome unknown (was the transaction broadcast? was the form
+# submitted?), so recovery must never re-run it on its own.
+_SIDE_EFFECT_KINDS = frozenset({"transact", "interact"})
 
-    from backend.app.models import Task
+
+async def _inspect_plan_for_recovery(db: AsyncSession, task_pk: Any):
+    """Return (blocking_reason, read_only_running_step_indexes) for an interrupted task."""
+    from backend.app.models import ExecutionPlan
+
+    plan = await db.scalar(
+        select(ExecutionPlan).where(
+            ExecutionPlan.task_id == task_pk, ExecutionPlan.is_current.is_(True)
+        )
+    )
+    blocking: list[str] = []
+    resettable: list[int] = []
+    for raw in (plan.steps if plan is not None else None) or []:
+        kind, status = raw.get("kind"), raw.get("status")
+        label = f"step {raw.get('index')} ({kind}): {raw.get('description', '')}"[:200]
+        if kind == "transact" and status in ("running", "completed"):
+            blocking.append(f"{label} was {status} when the worker stopped; verify on-chain state")
+        elif kind in _SIDE_EFFECT_KINDS and status == "running":
+            blocking.append(f"{label} was running when the worker stopped; verify whether it took effect")
+        elif status == "running":
+            resettable.append(int(raw.get("index", -1)))  # read-only: safe to run again
+    reason = "; ".join(blocking) if blocking else None
+    return reason, resettable
+
+
+async def recover_interrupted_tasks() -> int:
+    """Settle tasks left IN_PROGRESS by a crash. Returns how many were queued for retry.
+
+    * A side-effecting step (transaction, web interaction) in flight, or an already completed
+      transaction: park as NEEDS_USER_ACTION. Never auto-resumed, so nothing irreversible or
+      uncertain is executed twice; an operator verifies the outcome first.
+    * Otherwise the interruption counts as a retry (RETRYING) while the budget lasts, and FAILED
+      once ``max_retries`` is spent, so a task that keeps crashing the worker cannot loop forever.
+      Interrupted read-only steps are reset to pending so they can run again.
+
+    Leases of the dead run are always released, completed progress is kept, and every change is
+    recorded as a status-transition event.
+    """
+    from backend.app.planning.planner import Planner
 
     async with AsyncSessionLocal() as db:
         interrupted = list(
             (
-                await db.execute(
-                    select(Task.id).where(Task.status == TaskStatus.IN_PROGRESS.value)
-                )
+                await db.execute(select(Task).where(Task.status == TaskStatus.IN_PROGRESS.value))
             ).scalars().all()
         )
-        for task_pk in interrupted:
+        manager = TaskManager(db)
+        planner = Planner(db)
+        queued = parked = failed = 0
+        for task in interrupted:
             # The dead run's committed lease would otherwise block the retry for its full TTL.
-            await _release_task_leases(db, task_pk, "worker restarted; run interrupted")
-        result = await db.execute(
-            update(Task)
-            .where(Task.status == TaskStatus.IN_PROGRESS.value)
-            .values(status=TaskStatus.RETRYING.value)
-        )
-        count = result.rowcount or 0
+            await _release_task_leases(db, task.id, "worker restarted; run interrupted")
+            blocking, resettable = await _inspect_plan_for_recovery(db, task.id)
+
+            if blocking:
+                details = dict(task.error_details or {})
+                details["recovery"] = (
+                    "Worker stopped mid-run with a side-effecting step in flight; parked so it is "
+                    f"not executed again automatically. {blocking}"
+                )[:900]
+                await manager.transition(
+                    task,
+                    TaskStatus.NEEDS_USER_ACTION,
+                    reason=f"worker restarted; run interrupted. {blocking}"[:500],
+                    progress=task.progress,
+                    error_details=details,
+                    next_planned_action="Operator: verify the outcome of the interrupted step, then resume",
+                )
+                parked += 1
+                continue
+
+            for index in resettable:
+                await planner.update_step_status(task, index, "pending")
+            if task.retry_count < task.max_retries:
+                await manager.transition(
+                    task, TaskStatus.RETRYING, reason="worker restarted; run interrupted",
+                    progress=task.progress,
+                )
+                queued += 1
+            else:
+                await manager.transition(
+                    task, TaskStatus.FAILED,
+                    reason="worker restarted; run interrupted (retries exhausted)",
+                    progress=task.progress,
+                )
+                failed += 1
         await db.commit()
-        if count:
-            logger.info("Recovered %s interrupted task(s) for retry", count)
-        return count
+        if interrupted:
+            logger.info(
+                "Recovered interrupted tasks: %s queued for retry, %s parked for operator review, "
+                "%s failed (retries exhausted)", queued, parked, failed,
+            )
+        return queued
 
 
 # ----------------------------------------------------------------------
