@@ -38,6 +38,21 @@ RELIABILITY_SCORE = {
     SourceReliability.UNVERIFIED: 0.1,
 }
 
+# Default sources used when a cycle is run without an explicit list.
+#
+# Coingecko's airdrop index was removed from here. It answers 403 to any
+# non-browser client, so every cycle spent a request on a source that could only
+# ever fail, and pushed a permanent, meaningless entry into the cycle's failure
+# report. The failure reporting itself is unchanged and still reports sources
+# that break for real reasons -- the cause is fixed by not asking a source that
+# cannot answer, not by muting the report.
+DEFAULT_OFFICIAL_SOURCES: List[str] = []
+
+DEFAULT_COMMUNITY_SOURCES: List[str] = [
+    "https://airdrops.io",
+    "https://airdropalert.com",
+]
+
 
 class VerificationClass(str, Enum):
     CONFIRMED_FACT = "confirmed_fact"      # Verified against an authoritative source
@@ -533,14 +548,11 @@ async def run_discovery_cycle(
         Dict with discovery results and statistics.
     """
     if discovery_sources is None:
-        # In a real implementation, this would come from configuration
+        # Copied so a caller mutating the returned list cannot corrupt the defaults
+        # for the next cycle.
         discovery_sources = {
-            "official": [],
-            "community": [
-                "https://airdrops.io",
-                "https://airdropalert.com",
-                "https://coingecko.com/en/airdrops",
-            ]
+            "official": list(DEFAULT_OFFICIAL_SOURCES),
+            "community": list(DEFAULT_COMMUNITY_SOURCES),
         }
 
     start_time = datetime.now(timezone.utc)
