@@ -45,6 +45,16 @@ export default function DashboardLayout() {
     refetchInterval: 10000,
   })
 
+  // How many task conversations are waiting on this operator. Small, and polled slowly
+  // because it is a hint; the Inbox page refetches precisely when it is open.
+  const { data: inboxSummary } = useQuery({
+    queryKey: ['inbox-summary'],
+    queryFn: api.inboxSummary,
+    refetchInterval: 30000,
+    retry: false,
+  })
+  const badges: Record<string, number> = { inboxNeedsReply: inboxSummary?.needs_reply ?? 0 }
+
   const logout = async () => {
     await api.logout()
     window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
@@ -52,6 +62,10 @@ export default function DashboardLayout() {
 
   const isChat = pathname.startsWith('/agent')
   const isHome = pathname === '/'
+  // The Inbox is a three-panel workspace: it needs the full width, and on mobile it
+  // manages its own scrolling so the composer stays above the keyboard.
+  const isInbox = pathname.startsWith('/inbox')
+  const fullBleed = isChat || isHome || isInbox
   const stopActive = stop?.emergency_stop_enabled === true
 
   return (
@@ -73,7 +87,7 @@ export default function DashboardLayout() {
                 {section.label}
               </p>
               <ul className="space-y-0.5">
-                {section.items.map(({ to, label, icon: Icon, end }) => (
+                {section.items.map(({ to, label, icon: Icon, end, badge }) => (
                   <li key={to}>
                     <NavLink
                       to={to}
@@ -89,6 +103,14 @@ export default function DashboardLayout() {
                     >
                       <Icon className="h-4 w-4 shrink-0" />
                       <span className="truncate">{label}</span>
+                      {badge && badges[badge] > 0 && (
+                        <span
+                          className="ml-auto shrink-0 rounded-full bg-status-warning/20 px-1.5 py-0.5 text-[10px] font-bold text-status-warning"
+                          aria-label={`${badges[badge]} awaiting a reply`}
+                        >
+                          {badges[badge]}
+                        </span>
+                      )}
                     </NavLink>
                   </li>
                 ))}
@@ -158,15 +180,16 @@ export default function DashboardLayout() {
         <main
           className={clsx(
             'flex-1 overflow-y-auto lg:p-6',
-            isChat || isHome ? 'px-0 pt-0' : 'px-4 pt-1',
-            !keyboardOpen && 'pb-nav',
+            fullBleed ? 'px-0 pt-0' : 'px-4 pt-1',
+            isInbox && 'flex flex-col overflow-hidden',
+            !keyboardOpen && 'pb-nav lg:pb-0',
           )}
         >
           <div
             className={clsx(
               'mx-auto w-full lg:max-w-none',
-              isChat && 'h-full',
-              !isHome && 'max-w-3xl',
+              (isChat || isInbox) && 'h-full',
+              !fullBleed && 'max-w-3xl',
             )}
           >
             <Outlet />

@@ -13,6 +13,7 @@ import {
   HardDrive,
   Hexagon,
   Home,
+  Inbox,
   Layers,
   LifeBuoy,
   ListChecks,
@@ -31,6 +32,11 @@ export interface NavItem {
   label: string
   icon: LucideIcon
   end?: boolean
+  /**
+   * Key of a live count shown beside the item. Resolved by the layout, which owns the
+   * data; the nav model itself stays free of fetching.
+   */
+  badge?: string
 }
 
 export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
@@ -39,6 +45,9 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { to: '/', label: 'Mission Control', icon: Gauge, end: true },
       { to: '/agent', label: 'AI Agent Console', icon: Bot },
+      // Sits beside the console: the console is for general interaction and new
+      // tasks, the Inbox is where a specific task asks the operator something.
+      { to: '/inbox', label: 'Agent Inbox', icon: Inbox, badge: 'inboxNeedsReply' },
       { to: '/live', label: 'Live Broadcast', icon: RadioTower },
       { to: '/worker', label: 'Live Worker', icon: Activity },
       { to: '/goals', label: 'Goals & Strategy', icon: Target },
@@ -100,8 +109,11 @@ export const BOTTOM_TABS: BottomTab[] = [
  * the worker/diagnostics screens under Wallets, as drawn in the reference).
  * Pages with no natural tab (Settings, Memory, ...) highlight nothing.
  */
-const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
+export const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
   ['/agent', 'chat'],
+  // The Inbox shares the existing Chat tab rather than adding a sixth one, so the
+  // mobile order (Home -> Airdrops -> Chat -> Tasks -> Wallets) is unchanged.
+  ['/inbox', 'chat'],
   ['/airdrops', 'airdrops'],
   ['/telegram', 'airdrops'],
   ['/tasks', 'tasks'],

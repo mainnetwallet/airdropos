@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.inbox.raise_intervention import park_for_intervention
+from backend.app.inbox.service import OPERATOR_FALLBACK_EMAIL, UNKNOWN_REASON
 from backend.app.models import ExecutionLease, ExecutionPlan, Task
 from backend.app.tasks.state_machine import TaskStatus
 
@@ -193,17 +195,29 @@ class LeaseManager:
                     "Stale lease broken while a side-effecting step may have been in flight. "
                     f"Parked for operator review to prevent duplicate execution. {uncertain}"
                 )[:900]
-                await manager.transition(
-                    task,
-                    TaskStatus.NEEDS_USER_ACTION,
-                    reason=f"stale lease broken. {uncertain}"[:500],
-                    progress=task.progress,
-                    error_details=details,
-                    next_planned_action=(
-                        "Operator: verify the outcome of the interrupted step (check on-chain "
-                        "state / the target site) before any further action."
-                    ),
-                )
+                task.error_details = details
+                # Raises the intervention request and posts it to the task's Agent Inbox
+                # conversation, then parks it. Skipped silently if it cannot: the caller still
+                # breaks the lease, so a dead worker never keeps running.
+                try:
+                    await park_for_intervention(
+                        self.db,
+                        task,
+                        owner_email=getattr(task, "owner_email", None) or OPERATOR_FALLBACK_EMAIL,
+                        error_text=(
+                            "A previous worker's lease expired while a side-effecting step may "
+                            f"still have been in flight: {uncertain}. I stopped this task rather "
+                            "than repeating a step whose real-world outcome I cannot confirm."
+                        ),
+                        error_category="HUMAN_INTERVENTION_REQUIRED",
+                        blocking_step=uncertain,
+                        force_reason_code=UNKNOWN_REASON,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "Could not raise an intervention for %s under a stale lease: %s",
+                        task.task_id, exc,
+                    )
                 parked += 1
                 logger.warning("Task %s parked for operator review under a stale lease.", task.task_id)
             elif task.retry_count < task.max_retries:

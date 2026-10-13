@@ -89,6 +89,12 @@ EVIDENCE_KINDS: Dict[str, frozenset] = {
 }
 
 from backend.app.agent.prompts import AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
+from backend.app.inbox.raise_intervention import park_for_intervention  # noqa: E402
+from backend.app.inbox.service import (  # noqa: E402
+    AMBIGUOUS_INSTRUCTION,
+    OPERATOR_FALLBACK_EMAIL,
+    OPERATOR_PAUSE,
+)
 
 
 class LoopOutcome(str, Enum):
@@ -344,18 +350,75 @@ class AgentController:
         IN_PROGRESS is not claimable and the dashboard shows it as running, so a task halted by
         the emergency stop would look live until the next worker restart. The stop is checked
         before a step starts, so nothing is in flight. NEEDS_USER_ACTION is the lifecycle's
-        "an operator must decide" state; the operator resumes it (-> READY) once the stop is
-        lifted. Completed work and checkpoints are untouched and no retry is consumed.
+        "an operator must decide" state; completed work and checkpoints are untouched, no retry
+        is consumed, and the task is never restarted by an informational reply -- lifting the
+        stop is an explicit operator action.
         """
         if task.status != TaskStatus.IN_PROGRESS.value:
             return
-        await self.tasks.transition(
+        await self._request_operator_input(
             task,
-            TaskStatus.NEEDS_USER_ACTION,
-            reason="Emergency stop engaged; execution halted before the next step. Resume after review.",
-            progress=task.progress,
-            next_planned_action="Operator: lift the emergency stop, then resume the task",
+            iteration=0,
+            error_text=(
+                "Emergency stop engaged; execution halted before the next step. "
+                "Resume after review."
+            ),
+            force_reason_code=OPERATOR_PAUSE,
+            blocking_step=task.next_planned_action or "Execution halted by the emergency stop",
         )
+
+    # ------------------------------------------------------------------
+    async def _request_operator_input(
+        self,
+        task: Task,
+        *,
+        iteration: int,
+        error_text: str,
+        error_category: Optional[str] = None,
+        blocking_step: Optional[str] = None,
+        integration_ref: Optional[str] = None,
+        force_reason_code: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Persist an intervention request and tell the operator what to do.
+
+        Replaces a silent transition into NEEDS_USER_ACTION: the task now checkpoints, opens
+        (or reuses) its Agent Inbox conversation, and posts a message that names the real
+        blocker. If any of that fails the task is deliberately left running-failed rather than
+        parked with nobody able to unblock it.
+        """
+        try:
+            result = await park_for_intervention(
+                self.db,
+                task,
+                owner_email=task.owner_email or OPERATOR_FALLBACK_EMAIL,
+                error_text=error_text,
+                error_category=error_category,
+                blocking_step=blocking_step,
+                integration_ref=integration_ref,
+                iteration=iteration,
+                force_reason_code=force_reason_code,
+            )
+            if result is None:
+                logger.error(
+                    "Could not raise an intervention for %s; leaving it in %s",
+                    task.task_id, task.status,
+                )
+            return result
+        except Exception as exc:
+            # A failure to notify must never be worse than the failure being reported.
+            logger.error("Intervention request failed for %s: %s", task.task_id, exc)
+            return None
+
+    @staticmethod
+    def _integration_ref(tool_result: Any) -> Optional[str]:
+        """Best-effort session reference from a tool result, e.g. 'browser:default'."""
+        data = getattr(tool_result, "data", None)
+        if isinstance(data, dict):
+            for key in ("session_id", "live_session", "session_key"):
+                value = data.get(key)
+                if value:
+                    return str(value)[:255]
+        return None
 
     async def _plan_revision(self, task: Task) -> Optional[int]:
         current = await self.planner.current_plan(task)
@@ -392,14 +455,61 @@ class AgentController:
 
     # ------------------------------------------------------------------
     async def _ensure_plan(self, task: Task, report: LoopReport) -> ExecutionPlanSpec:
-        """Load the persisted plan, or decompose one if none exists."""
+        """Load the persisted plan, or decompose one if none exists.
+
+        Operator clarifications supplied through the Agent Inbox are folded in here, on the
+        worker, rather than in the API process -- planning has exactly one home and the LLM
+        is not called from a request handler. Instructions are cleared before the planner is
+        invoked so a replan can never be retried forever on the same note.
+        """
+        instructions = self._take_operator_instructions(task)
         existing = await self.planner.load_plan_spec(task)
+
         if existing is not None and existing.steps:
-            logger.info(
-                "Task %s resuming with plan revision (%s step(s))",
-                task.task_id, len(existing.steps),
+            if not instructions:
+                logger.info(
+                    "Task %s resuming with plan revision (%s step(s))",
+                    task.task_id, len(existing.steps),
+                )
+                return existing
+
+            completed_irreversible = [
+                s for s in existing.steps if s.kind.is_irreversible and s.status == "completed"
+            ]
+            if completed_irreversible:
+                # Value already moved under the old plan. Changing direction now could repeat
+                # or contradict it, so the clarification is left for the operator instead.
+                report.blockers.append(
+                    "Operator guidance received, but this task has already completed an "
+                    "irreversible step; the plan was not revised automatically."
+                )
+                task.operator_instructions = instructions
+                await self.db.flush()
+                return existing
+
+            reason = "Operator guidance received in the Agent Inbox: " + "; ".join(instructions)
+            try:
+                revised = await self.planner.replan(
+                    task,
+                    existing,
+                    trigger=ReplanTrigger.OPERATOR_REQUEST,
+                    reason=reason,
+                )
+            except PlanningError as exc:
+                logger.warning(
+                    "Could not apply operator guidance to task %s: %s", task.task_id, exc
+                )
+                report.failures.append(f"Operator guidance could not be planned: {exc}")
+                task.operator_instructions = instructions
+                await self.db.flush()
+                return existing
+
+            report.steps.append(
+                StepResult(0, "replanned (operator request)", None, {"steps": len(revised.steps)},
+                           True, reason[:300], 0)
             )
-            return existing
+            await self._checkpoint(task, 0, "replanned_operator_request")
+            return revised
 
         constraints = PlanConstraints(
             spent_already_usd=task.actual_cost_usd,
@@ -407,6 +517,10 @@ class AgentController:
             allow_transactions=self._transactions_allowed(),
         )
         objective = task.description or task.title
+        if instructions:
+            objective = (
+                f"{objective}\n\nOperator guidance given for this task: " + "; ".join(instructions)
+            )
         spec = await self.planner.decompose(
             objective=objective,
             task=task,
@@ -418,6 +532,22 @@ class AgentController:
                        spec.rationale[:300], 0)
         )
         return spec
+
+    @staticmethod
+    def _take_operator_instructions(task: Task) -> List[str]:
+        """Read and clear the pending operator clarifications for this task.
+
+        Cleared before planning runs so the same note cannot drive an unbounded number of
+        replans. If planning fails the caller puts them back.
+        """
+        records = list(task.operator_instructions or [])
+        task.operator_instructions = []
+        texts: List[str] = []
+        for record in records:
+            text = record.get("instruction") if isinstance(record, dict) else record
+            if text:
+                texts.append(str(text)[:300])
+        return texts
 
     def _transactions_allowed(self) -> bool:
         if self.policy is not None:
@@ -512,11 +642,12 @@ class AgentController:
                     task, step.index, "blocked", failure_reason=reason
                 )
                 report.blockers.append(reason)
-                await self.tasks.transition(
+                await self._request_operator_input(
                     task,
-                    TaskStatus.NEEDS_USER_ACTION,
-                    reason=reason,
-                    next_planned_action=f"Operator: {action}",
+                    iteration=iteration,
+                    error_text=reason,
+                    blocking_step=f"Step {step.index} ({step.kind.value}): {action}",
+                    force_reason_code=AMBIGUOUS_INSTRUCTION if step.kind is StepKind.INTERACT else None,
                 )
                 return (
                     StepResult(iteration, action, None, None, False, reason, 0),
@@ -667,11 +798,13 @@ class AgentController:
             step.status = "blocked"
             step.failure_reason = reason
             await self.planner.update_step_status(task, step.index, "blocked", failure_reason=reason)
-            await self.tasks.transition(
+            await self._request_operator_input(
                 task,
-                TaskStatus.NEEDS_USER_ACTION,
-                reason=reason,
-                next_planned_action="Resume when the blocking condition is resolved",
+                iteration=iteration,
+                error_text=reason,
+                error_category=tool_result.error_category or diagnosis.category.value,
+                blocking_step=f"Step {step.index} ({step.tool}): {action}",
+                integration_ref=self._integration_ref(tool_result),
             )
             return (
                 StepResult(iteration, action, step.tool, tool_result.data, False, reason, 0),
@@ -979,6 +1112,62 @@ class AgentController:
             await self.db.flush()
         except Exception as exc:
             logger.error("Failed to finalize task %s: %s", task.task_id, exc)
+        await self._report_to_inbox(task, report)
+
+    # ------------------------------------------------------------------
+    async def _report_to_inbox(self, task: Task, report: LoopReport) -> None:
+        """Tell the task's conversation what this run actually did.
+
+        Only reported for tasks that already have an Agent Inbox conversation, so ordinary
+        tasks do not acquire one just because they ran. Nothing here claims more than the
+        report proves: unverified work is named as unverified.
+        """
+        from backend.app.inbox import events
+        from backend.app.inbox.service import ConversationService
+
+        try:
+            conversations = ConversationService(self.db)
+            conversation = await conversations.get_for_task(task.id, task.owner_email or "")
+            if conversation is None:
+                return
+
+            lines = [f"Task {task.task_id} run finished: {report.outcome.value.replace('_', ' ').lower()}."]
+            if report.verified_completions:
+                lines.append(f"Verified complete: {len(report.verified_completions)} item(s).")
+            if report.unverified_claims:
+                lines.append(
+                    f"Not verified: {len(report.unverified_claims)} claim(s) produced no evidence."
+                )
+            if report.failures:
+                lines.append(f"Failures: {report.failures[0]}")
+            if report.blockers:
+                lines.append(f"Still blocked: {report.blockers[0]}")
+            if report.next_actions:
+                lines.append(f"Next: {report.next_actions[0]}")
+
+            message = await conversations.append_message(
+                conversation,
+                role="assistant",
+                content="\n".join(lines),
+                kind="AGENT",
+            )
+            await self.db.flush()
+
+            event = {
+                LoopOutcome.COMPLETED: events.EV_TASK_COMPLETED,
+                LoopOutcome.FAILED: events.EV_TASK_FAILED,
+                LoopOutcome.NEEDS_USER_ACTION: events.EV_INTERVENTION_CREATED,
+            }.get(report.outcome, events.EV_TASK_PROGRESS)
+            await events.publish(
+                event,
+                task_id=task.task_id,
+                conversation_id=str(conversation.id),
+                message_id=str(message.id),
+                summary=lines[0],
+                status=task.status,
+            )
+        except Exception as exc:  # never let reporting mask the run's own result
+            logger.debug("Could not report run outcome to the inbox for %s: %s", task.task_id, exc)
 
 
 def json_dumps(obj: Any) -> str:

@@ -362,7 +362,9 @@ class TestAlembicConfig:
         cfg = Config(str(REPO / "backend" / "alembic.ini"))
         script = ScriptDirectory.from_config(cfg)
         assert Path(script.dir) == REPO / "backend" / "app" / "migrations"
-        assert script.get_heads() == ["4_autonomous_execution"]
+        # One head, and it is the newest revision in the chain. Named explicitly so adding a
+        # migration without leaving a branch is a test failure rather than a surprise at deploy.
+        assert script.get_heads() == ["5_agent_inbox"]
 
     def test_stale_duplicate_directory_is_marked_and_not_referenced(self):
         stale = REPO / "backend" / "migrations"

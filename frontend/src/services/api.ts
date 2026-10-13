@@ -13,6 +13,10 @@ import type {
   EmergencyStopStatus,
   GoalView,
   ImprovementProposal,
+  InboxConversationDetail,
+  InboxListResponse,
+  InboxReplyResult,
+  InboxSummary,
   MemoryView,
   Overview,
   TaskReport,
@@ -225,6 +229,46 @@ export const api = {
       `/tasks/${encodeURIComponent(taskId)}/retry`,
       { method: 'POST' },
     ),
+
+  // --- Agent Inbox -------------------------------------------------------
+  // Task-scoped conversations. The task is resolved server-side from the
+  // conversation id, so nothing here passes a task id it could tamper with.
+  listInboxConversations: (params?: {
+    search?: string
+    needs_reply?: boolean
+    include_archived?: boolean
+    limit?: number
+  }) => {
+    const query = new URLSearchParams()
+    if (params?.search) query.set('search', params.search)
+    if (params?.needs_reply !== undefined) query.set('needs_reply', String(params.needs_reply))
+    if (params?.include_archived) query.set('include_archived', 'true')
+    if (params?.limit) query.set('limit', String(params.limit))
+    const qs = query.toString()
+    return request<InboxListResponse>(`/inbox/conversations${qs ? `?${qs}` : ''}`)
+  },
+  getInboxConversation: (conversationId: string, params?: { limit?: number; before_seq?: number }) => {
+    const query = new URLSearchParams()
+    if (params?.limit) query.set('limit', String(params.limit))
+    if (params?.before_seq !== undefined) query.set('before_seq', String(params.before_seq))
+    const qs = query.toString()
+    return request<InboxConversationDetail>(
+      `/inbox/conversations/${encodeURIComponent(conversationId)}${qs ? `?${qs}` : ''}`,
+    )
+  },
+  sendInboxMessage: (
+    conversationId: string,
+    message: string,
+    clientToken: string,
+  ) =>
+    request<InboxReplyResult>(
+      `/inbox/conversations/${encodeURIComponent(conversationId)}/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ message, client_token: clientToken }),
+      },
+    ),
+  inboxSummary: () => request<InboxSummary>('/inbox/summary'),
 
   // --- Goals ------------------------------------------------------------
   listGoals: () => request<{ goals: GoalView[] }>('/goals'),

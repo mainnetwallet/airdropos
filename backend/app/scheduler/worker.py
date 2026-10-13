@@ -20,6 +20,8 @@ from sqlalchemy import select
 
 from backend.app.agent.controller import AgentController
 from backend.app.core.config import settings
+from backend.app.inbox.raise_intervention import park_for_intervention
+from backend.app.inbox.service import OPERATOR_FALLBACK_EMAIL, UNKNOWN_REASON
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.database.session import AsyncSessionLocal, engine
@@ -497,13 +499,22 @@ async def recover_interrupted_tasks() -> int:
                     "Worker stopped mid-run with a side-effecting step in flight; parked so it is "
                     f"not executed again automatically. {blocking}"
                 )[:900]
-                await manager.transition(
+                task.error_details = details
+                # Tell the operator in the task's own conversation instead of leaving them to
+                # find this in the Task Manager and work out what happened. This also performs
+                # the NEEDS_USER_ACTION transition and saves a checkpoint.
+                await park_for_intervention(
+                    db,
                     task,
-                    TaskStatus.NEEDS_USER_ACTION,
-                    reason=f"worker restarted; run interrupted. {blocking}"[:500],
-                    progress=task.progress,
-                    error_details=details,
-                    next_planned_action="Operator: verify the outcome of the interrupted step, then resume",
+                    owner_email=task.owner_email or OPERATOR_FALLBACK_EMAIL,
+                    error_text=(
+                        f"The worker restarted while a side-effecting step was in flight: {blocking}. "
+                        "I stopped this task rather than repeating a step whose real-world outcome "
+                        "I cannot confirm."
+                    ),
+                    error_category="HUMAN_INTERVENTION_REQUIRED",
+                    blocking_step=blocking,
+                    force_reason_code=UNKNOWN_REASON,
                 )
                 parked += 1
                 continue

@@ -117,7 +117,8 @@ function MobileHome({
     { label: 'Airdrops Tracking', value: data?.campaigns, to: '/airdrops', icon: Compass, tone: 'green' },
     { label: 'Active Tasks', value: data?.active_tasks, to: '/tasks', icon: Layers, tone: 'purple' },
     { label: 'Wallets Connected', value: data?.wallets, to: '/wallets', icon: Wallet, tone: 'green' },
-    { label: 'Alerts Pending', value: data?.needs_user_action, to: '/tasks?status=NEEDS_USER_ACTION', icon: Bell, tone: 'orange' },
+    // A task needing a human is resolved in the Agent Inbox, not by filtering a list here.
+    { label: 'Waiting For You', value: data?.needs_user_action, to: '/inbox', icon: Bell, tone: 'orange' },
   ]
   const activity = buildActivity(data, worker)
 

@@ -185,6 +185,9 @@ PROTECTED_GETS = [
     "/api/v1/settings",
     "/api/v1/emergency-stop",
     "/api/v1/health/detail",
+    "/api/v1/inbox/conversations",
+    "/api/v1/inbox/summary",
+    "/api/v1/inbox/conversations/00000000-0000-0000-0000-000000000000",
 ]
 
 PROTECTED_POSTS = [
@@ -192,6 +195,9 @@ PROTECTED_POSTS = [
     "/api/v1/learning/analyze",
     "/api/v1/agent/chat",
     "/api/v1/emergency-stop",
+    # The Agent Inbox reply endpoint requeues a task, so it must never be reachable
+    # without a session.
+    "/api/v1/inbox/conversations/00000000-0000-0000-0000-000000000000/messages",
 ]
 
 

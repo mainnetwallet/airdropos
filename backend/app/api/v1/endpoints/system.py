@@ -325,6 +325,7 @@ async def _persist_chat_task(
         category=(str(spec["category"])[:100] if spec.get("category") else None),
         network=(str(spec["network"])[:50] if spec.get("network") else None),
         priority=priority,
+        owner_email=principal.email,
     )
     await manager.transition(
         task, TaskStatus.READY, reason="Created from agent chat; queued for the worker"
@@ -376,6 +377,7 @@ async def create_task(
         priority=payload.priority,
         goal_id=payload.goal_id,
         project_id=payload.project_id,
+        owner_email=principal.email,
     )
     await write_audit(db, principal, "TASK_CREATE", "task", task.task_id,
                       after_state={"title": task.title, "priority": task.priority})

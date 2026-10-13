@@ -41,6 +41,14 @@ class Task(Base):
 
     next_planned_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, default=dict)
+    # The authenticated operator who created this task. It scopes the task's Agent Inbox
+    # conversation: a reply is authorised against this, never against a client-supplied id.
+    # NULL for tasks created before ownership was tracked, which any operator may claim once.
+    owner_email: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    # Clarifications the operator supplied in the Agent Inbox for this specific task. Dated,
+    # task-scoped guidance that the controller folds into the plan on the next run. It never
+    # carries instructions for any other task.
+    operator_instructions: Mapped[Optional[List[Dict[str, Any]]]] = mapped_column(JSONB, default=list)
     estimated_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     actual_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
 

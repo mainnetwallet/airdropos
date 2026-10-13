@@ -53,6 +53,7 @@ from backend.app.models.scheduler import (
     PlanningRun,
     AgentConversation,
     ConversationMessage,
+    InterventionRequest,
 )
 
 __all__ = [
@@ -105,4 +106,5 @@ __all__ = [
     "PlanningRun",
     "AgentConversation",
     "ConversationMessage",
+    "InterventionRequest",
 ]

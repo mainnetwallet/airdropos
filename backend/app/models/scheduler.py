@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any
 import uuid
 
-from sqlalchemy import String, Float, Boolean, DateTime, ForeignKey, Text, Integer
+from sqlalchemy import Index, String, Float, Boolean, DateTime, ForeignKey, Text, Integer
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -198,12 +198,42 @@ class PlanningRun(Base):
 
 
 class AgentConversation(Base):
+    """A durable agent conversation.
+
+    Historically this carried the dashboard's general agent console and was never written to.
+    It now also backs the Agent Inbox: one conversation per task, scoped to the owning operator,
+    so a reply can only ever land on the task whose conversation it was sent from.
+    """
+
     __tablename__ = "agent_conversations"
 
-    channel: Mapped[str] = mapped_column(String(50), nullable=False)  # DASHBOARD, TELEGRAM
+    channel: Mapped[str] = mapped_column(String(50), nullable=False)  # DASHBOARD, TELEGRAM, TASK_INBOX
     channel_conversation_id: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
     title: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     context_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # --- Agent Inbox scoping -------------------------------------------------
+    # The task this conversation belongs to. NULL for the general console conversation.
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    # The authenticated operator who owns the conversation. A reply is authorised against
+    # this, never against a task id supplied by the client.
+    owner_email: Mapped[Optional[str]] = mapped_column(String(255), index=True, nullable=True)
+    # OPEN, ARCHIVED
+    status: Mapped[str] = mapped_column(String(50), default="OPEN", index=True, nullable=False)
+    # True while an unresolved intervention request is waiting for this conversation's owner.
+    requires_reply: Mapped[bool] = mapped_column(Boolean, default=False, index=True, nullable=False)
+    last_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True, nullable=True)
+    # Monotonic per-conversation counter giving every message a stable total order.
+    last_seq: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # A unique INDEX rather than a UniqueConstraint: on SQLite a constraint becomes an
+    # anonymous auto-index that introspection cannot see, which makes it impossible to drop
+    # in a downgrade. The migration creates an index too, so both paths agree.
+    __table_args__ = (
+        Index("uq_agent_conversation_channel_key", "channel", "channel_conversation_id", unique=True),
+    )
 
     messages: Mapped[List["ConversationMessage"]] = relationship("ConversationMessage", back_populates="conversation", cascade="all, delete-orphan")
 
@@ -211,12 +241,85 @@ class AgentConversation(Base):
 class ConversationMessage(Base):
     __tablename__ = "conversation_messages"
 
-    conversation_id: Mapped[Any] = mapped_column(
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agent_conversations.id", ondelete="CASCADE"), index=True, nullable=False
     )
-    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user, assistant, system, tool
+    role: Mapped[str] = mapped_column(String(50), nullable=False)  # user, assistant, system, tool
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_calls: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, default=dict)
     tokens_used: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # --- Agent Inbox scoping -------------------------------------------------
+    # Denormalised from the conversation so a message can never be read with the wrong task.
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    # AGENT, USER, SYSTEM, INTERVENTION_REQUEST, RESUMPTION, VERIFICATION, FOLLOW_UP
+    kind: Mapped[str] = mapped_column(String(50), default="AGENT", index=True, nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # Client-supplied idempotency token. Unique per conversation so a double-submit cannot
+    # persist two copies of the same reply or launch two resume attempts.
+    client_token: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    intervention_request_id: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
+
     conversation: Mapped["AgentConversation"] = relationship("AgentConversation", back_populates="messages")
+
+    # Client-supplied idempotency token. Unique per conversation so a double-submit cannot
+    # persist two copies of the same reply or launch two resume attempts. A unique INDEX,
+    # for the same reason as the conversation key above.
+    __table_args__ = (
+        Index(
+            "uq_conversation_message_client_token",
+            "conversation_id",
+            "client_token",
+            unique=True,
+        ),
+    )
+
+
+class InterventionRequest(Base):
+    """A persistent, structured request for human input that is blocking one task.
+
+    Created before the agent's message is published, so the conversation can never advertise a
+    request that does not exist. Resolved only by an authenticated reply routed through this
+    same conversation, never by the task engine.
+    """
+
+    __tablename__ = "intervention_requests"
+
+    request_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_conversations.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    owner_email: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+
+    # MISSING_AUTHENTICATION, TELEGRAM_SESSION_UNAVAILABLE, BROWSER_SESSION_UNAVAILABLE,
+    # HUMAN_VERIFICATION, MISSING_CONFIGURATION, AMBIGUOUS_INSTRUCTION, OPERATOR_PAUSE,
+    # HUMAN_APPROVAL, UNKNOWN
+    reason_code: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    problem_summary: Mapped[str] = mapped_column(String(500), nullable=False)
+    detailed_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    required_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    instructions: Mapped[Optional[List[str]]] = mapped_column(JSONB, default=list)
+    # Integration / session reference the operator must fix, when one is known.
+    integration_ref: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    blocking_step: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    error_category: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # Name of the checkpoint written when this task was parked, so the operator can see
+    # exactly where a resume would pick up from. Null when the checkpoint could not be saved.
+    checkpoint_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # PENDING, RESOLVED, RESUME_SCHEDULED, CANCELLED, SUPERSEDED
+    status: Mapped[str] = mapped_column(String(50), default="PENDING", index=True, nullable=False)
+    created_at_task_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # How the external condition was checked, and what it reported. Never asserted by the client.
+    verification_method: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    verification_outcome: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reply_message_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    conversation: Mapped["AgentConversation"] = relationship("AgentConversation")

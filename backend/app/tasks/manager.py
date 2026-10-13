@@ -24,6 +24,7 @@ from backend.app.models import (
 )
 from backend.app.tasks.id_generator import format_task_id, next_sequence, parse_task_id
 from backend.app.tasks.state_machine import (
+    VALID_TRANSITIONS,
     TaskStatus,
     assert_completion_verified,
     assert_transition,
@@ -73,6 +74,7 @@ class TaskManager:
         estimated_cost_usd: float = 0.0,
         deadline_at: Optional[datetime] = None,
         max_retries: int = 3,
+        owner_email: Optional[str] = None,
     ) -> Task:
         """Allocate a collision-free AIR-YYYY-NNNNNN ID and persist a new task."""
         if priority < 1 or priority > 10:
@@ -118,6 +120,7 @@ class TaskManager:
             estimated_cost_usd=estimated_cost_usd,
             deadline_at=deadline_at,
             max_retries=max_retries,
+            owner_email=owner_email,
             next_planned_action=planned_actions[0].get("description") if planned_actions else None,
         )
         self.db.add(task)
@@ -394,6 +397,69 @@ class TaskManager:
         )
         logger.info("Worker %s claimed task %s", worker_id, task.task_id)
         return task
+
+    # ------------------------------------------------------------------
+    async def transition_if_current(
+        self,
+        task: Task,
+        expected_statuses: Sequence[TaskStatus],
+        new_status: TaskStatus,
+        *,
+        reason: str = "",
+        progress: Optional[float] = None,
+        next_planned_action: Optional[str] = None,
+    ) -> bool:
+        """Apply a transition only if the task is still in one of `expected_statuses`.
+
+        Returns False when another writer already moved the task, which is how a duplicate
+        reply or two racing requests are told apart without trusting the client. This is the
+        same compare-and-set `claim_next_task` uses to keep two workers off one task, so there
+        is only one pattern for "act only if nobody got there first".
+
+        Deliberately narrow: it does not run the COMPLETED verification guard, so
+        `transition` remains the entry point for anything that must be proven.
+        """
+        current = TaskStatus(task.status)
+        if new_status not in VALID_TRANSITIONS.get(current, set()):
+            return False
+
+        values: Dict[str, Any] = {"status": new_status.value}
+        if progress is not None:
+            values["progress"] = max(0.0, min(1.0, progress))
+        if next_planned_action is not None:
+            values["next_planned_action"] = next_planned_action
+
+        result = await self.db.execute(
+            update(Task)
+            .where(
+                Task.id == task.id,
+                Task.status.in_([s.value for s in expected_statuses]),
+            )
+            .values(**values)
+            .execution_options(synchronize_session="fetch")
+        )
+        if (result.rowcount or 0) != 1:
+            logger.info(
+                "Task %s was moved out of %s by another writer first",
+                task.task_id, new_status.value,
+            )
+            await self.db.refresh(task)
+            return False
+
+        await self.db.refresh(task)
+        await self._record_event(
+            task,
+            "STATUS_TRANSITION",
+            SEVERITY_BY_STATUS.get(new_status, "INFO"),
+            {
+                "from": current.value,
+                "to": new_status.value,
+                "reason": reason,
+                "verified": False,
+                "conditional": True,
+            },
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Lookups

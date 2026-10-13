@@ -121,8 +121,10 @@ export function MobileHeader({
           </Link>
         ) : (
           <Link
-            to="/tasks?status=NEEDS_USER_ACTION"
-            aria-label={alerts > 0 ? `${alerts} tasks need your action` : 'Notifications'}
+            to="/inbox"
+            aria-label={
+              alerts > 0 ? `${alerts} tasks waiting for your reply in the Agent Inbox` : 'Agent Inbox'
+            }
             className={clsx(iconButton, 'relative')}
           >
             <Bell className="h-[22px] w-[22px]" />

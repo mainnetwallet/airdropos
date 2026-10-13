@@ -341,6 +341,117 @@ export interface WsEvent {
   at: string
 }
 
+// ======================================================================
+// Agent Inbox
+// ======================================================================
+
+/**
+ * One task-associated conversation. Every field here is reported by the backend;
+ * nothing on this screen is inferred client-side.
+ */
+export interface InboxConversation {
+  conversation_id: string
+  task_id: string | null
+  title: string | null
+  task_status: TaskStatus | string | null
+  task_progress: number | null
+  status: string
+  requires_reply: boolean
+  last_message_at: string | null
+  last_seq: number
+  last_message_preview?: string | null
+}
+
+export interface InboxMessage {
+  id: string
+  role: 'user' | 'assistant' | 'system' | 'tool' | string
+  kind: string
+  content: string
+  seq: number
+  created_at: string | null
+  intervention_request_id: string | null
+}
+
+/** The structured record of what is blocking a task. */
+export interface InterventionRequest {
+  request_id: string
+  task_id: string
+  conversation_id: string
+  reason_code: string
+  problem_summary: string
+  detailed_explanation: string | null
+  required_action: string | null
+  instructions: string[]
+  integration_ref: string | null
+  blocking_step: string | null
+  error_category: string | null
+  checkpoint_name?: string | null
+  status: string
+  created_at: string | null
+  resolved_at: string | null
+  resolved_by: string | null
+  verification_method: string | null
+  verification_outcome: string | null
+  machine_verifiable: boolean
+  requires_explicit_authorization: boolean
+}
+
+/** Real task state for the details panel. Absent fields are absent, never invented. */
+export interface InboxTaskSummary {
+  task_id: string
+  title: string
+  status: TaskStatus | string
+  progress: number
+  retry_count: number
+  max_retries: number
+  next_planned_action: string | null
+  next_execution_at: string | null
+  last_updated: string | null
+  error_details: Record<string, unknown>
+  detail_url: string
+}
+
+export interface InboxConversationDetail extends InboxConversation {
+  messages: InboxMessage[]
+  message_count: number
+  has_more: boolean
+  open_request: InterventionRequest | null
+  task: InboxTaskSummary | null
+}
+
+export interface InboxListResponse {
+  conversations: InboxConversation[]
+  count: number
+  total: number
+  needs_reply: number
+}
+
+export interface InboxSummary {
+  conversations: number
+  needs_reply: number
+  active: number
+}
+
+/** What the backend decided to do with a reply. */
+export interface InboxReplyResult {
+  status: 'RESUMED' | 'CLARIFIED' | 'CANCELLED' | 'NEEDS_MORE_INFO' | 'RECORDED' | 'IGNORED' | string
+  task_id: string
+  conversation_id: string
+  message_id: string
+  agent_message_id: string | null
+  request_id: string | null
+  task_status: string
+  resumed: boolean
+  detail?: string
+  verification?: {
+    method: string
+    ok: boolean
+    checkable: boolean
+    outcome: string
+    detail: Record<string, unknown>
+  }
+}
+
 export interface WorkerLogLine {
   t: string
   level: string

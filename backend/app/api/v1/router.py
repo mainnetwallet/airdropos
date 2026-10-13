@@ -6,6 +6,7 @@ from backend.app.api.v1.endpoints import (
     auth,
     browser_profiles,
     campaigns,
+    inbox,
     live,
     knowledge,
     system,
@@ -20,6 +21,7 @@ api_router = APIRouter()
 api_router.include_router(auth.router)
 api_router.include_router(campaigns.router)
 api_router.include_router(system.router)
+api_router.include_router(inbox.router)
 api_router.include_router(transactions.router)
 api_router.include_router(audit.router)
 api_router.include_router(settings.router)

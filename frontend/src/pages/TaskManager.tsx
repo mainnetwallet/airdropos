@@ -1,12 +1,13 @@
 /** Task Manager: list, filter, inspect, cancel, and retry persistent tasks. */
 
-import { useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useCallback, useEffect, useState } from 'react'
+import { useSearchParams, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   CheckCircle2,
   Clock,
+  MessageSquare,
   MoreVertical,
   Radio,
   RefreshCw,
@@ -93,11 +94,16 @@ function updatedAgo(iso: string): string {
 
 export default function TaskManagerPage() {
   const queryClient = useQueryClient()
-  const [params] = useSearchParams()
+  const navigate = useNavigate()
+  const [params, setParams] = useSearchParams()
 
-  // The header bell links here with ?status=NEEDS_USER_ACTION.
+  const statusParam = params.get('status') as TaskStatus | null
+  const taskParam = params.get('task')
+
+  // The Agent Inbox links here with ?task=<id> so a task can be opened directly from the
+  // conversation that raised it. Falls back to the status filter's group on a bad id.
   const initialStatus = (() => {
-    const wanted = params.get('status') as TaskStatus | null
+    const wanted = statusParam
     return wanted && STATUSES.includes(wanted) ? wanted : 'ALL'
   })()
 
@@ -105,7 +111,37 @@ export default function TaskManagerPage() {
   const [group, setGroup] = useState<Group>(groupForStatus(initialStatus))
   const [search, setSearch] = useState('')
   const [showSearch, setShowSearch] = useState(false)
-  const [selected, setSelected] = useState<string | null>(null)
+  const [selected, setSelected] = useState<string | null>(taskParam)
+
+  // Keep the selection in the URL so a refresh, or a shared link, reopens the same task,
+  // and so the Inbox's link is not a dead end.
+  const selectTask = useCallback(
+    (id: string | null) => {
+      setSelected(id)
+      setParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          if (id) next.set('task', id)
+          else next.delete('task')
+          return next
+        },
+        { replace: true },
+      )
+    },
+    [setParams],
+  )
+
+  // Following a link to a different task while already on this page.
+  useEffect(() => {
+    if (taskParam && taskParam !== selected) selectTask(taskParam)
+  }, [taskParam, selected, selectTask])
+
+  // A task parked on a human belongs in the pending group regardless of the filter.
+  useEffect(() => {
+    if (!statusParam) return
+    setStatusFilter(initialStatus)
+    setGroup(groupForStatus(initialStatus))
+  }, [statusParam, initialStatus])
 
   const tasksQuery = useQuery({
     queryKey: ['tasks', statusFilter],
@@ -138,7 +174,7 @@ export default function TaskManagerPage() {
   const remove = useMutation({
     mutationFn: (id: string) => api.deleteTask(id),
     onSuccess: () => {
-      setSelected(null)
+      selectTask(null)
       queryClient.invalidateQueries({ queryKey: ['tasks'] })
     },
   })
@@ -272,8 +308,8 @@ export default function TaskManagerPage() {
                 key={task.task_id}
                 role="button"
                 tabIndex={0}
-                onClick={() => setSelected(task.task_id)}
-                onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && setSelected(task.task_id)}
+                onClick={() => selectTask(task.task_id)}
+                onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && selectTask(task.task_id)}
                 className={clsx(
                   'flex items-center gap-3 rounded-2xl border bg-surface-100 p-3 shadow-card',
                   selected === task.task_id ? 'border-accent' : 'border-surface-300/60',
@@ -327,7 +363,7 @@ export default function TaskManagerPage() {
                   {filtered.map((task) => (
                     <tr
                       key={task.task_id}
-                      onClick={() => setSelected(task.task_id)}
+                      onClick={() => selectTask(task.task_id)}
                       className={`table-row cursor-pointer ${
                         selected === task.task_id ? 'bg-accent/10' : ''
                       }`}
@@ -360,7 +396,7 @@ export default function TaskManagerPage() {
               ? 'fixed inset-0 z-[60] flex items-end bg-black/50 lg:static lg:z-auto lg:block lg:bg-transparent'
               : 'hidden lg:block',
           )}
-          onClick={() => setSelected(null)}
+          onClick={() => selectTask(null)}
         >
           <div
             className="max-h-[85dvh] w-full overflow-y-auto rounded-t-3xl bg-surface-50 pb-[env(safe-area-inset-bottom)] lg:max-h-none lg:overflow-visible lg:rounded-none lg:bg-transparent lg:pb-0"
@@ -373,7 +409,7 @@ export default function TaskManagerPage() {
                 selected ? (
                   <button
                     type="button"
-                    onClick={() => setSelected(null)}
+                    onClick={() => selectTask(null)}
                     aria-label="Close task detail"
                     className="flex h-10 w-10 items-center justify-center rounded-full text-slate-400 hover:bg-surface-200 lg:hidden"
                   >
@@ -410,8 +446,17 @@ export default function TaskManagerPage() {
                         </p>
                       )}
                       <p className="mt-1 text-[11px] opacity-80">
-                        Do the step yourself, then press Retry to let the agent continue.
+                        Answer the agent in its conversation. It re-checks the condition and
+                        resumes this task by itself — no manual retry is needed.
                       </p>
+                      <button
+                        type="button"
+                        onClick={() => navigate('/inbox')}
+                        className="btn-primary mt-2 w-full justify-center"
+                      >
+                        <MessageSquare className="h-4 w-4" />
+                        Reply in Agent Inbox
+                      </button>
                     </Alert>
                   )}
 
@@ -512,8 +557,12 @@ export default function TaskManagerPage() {
                       Delete
                     </button>
                   </div>
-                  {remove.error && (
-                    <p className="text-xs text-status-error">{(remove.error as Error).message}</p>
+                  {/* Every action failure is shown. A control that silently did nothing is worse
+                      than no control at all. */}
+                  {(retry.error || cancel.error || remove.error) && (
+                    <p role="alert" className="text-xs text-status-error">
+                      {((retry.error || cancel.error || remove.error) as Error).message}
+                    </p>
                   )}
                 </div>
               )}
