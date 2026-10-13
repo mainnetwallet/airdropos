@@ -597,7 +597,7 @@ class BrowserController:
             forms.append({"action": await form.get_attribute("action"), "fields": fields})
 
         buttons = []
-        for btn in await page.query_selector_all("button, [role=button], input[type=submit]"):
+        for btn in await page.query_selector_all("button, [role=button], [role=link], [role=menuitem], [role=tab], input[type=submit], input[type=button]"):
             label = (await btn.inner_text()) or (await btn.get_attribute("value")) or ""
             if label.strip():
                 buttons.append(label.strip()[:80])

@@ -35,6 +35,39 @@ def _event(params: Dict[str, Any], type_: str, message: str, status: str = "ok")
     hub.browser_sessions.touch(key)
     hub.events.emit(integration="browser", session_id=f"browser:{key}", type=type_, message=message, status=status)
 
+_CLICK_ROLES = ("button", "link", "menuitem", "tab", "option")
+
+
+async def _find_clickable(page, text: str, wait_ms: int = 6000):
+    """Locate something clickable by its visible text.
+
+    Tries buttons, links, menu items, tabs, plain text, aria-label/title and `value`, in the main
+    page and in every iframe. Single-page apps (modals, login dialogs) often render a moment after
+    navigation, so it polls briefly instead of failing on the first empty look.
+    """
+    import time
+
+    deadline = time.monotonic() + wait_ms / 1000.0
+    while True:
+        for frame in [page.main_frame] + [f for f in page.frames if f != page.main_frame]:
+            candidates = []
+            for role in _CLICK_ROLES:
+                candidates.append(frame.get_by_role(role, name=text, exact=False))
+            candidates.append(frame.get_by_text(text, exact=False))
+            candidates.append(frame.locator(f'[aria-label*="{text}" i], [title*="{text}" i], input[value*="{text}" i]'))
+            for loc in candidates:
+                try:
+                    if await loc.count() > 0:
+                        return loc.first
+                except Exception:
+                    continue
+        if time.monotonic() >= deadline:
+            return None
+        try:
+            await page.wait_for_timeout(500)
+        except Exception:
+            return None
+
 
 class NavigateTool(BaseTool):
     name = "browser_navigate"
@@ -137,15 +170,17 @@ class ClickButtonTool(BaseTool):
             return _needs_human(params, before.human_reason or "Human interaction required.")
 
         try:
-            locator = page.get_by_role("button", name=params["button_text"], exact=False)
-            if await locator.count() == 0:
-                locator = page.locator(f"text={params['button_text']}")
-            if await locator.count() == 0:
+            target = await _find_clickable(page, params["button_text"])
+            if target is None:
+                seen = await controller.inspect(page)
                 return ToolResult.failure(
-                    f"No button matching '{params['button_text']}'. Visible: {before.buttons[:20]}",
+                    f"Nothing clickable matching '{params['button_text']}' was found (checked buttons, links, "
+                    f"tabs, text and iframes, waited ~6s). Buttons: {seen.buttons[:20]}. "
+                    f"Page: {seen.url}. Use inspect_page or capture_evidence, then retry with the exact visible text. "
+                    "Do NOT report this click as done.",
                     category="ELEMENT_NOT_FOUND",
                 )
-            await locator.first.click(timeout=10000)
+            await target.click(timeout=10000)
         except Exception as exc:
             text = str(exc).lower()
             if "captcha" in text:
@@ -295,6 +330,46 @@ class CaptureEvidenceTool(BaseTool):
         )
 
 
+class CloseSessionTool(BaseTool):
+    name = "browser_close"
+    version = "1.0.0"
+    description = (
+        "Close an open browser session (page, context and live view). Saves its cookies/login state first. "
+        "Use when the operator asks to stop/close the browser or the work in it is finished."
+    )
+    required_permissions = ["browser.interact"]
+    side_effect = SideEffect.WEB_INTERACTION
+    timeout_seconds = 30
+    is_idempotent = True
+    input_schema = {
+        "type": "object",
+        "properties": {"session_key": {"type": "string", "maxLength": 64}},
+        "required": ["session_key"],
+    }
+
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        key = normalize_session_key(params["session_key"])
+        reg = hub.browser_sessions
+        rec = reg.get(key)
+        open_keys = [k for k, r in reg.records.items() if not r.stopped]
+        if rec is None or rec.stopped:
+            return ToolResult.failure(
+                f"No open browser session named '{key}'. Open sessions: {open_keys or 'none'}.",
+                category="SESSION_MISSING",
+            )
+        # An operator driving the session by hand is not interrupted. Paused / waiting-for-human
+        # sessions CAN be closed (the operator asked), so the normal action gate is not used here.
+        reg._expire_lock(rec)
+        if rec.control is not None:
+            return ToolResult.needs_user("An operator has manual control of this browser session, so the agent will not close it.")
+        reg.mark_stopped(key, by_operator=False, reason="Closed by agent on request")
+        await controller.close_session(key)
+        return ToolResult.success(
+            data={"closed": key, "open_sessions": [k for k, r in reg.records.items() if not r.stopped]},
+            evidence={"authoritative": True, "kind": "session_closed", "session_key": key},
+        )
+
+
 def register_browser_tools(registry) -> None:
     registry.register_or_replace_many(
         [
@@ -303,5 +378,6 @@ def register_browser_tools(registry) -> None:
             ClickButtonTool(),
             FillFormTool(),
             CaptureEvidenceTool(),
+            CloseSessionTool(),
         ]
     )
