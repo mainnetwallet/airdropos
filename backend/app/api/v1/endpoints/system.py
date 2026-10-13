@@ -379,6 +379,14 @@ async def create_task(
         project_id=payload.project_id,
         owner_email=principal.email,
     )
+    # CREATED is not claimable: claim_next_task() selects READY/RETRYING only, so a task
+    # left here would never reach a worker. The request has already been validated
+    # (title length, priority range, authz), so queue it exactly as the agent chat and the
+    # create_task tool do. In the same transaction, so a failed audit cannot leave a
+    # half-queued task behind.
+    await manager.transition(
+        task, TaskStatus.READY, reason="Created via the task API; queued for the worker"
+    )
     await write_audit(db, principal, "TASK_CREATE", "task", task.task_id,
                       after_state={"title": task.title, "priority": task.priority})
     await db.commit()

@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -119,9 +119,14 @@ async def _verify_telegram_session(
 ) -> VerificationResult:
     """Check the Telegram user session the task depends on.
 
-    Reports the first concrete reason it is not usable. When Telethon and credentials are
-    present it performs the real authorisation check rather than inferring readiness from a
-    file being on disk.
+    Asks the WORKER, which is the process that owns the Telethon client, through the
+    gateway it already serves. This deliberately does not build a TelegramClient of its
+    own: two independent clients on the same SQLite session file contend for it, and
+    Telethon raises AuthKeyDuplicatedError when the same auth key is used twice at once.
+    Opening one here was a corruption risk, not a verification.
+
+    The configuration pre-checks below need no client at all and report the first concrete
+    reason the deployment is not ready.
     """
     from pathlib import Path
 
@@ -132,75 +137,166 @@ async def _verify_telegram_session(
         problems.append("TELEGRAM_USER_ENABLED is not set to true.")
     if not settings.TELEGRAM_API_ID or not settings.TELEGRAM_API_HASH:
         problems.append("TELEGRAM_API_ID or TELEGRAM_API_HASH is not configured.")
-    session_file = Path(f"{settings.TELEGRAM_SESSION_PATH}.session")
-    if not session_file.exists():
+    if not Path(f"{settings.TELEGRAM_SESSION_PATH}.session").exists():
         problems.append("No Telegram session file exists yet.")
-
-    try:
-        import telethon  # noqa: F401
-    except Exception:
-        problems.append("Telethon is not installed in this process.")
-        return VerificationResult.failed(
-            method="telegram_session_readiness",
-            outcome="Telegram is not ready: " + " ".join(problems),
-            question="Telethon is not installed on the server. Install it, then tell me to re-check.",
-        )
-
     if problems:
         return VerificationResult.failed(
             method="telegram_session_readiness",
             outcome="Telegram is not ready: " + " ".join(problems),
-            question="Telegram is not configured for this deployment. Can you confirm the intended Telegram account, or tell me to continue without it?",
+            question=(
+                "Telegram is not configured for this deployment. Can you confirm the intended "
+                "Telegram account, or tell me to continue without it?"
+            ),
         )
 
-    # Everything is configured and a session file exists. Ask Telethon directly.
+    # Configured. Ask the worker for the state of the client it actually holds.
+    from backend.app.live import client as gateway
+
     try:
-        from telethon import TelegramClient
-
-        client = TelegramClient(
-            settings.TELEGRAM_SESSION_PATH,
-            int(settings.TELEGRAM_API_ID),
-            str(settings.TELEGRAM_API_HASH),
+        payload = await gateway.get_json("/sessions/telegram/agent")
+    except gateway.GatewayUnavailable as exc:
+        return VerificationResult.unchecked(
+            method="telegram_worker_session",
+            outcome=f"The worker holding the Telegram session is not reachable ({exc}).",
+            question=(
+                "I cannot ask the worker whether the Telegram session is signed in, because it "
+                "is not reachable. Please tell me the sign-in state, or bring the worker back "
+                "and I will re-check."
+            ),
         )
-        try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                return VerificationResult.failed(
-                    method="telegram_is_user_authorized",
-                    outcome="The Telegram session file exists but the account is not authorised.",
-                    question="Please complete the Telegram sign-in for this session, then tell me to re-check.",
-                )
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+    except gateway.GatewayError as exc:
+        if exc.status == 404 or exc.code == "not_found":
+            # The worker has never used the account, so no client exists to authorise.
+            return VerificationResult.failed(
+                method="telegram_worker_session",
+                outcome="The worker has not opened the Telegram session yet.",
+                question=(
+                    "The agent has not signed in to Telegram yet. Please run the interactive "
+                    "Telegram sign-in, then tell me to re-check."
+                ),
+            )
+        return VerificationResult.unchecked(
+            method="telegram_worker_session",
+            outcome=f"The worker gateway returned {exc.status} ({exc.code}).",
+            question="I could not read the Telegram session state. Please tell me what the sign-in step reported.",
+        )
     except Exception as exc:
         return VerificationResult.unchecked(
-            method="telegram_is_user_authorized",
-            outcome=f"The Telegram session check could not complete: {type(exc).__name__}.",
+            method="telegram_worker_session",
+            outcome=f"The Telegram session check could not run: {type(exc).__name__}.",
+            question="I could not read the Telegram session state. Please tell me what the sign-in step reported.",
+        )
+
+    session = _extract_session(payload)
+    if session is None:
+        return VerificationResult.unchecked(
+            method="telegram_worker_session",
+            outcome="The worker gateway returned a response that is not a session object.",
+            question="I could not read the Telegram session state. Please tell me what the sign-in step reported.",
+        )
+
+    # The worker may report a session that is not the one we asked about.
+    if str(session.get("integration") or "") != "telegram" or str(session.get("key") or "agent") != "agent":
+        return VerificationResult.unchecked(
+            method="telegram_worker_session",
+            outcome="The gateway answered about a different session than the Telegram agent session.",
+            question="That session reference looks stale. Tell me which account you signed in, and I will re-check.",
+        )
+
+    status = str(session.get("status") or "").lower()
+    if status not in KNOWN_SESSION_STATUSES:
+        return VerificationResult.unchecked(
+            method="telegram_worker_session",
+            outcome=f"The worker reported an unfamiliar Telegram session status '{status}'.",
+            question="I do not recognise that session state, so I will not guess. Please tell me the sign-in state.",
+        )
+
+    if status == SESSION_STOPPED:
+        return VerificationResult.failed(
+            method="telegram_worker_session",
+            outcome="The Telegram session was stopped by an operator.",
+            question="The Telegram session is stopped. Please resume it from Live Broadcast, then tell me to re-check.",
+        )
+    if status == SESSION_PAUSED:
+        return VerificationResult.failed(
+            method="telegram_worker_session",
+            outcome="The Telegram session is paused by an operator.",
+            question="The Telegram session is paused. Please resume it, then tell me to re-check.",
+        )
+    if status == SESSION_WAITING:
+        reason = str((session.get("status_detail") or "") or "the session is waiting")
+        return VerificationResult.failed(
+            method="telegram_worker_session",
+            outcome=f"The Telegram session is still waiting: {reason}",
+            question="The Telegram session is still waiting on something. Please finish that, then tell me to re-check.",
+        )
+
+    # Status alone is not authorisation. The worker's own client must report a live
+    # connection; that is the strongest signal available without opening a second client.
+    meta = session.get("meta")
+    connected = meta.get("connected") if isinstance(meta, dict) else None
+    if connected is not True:
+        return VerificationResult.failed(
+            method="telegram_worker_session",
+            outcome=(
+                "The worker reports no live Telegram connection"
+                if connected is False
+                else "The worker did not report a Telegram connection state"
+            ),
             question=(
-                "I could not reach Telegram to confirm the session. Please confirm the account is "
-                "signed in, or tell me what the sign-in step reported."
+                "The agent's Telegram client is not connected. Please run the interactive "
+                "Telegram sign-in, then tell me to re-check."
             ),
         )
 
     return VerificationResult.satisfied(
-        method="telegram_is_user_authorized",
-        outcome="Telegram reported the session is connected and authorised.",
+        method="telegram_worker_session",
+        outcome="The worker's Telegram client reports a live connection with status 'running'.",
+        status=status,
     )
 
 
 # ----------------------------------------------------------------------
 # Browser / live sessions
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Gateway session shape
+# ----------------------------------------------------------------------
+# The worker gateway answers GET /sessions/{integration}/{key} with a WRAPPER:
+#   {"session": {"id": ..., "integration": ..., "key": ..., "status": ..., "waiting": ...}}
+# `status` is a live.models.SessionStatus value. Only RUNNING means the session is usable;
+# everything else is either still blocked or gone.
+SESSION_OK = "running"
+SESSION_WAITING = "waiting_for_user"
+SESSION_STOPPED = "stopped"
+SESSION_FAILED = "failed"
+SESSION_PAUSED = "paused"
+KNOWN_SESSION_STATUSES = frozenset(
+    {SESSION_OK, SESSION_WAITING, SESSION_STOPPED, SESSION_FAILED, SESSION_PAUSED}
+)
+
+
+def _extract_session(payload: Any) -> Optional[Dict[str, Any]]:
+    """Pull the session out of the gateway response, or None if the shape is wrong.
+
+    Strict on purpose. A response we do not understand must never be read as an active
+    session, because that is how a task gets resumed while the human is still waiting.
+    """
+    if not isinstance(payload, dict):
+        return None
+    inner = payload.get("session", payload)
+    if not isinstance(inner, dict):
+        return None
+    return inner
+
+
 async def _verify_live_session(
     db: AsyncSession, task: Task, request: InterventionRequest
 ) -> VerificationResult:
-    """Check the live browser session that is holding this task up.
+    """Check the live session that is holding this task up.
 
-    Uses the existing gateway client the live pages already read from. If the gateway is not
-    reachable this returns "unchecked" rather than assuming the session is fine.
+    Asks the worker that owns the session. If the gateway is unreachable, or answers
+    something we do not recognise, the result is inconclusive rather than a silent pass.
     """
     from backend.app.live import client as gateway
 
@@ -214,33 +310,101 @@ async def _verify_live_session(
         )
 
     try:
-        session = await gateway.get_json(f"/sessions/{integration}/{key}")
-    except gateway.GatewayUnavailable:
+        payload = await gateway.get_json(f"/sessions/{integration}/{key}")
+    except gateway.GatewayUnavailable as exc:
         return VerificationResult.unchecked(
             method="live_session_state",
-            outcome="The worker gateway is not reachable, so the session cannot be inspected.",
+            outcome=f"The worker gateway is not reachable, so the session cannot be inspected ({exc}).",
             question="I cannot inspect the live session right now. Please tell me whether the step you were asked to do is now complete.",
         )
+    except gateway.GatewayError as exc:
+        # A session the worker says does not exist is a definite negative, not an unknown.
+        if exc.status == 404 or exc.code == "not_found":
+            return VerificationResult.failed(
+                method="live_session_state",
+                outcome=f"That {integration} session is no longer running.",
+                question="That session has ended. Please start it again, or tell me to continue this task another way.",
+            )
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome=f"The worker gateway returned {exc.status} ({exc.code}).",
+            question="I could not read the session state. Please tell me what you saw on that page.",
+        )
+    except Exception as exc:
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome=f"The session check could not run: {type(exc).__name__}.",
+            question="I could not read the session state. Please tell me what you saw on that page.",
+        )
 
-    waiting = session.get("waiting") or None
-    if waiting:
-        reason = str(waiting.get("reason") or "the session is still waiting for you")
+    session = _extract_session(payload)
+    if session is None:
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome="The gateway returned a response that is not a session object.",
+            question="I could not read the session state. Please tell me what you saw on that page.",
+        )
+
+    # Identity: a stale reference must not be satisfied by some other session's state.
+    returned_key = session.get("key")
+    returned_integration = session.get("integration")
+    if returned_key is not None and str(returned_key) != key:
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome=f"The gateway answered about session '{returned_key}', not '{key}'.",
+            question="That session reference looks stale. Tell me which session you worked in, and I will re-check.",
+        )
+    if returned_integration is not None and str(returned_integration) != integration:
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome=f"The gateway answered about integration '{returned_integration}', not '{integration}'.",
+            question="That session reference looks stale. Tell me which session you worked in, and I will re-check.",
+        )
+
+    status = session.get("status")
+    if not isinstance(status, str) or not status:
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome="The gateway did not report a session status.",
+            question="I could not confirm the session is usable. Please tell me whether the page is showing the completed step.",
+        )
+    status = status.lower()
+    if status not in KNOWN_SESSION_STATUSES:
+        return VerificationResult.unchecked(
+            method="live_session_state",
+            outcome=f"The gateway reported an unfamiliar session status '{status}'.",
+            question="I do not recognise that session state, so I will not guess. Please tell me what you see on that page.",
+        )
+
+    waiting = session.get("waiting")
+    if status == SESSION_WAITING or isinstance(waiting, dict):
+        reason = ""
+        if isinstance(waiting, dict):
+            reason = str(waiting.get("reason") or "")
+        if not reason:
+            reason = str(session.get("status_detail") or "") or "the session is still waiting for you"
         return VerificationResult.failed(
             method="live_session_state",
             outcome=f"The session is still waiting: {reason}",
             question="That session still reports it is waiting. Please finish the step it is asking for, then tell me to re-check.",
         )
-    if session.get("status") in ("stopped", "failed"):
+    if status in (SESSION_STOPPED, SESSION_FAILED):
         return VerificationResult.failed(
             method="live_session_state",
-            outcome=f"The session is {session.get('status')}.",
-            question="That session has ended. Tell me whether to restart it or continue this task another way.",
+            outcome=f"The session is {status}.",
+            question="That session has ended. Please start it again, or tell me to continue this task another way.",
+        )
+    if status == SESSION_PAUSED:
+        return VerificationResult.failed(
+            method="live_session_state",
+            outcome="The session is paused.",
+            question="That session is paused. Please resume it, then tell me to re-check.",
         )
 
     return VerificationResult.satisfied(
         method="live_session_state",
-        outcome=f"The {integration} session reports no outstanding verification.",
-        status=session.get("status"),
+        outcome=f"The {integration} session reports status '{status}' with no outstanding verification.",
+        status=status,
     )
 
 

@@ -66,6 +66,29 @@ def upgrade() -> None:
     tables = set(inspector.get_table_names())
 
     # ------------------------------------------------------------------
+    # 0. users.telegram_user_id
+    # ------------------------------------------------------------------
+    # Declared on the model and written by the auth layer, but revision 1 never created it,
+    # so any database built through the migration chain could not insert a user at all.
+    if "users" in tables and not _has_column("users", "telegram_user_id"):
+        op.add_column("users", sa.Column("telegram_user_id", sa.Integer(), nullable=True))
+        if "ix_users_telegram_user_id" not in {
+            ix["name"] for ix in inspector.get_indexes("users")
+        }:
+            op.create_index("ix_users_telegram_user_id", "users", ["telegram_user_id"])
+
+    # ------------------------------------------------------------------
+    # 0b. user_sessions.updated_at
+    # ------------------------------------------------------------------
+    # Inherited from Base on the model and written by the auth layer on every session
+    # update, but never created. Without it no session can be inserted or touched, so a
+    # chain-built database could not authenticate anyone.
+    if "user_sessions" in tables and not _has_column("user_sessions", "updated_at"):
+        op.add_column(
+            "user_sessions", sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True)
+        )
+
+    # ------------------------------------------------------------------
     # 1. wallets: the key-material columns the management API writes.
     # ------------------------------------------------------------------
     # Written as literal calls rather than a loop over a table of names. A loop
@@ -173,6 +196,14 @@ def upgrade() -> None:
 def downgrade() -> None:
     inspector = sa.inspect(op.get_bind())
     tables = set(inspector.get_table_names())
+
+    if "users" in tables and _has_column("users", "telegram_user_id"):
+        if "ix_users_telegram_user_id" in {ix["name"] for ix in inspector.get_indexes("users")}:
+            op.drop_index("ix_users_telegram_user_id", table_name="users")
+        op.drop_column("users", "telegram_user_id")
+
+    if "user_sessions" in tables and _has_column("user_sessions", "updated_at"):
+        op.drop_column("user_sessions", "updated_at")
 
     if "memory_records" in tables:
         for name in (

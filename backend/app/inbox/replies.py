@@ -60,6 +60,20 @@ _CANCEL_PATTERNS = (
     r"\bstop this\b",
     r"\bcancel it\b",
     r"\bdo not (?:run|execute) (?:this|the) task\b",
+    # Bengali: "stop it", "cancel it", "halt".
+    r"বন্ধ\s*কর(?:ো|ুন)",
+    r"বাতিল\s*কর(?:ো|ুন)",
+    r"রদ\s*কর(?:ো|ুন)",
+    r"থাম(?:াও|ান)",
+)
+
+# A negation governing the instruction. Checked BEFORE the cancellation patterns, because
+# "do not stop this task, I fixed it" is the opposite of a cancellation and used to cancel.
+_NEGATION_PATTERNS = (
+    r"\b(?:do not|don'?t|do n[o']t|never|no need to)\s+(?:stop|cancel|abort|kill)\b",
+    r"\bstop\s+no\b",
+    # Bengali negation before a stop verb: "don't stop it".
+    r"(?:করবেন\s*না|করো\s*না|বন্ধ\s*করবেন\s*না|বন্ধ\s*করো\s*না)\s*",
 )
 
 # Explicit authorisation. Required for operator pauses, approvals and ambiguous instructions.
@@ -70,6 +84,15 @@ _AUTHORISE_PATTERNS = (
     r"\byes[, ]+resume\b",
     r"\bgo ahead (?:and|with) resume\b",
     r"\bproceed (?:with|to) (?:this|the) task\b",
+    # Bengali. A verb is required, exactly as in English: a bare "হ্যাঁ" ("yes") on its own
+    # is informational and must not restart a task somebody deliberately stopped.
+    r"এখন\s*চালাও",
+    r"চালিয়ে\s*দ(?:াও|েন)",
+    r"শুরু\s*কর(?:ো|ুন)",
+    r"এগিয়ে\s*য(?:াও|ান)",
+    r"সম্পন্ন\s*কর(?:ো|ুন)",
+    r"রিজিউম\s*কর(?:ো|ুন)",
+    r"চালু\s*কর(?:ো|ুন)",
 )
 
 # Directives that change the task's direction rather than clear its blocker.
@@ -77,6 +100,8 @@ _CLARIFICATION_PATTERNS = (
     r"\buse (?P<target>[a-z0-9 \-]{2,40}?)(?: instead| rather)\b",
     r"\bswitch to (?P<target>[a-z0-9 \-]{2,40}?)(?: instead)?\b",
     r"\bchange (?:the )?network to (?P<target>[a-z0-9 \-]{2,40}?)(?: instead)?\b",
+    # Bengali: "use <network> now".
+    r"(?:ব্যবহার\s*কর(?:ো|ুন)|ব্যবহার\s*করে)",
 )
 
 _NETWORK_HINT = re.compile(
@@ -88,6 +113,17 @@ _NETWORK_HINT = re.compile(
 
 def _matches(patterns, text: str) -> bool:
     return any(re.search(p, text) for p in patterns)
+
+
+def _is_cancellation(text: str) -> bool:
+    """Whether this reply cancels the task.
+
+    A negation governs the instruction: "do not stop this task" is the opposite of a
+    cancellation, and treating it as one destroys work the operator wanted kept.
+    """
+    if _matches(_NEGATION_PATTERNS, text):
+        return False
+    return _matches(_CANCEL_PATTERNS, text)
 
 
 @dataclass
@@ -226,7 +262,7 @@ class ReplyRouter:
             )
 
         # --- Explicit cancellation, scoped to this task only. -------------------
-        if _matches(_CANCEL_PATTERNS, normalise_reply(body)):
+        if _is_cancellation(normalise_reply(body)):
             return await self._cancel(conversation, task, owner_email, base)
 
         # --- A note with no open blocker: record it, change nothing. ------------
@@ -547,15 +583,26 @@ class ReplyRouter:
 
     # ------------------------------------------------------------------
     def _extract_clarification(self, body: str) -> Optional[str]:
-        """Pull a concrete 'use X instead' instruction out of a reply, if there is one."""
+        """Pull a concrete 'use X instead' instruction out of a reply, if there is one.
+
+        Bengali is handled alongside English because the operator may write in either.
+        The network is read from the same allow-list either way, so an unfamiliar word is
+        never adopted as an instruction.
+        """
+        normalised = normalise_reply(body)
         for pattern in _CLARIFICATION_PATTERNS:
-            match = re.search(pattern, normalise_reply(body))
+            match = re.search(pattern, normalised)
             if not match:
                 continue
             target = (match.groupdict().get("target") or "").strip()
             if target and _NETWORK_HINT.search(target):
                 return target
-        if _NETWORK_HINT.search(body) and _matches(_CLARIFICATION_PATTERNS, normalise_reply(body)):
+            if not target:
+                # A bare Bengali "use ..." verb: the network comes from the allow-list.
+                hint = _NETWORK_HINT.search(body)
+                if hint:
+                    return hint.group(0)
+        if _NETWORK_HINT.search(body) and _matches(_CLARIFICATION_PATTERNS, normalised):
             hint = _NETWORK_HINT.search(body)
             return hint.group(0) if hint else None
         return None

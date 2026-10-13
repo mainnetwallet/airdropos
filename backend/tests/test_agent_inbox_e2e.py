@@ -156,8 +156,11 @@ async def test_a_blocked_task_resumes_itself_after_one_good_reply(env, telegram)
     async with made() as db:
         blocked = await TaskManager(db).get_by_task_id(blocked_id)
         other = await TaskManager(db).get_by_task_id(other_id)
-        await TaskManager(db).transition(blocked, TaskStatus.READY, reason="queued")
-        await TaskManager(db).transition(other, TaskStatus.READY, reason="queued")
+        # Both arrive READY from the API now; the worker only has to claim them.
+        assert blocked.status == TaskStatus.READY.value, (
+            "an API-created task must arrive queued for the worker"
+        )
+        assert other.status == TaskStatus.READY.value
         await TaskManager(db).transition(blocked, TaskStatus.IN_PROGRESS, reason="claimed by worker")
         await TaskManager(db).transition(other, TaskStatus.IN_PROGRESS, reason="claimed by worker")
         await db.commit()

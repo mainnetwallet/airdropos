@@ -17,6 +17,19 @@ down_revision = None
 branch_labels = None
 depends_on = None
 
+# Tables that carry `updated_at` and get a trigger to keep it current.
+_TABLES_WITH_UPDATED_AT = [
+    "users", "user_sessions", "projects", "goals", "tasks", "wallets",
+    "blockchain_transactions", "transaction_receipts", "airdrop_campaigns",
+    "campaign_sources", "wallet_eligibility", "claim_records", "tools",
+    "tool_executions", "generated_adapters", "execution_plans", "plan_revisions",
+    "execution_leases", "learning_records", "improvement_proposals", "audit_logs",
+    "system_settings", "automation_schedules", "scheduled_runs", "notifications",
+    "notification_deliveries", "integration_health", "diagnostic_records",
+    "world_state_observations", "source_claims", "change_observations",
+    "failure_records", "resource_usage", "planning_runs", "agent_conversations",
+]
+
 
 def upgrade() -> None:
     # Create all tables in dependency order
@@ -41,7 +54,7 @@ def upgrade() -> None:
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("ip_address", sa.String(255)),
         sa.Column("user_agent", sa.String(500)),
-        sa.Column("scopes", postgresql.ARRAY(sa.String()), nullable=True),
+        sa.Column("scopes", postgresql.JSONB, nullable=True),
         sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
@@ -66,7 +79,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(50), nullable=False, default="ACTIVE"),
         sa.Column("progress", sa.Float(), nullable=False, default=0.0),
         sa.Column("next_planned_action", sa.Text),
-        sa.Column("current_blockers", postgresql.ARRAY(sa.Text)),
+        sa.Column("current_blockers", postgresql.JSONB),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
     )
@@ -87,9 +100,9 @@ def upgrade() -> None:
         sa.Column("actual_cost_usd", sa.Float(), nullable=False, default=0.0),
         sa.Column("next_execution_at", sa.DateTime(timezone=True)),
         sa.Column("deadline_at", sa.DateTime(timezone=True)),
-        sa.Column("planned_actions", postgresql.ARRAY(sa.JSONB), nullable=True),
-        sa.Column("completed_actions", postgresql.ARRAY(sa.JSONB), nullable=True),
-        sa.Column("failed_actions", postgresql.ARRAY(sa.JSONB), nullable=True),
+        sa.Column("planned_actions", postgresql.JSONB, nullable=True),
+        sa.Column("completed_actions", postgresql.JSONB, nullable=True),
+        sa.Column("failed_actions", postgresql.JSONB, nullable=True),
         sa.Column("verified", sa.Boolean(), nullable=False, default=False),
         sa.Column("evidence_count", sa.Integer(), nullable=False, default=0),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
@@ -103,7 +116,7 @@ def upgrade() -> None:
         sa.Column("label", sa.String(255), nullable=False),
         sa.Column("address", sa.String(255), nullable=False),
         sa.Column("chain_type", sa.String(50), nullable=False),
-        sa.Column("supported_networks", postgresql.ARRAY(sa.String)),  # e.g., ["ethereum", "arbitrum"]
+        sa.Column("supported_networks", postgresql.JSONB),  # e.g., ["ethereum", "arbitrum"]
         sa.Column("is_active", sa.Boolean(), nullable=False, default=True),
         sa.Column("is_locked", sa.Boolean(), nullable=False, default=True),
         sa.Column("total_spent_usd", sa.Float(), nullable=False, default=0.0),
@@ -226,7 +239,7 @@ def upgrade() -> None:
         sa.Column("category", sa.String(50)),
         sa.Column("input_schema", postgresql.JSONB, nullable=False),
         sa.Column("output_schema", postgresql.JSONB, nullable=False),
-        sa.Column("required_permissions", postgresql.ARRAY(sa.String)),
+        sa.Column("required_permissions", postgresql.JSONB),
         sa.Column("side_effect", sa.String(50)),
         sa.Column("is_active", sa.Boolean(), nullable=False, default=True),
         sa.Column("is_idempotent", sa.Boolean(), nullable=False, default=True),
@@ -262,7 +275,7 @@ def upgrade() -> None:
         sa.Column("source_code", sa.Text, nullable=False),
         sa.Column("input_schema", postgresql.JSONB, nullable=False),
         sa.Column("output_schema", postgresql.JSONB, nullable=False),
-        sa.Column("required_permissions", postgresql.ARRAY(sa.String)),
+        sa.Column("required_permissions", postgresql.JSONB),
         sa.Column("side_effect", sa.String(50)),
         sa.Column("is_active", sa.Boolean(), nullable=False, default=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
@@ -297,9 +310,9 @@ def upgrade() -> None:
         sa.Column("to_revision", sa.Integer(), nullable=False),
         sa.Column("trigger_category", sa.String(50)),
         sa.Column("reason", sa.Text),
-        sa.Column("added_steps", postgresql.ARRAY(sa.String)),
-        sa.Column("removed_steps", postgresql.ARRAY(sa.String)),
-        sa.Column("modified_steps", postgresql.ARRAY(sa.String)),
+        sa.Column("added_steps", postgresql.JSONB),
+        sa.Column("removed_steps", postgresql.JSONB),
+        sa.Column("modified_steps", postgresql.JSONB),
         sa.Column("preserved_irreversible_step_ids", postgresql.JSONB),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.ForeignKeyConstraint(["plan_id"], ["execution_plans.id"]),
@@ -361,8 +374,8 @@ def upgrade() -> None:
         sa.Column("description", sa.Text, nullable=False),
         sa.Column("status", sa.String(50), nullable=False, default="DRAFT"),
         sa.Column("security_review_required", sa.Boolean(), nullable=False, default=False),
-        sa.Column("affected_files", postgresql.ARRAY(sa.String)),
-        sa.Column("required_tests", postgresql.ARRAY(sa.String)),
+        sa.Column("affected_files", postgresql.JSONB),
+        sa.Column("required_tests", postgresql.JSONB),
         sa.Column("branch_name", sa.String(100)),
         sa.Column("rollback_plan", sa.Text),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
@@ -428,7 +441,7 @@ def upgrade() -> None:
         sa.Column("severity", sa.String(50), nullable=False, default="INFO"),
         sa.Column("channel", sa.String(50), nullable=False),
         sa.Column("status", sa.String(50), nullable=False, default="PENDING"),
-        sa.Column("delivered_to", postgresql.ARRAY(sa.String)),
+        sa.Column("delivered_to", postgresql.JSONB),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
     )
@@ -599,55 +612,69 @@ def upgrade() -> None:
     op.create_index("ix_planning_runs_task_id", "planning_runs", ["task_id"])
     op.create_index("ix_agent_conversations_task_id", "agent_conversations", ["task_id"])
 
-    # Create trigger for updated_at
-    op.execute("""
-        CREATE OR REPLACE FUNCTION update_updated_at_column()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            NEW.updated_at = now();
-            RETURN NEW;
-        END;
-        $$ language 'plpgsql';
-    """)
-
-    # Attach trigger to all tables with updated_at
-    tables_with_updated_at = [
-        "users", "user_sessions", "projects", "goals", "tasks", "wallets",
-        "blockchain_transactions", "transaction_receipts", "airdrop_campaigns",
-        "campaign_sources", "wallet_eligibility", "claim_records", "tools",
-        "tool_executions", "generated_adapters", "execution_plans", "plan_revisions",
-        "execution_leases", "learning_records", "improvement_proposals", "audit_logs",
-        "system_settings", "automation_schedules", "scheduled_runs", "notifications",
-        "notification_deliveries", "integration_health", "diagnostic_records",
-        "world_state_observations", "source_claims", "change_observations",
-        "failure_records", "resource_usage", "planning_runs", "agent_conversations"
+    # Keep `updated_at` current with a database trigger.
+    #
+    # PostgreSQL gets a plpgsql trigger; SQLite has no plpgsql, so it gets an equivalent
+    # trigger written in its own dialect, rather than being silently left without one.
+    # SQLite is a supported backend (run.py --sqlite).
+    #
+    # The list above is a superset: some of those tables (`user_sessions`, for one) are
+    # declared without an `updated_at` column at all. A trigger referencing a column that
+    # does not exist is rejected outright by PostgreSQL and poisons later DDL on SQLite,
+    # so the real schema is consulted instead of trusting the list.
+    inspector = sa.inspect(op.get_bind())
+    existing_tables = set(inspector.get_table_names())
+    targets = [
+        table
+        for table in _TABLES_WITH_UPDATED_AT
+        if table in existing_tables
+        and "updated_at" in {c["name"] for c in inspector.get_columns(table)}
     ]
 
-    for table in tables_with_updated_at:
-        op.execute(f"""
-            CREATE TRIGGER trigger_{table}_updated_at
-            BEFORE UPDATE ON {table}
-            FOR EACH ROW
-            EXECUTE FUNCTION update_updated_at_column();
+    if op.get_bind().dialect.name == "postgresql":
+        op.execute("""
+            CREATE OR REPLACE FUNCTION update_updated_at_column()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = now();
+                RETURN NEW;
+            END;
+            $$ language 'plpgsql';
         """)
+
+        for table in targets:
+            op.execute(f"""
+                CREATE TRIGGER trigger_{table}_updated_at
+                BEFORE UPDATE ON {table}
+                FOR EACH ROW
+                EXECUTE FUNCTION update_updated_at_column();
+            """)
+    else:
+        for table in targets:
+            op.execute(f"""
+                CREATE TRIGGER trigger_{table}_updated_at
+                AFTER UPDATE ON {table}
+                FOR EACH ROW
+                WHEN NEW.updated_at = OLD.updated_at
+                BEGIN
+                    UPDATE {table} SET updated_at = CURRENT_TIMESTAMP WHERE rowid = NEW.rowid;
+                END;
+            """)
 
 
 def downgrade() -> None:
-    # Drop triggers
-    for table in [
-        "users", "user_sessions", "projects", "goals", "tasks", "wallets",
-        "blockchain_transactions", "transaction_receipts", "airdrop_campaigns",
-        "campaign_sources", "wallet_eligibility", "claim_records", "tools",
-        "tool_executions", "generated_adapters", "execution_plans", "plan_revisions",
-        "execution_leases", "learning_records", "improvement_proposals", "audit_logs",
-        "system_settings", "automation_schedules", "scheduled_runs", "notifications",
-        "notification_deliveries", "integration_health", "diagnostic_records",
-        "world_state_observations", "source_claims", "change_observations",
-        "failure_records", "resource_usage", "planning_runs", "agent_conversations"
-    ]:
-        op.execute(f"DROP TRIGGER IF EXISTS trigger_{table}_updated_at ON {table}")
+    # Drop triggers, tolerating ones that cannot be parsed because the table they were
+    # attached to has since been rebuilt without the column they referenced.
+    for table in _TABLES_WITH_UPDATED_AT:
+        try:
+            op.execute(f"DROP TRIGGER IF EXISTS trigger_{table}_updated_at ON {table}")
+        except Exception:
+            pass
 
-    op.execute("DROP FUNCTION IF EXISTS update_updated_at_column()")
+    try:
+        op.execute("DROP FUNCTION IF EXISTS update_updated_at_column()")
+    except Exception:
+        pass
 
     # Drop indexes
     op.drop_index("ix_agent_conversations_task_id", table_name="agent_conversations")
