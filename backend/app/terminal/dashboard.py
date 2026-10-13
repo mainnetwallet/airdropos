@@ -287,9 +287,14 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
     # Once, immediately before the first frame. Nothing is printed after this.
     take_over_screen(console)
     try:
+        # screen=True draws on the terminal's alternate screen. Redrawing in the normal
+        # buffer made Windows consoles push the whole dashboard down a line on every
+        # frame (flicker, a growing scrollbar). The alternate screen cannot scroll, and
+        # the terminal's previous contents come back when the dashboard exits.
         with Live(
             console=console,
             auto_refresh=False,
+            screen=True,
             vertical_overflow="crop",
             transient=False,
             refresh_per_second=8,
@@ -303,7 +308,9 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                 width, height = console.size
                 # -1 keeps the render off the last column so a wide terminal
                 # does not wrap the right border onto the next line.
-                live.update(build(state, max(60, width - 1), max(24, height)), refresh=True)
+                # One row less than the window: a frame exactly as tall as the window
+                # leaves the cursor on a new line, which scrolls the screen by one.
+                live.update(build(state, max(60, width - 1), max(24, height - 1)), refresh=True)
                 await _sleep(stop, 1.0)
     finally:
         _clear_ready()

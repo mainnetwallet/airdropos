@@ -5,6 +5,12 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (terminal dashboard)
+- **The terminal dashboard shifted down and flickered every second on Windows.** It was
+  redrawn in the normal screen buffer, and a frame as tall as the window leaves the cursor
+  on a new line, so each redraw scrolled the screen by one row and piled copies into the
+  scrollbar. It now runs on the terminal's alternate screen (which cannot scroll; the
+  previous contents return on exit) and renders one row shorter than the window.
 ### Added (live terminal dashboard)
 - **`py run.py` now opens one live terminal dashboard.** It shows the AirdropOS header
   and version, environment/model/endpoint, four system-status cards (backend API,
