@@ -5,6 +5,20 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed (terminal dashboard)
+- **The dashboard now adapts to any terminal size instead of being cut off.** Making the
+  window smaller used to crop the bottom panels and truncate text (`Frontend (V…`,
+  `Runni…`). The layout is now planned from the real width and height on every frame:
+  width picks three, two or one column; height is shared out by priority, so the system
+  status and scheduler keep their space and the activity feed takes what is left. A
+  section that is short on rows switches to a smaller form (cards, then a list, then a
+  one-line strip), a list that does not fit ends in `… +N more`, and sections that cannot
+  fit at all are dropped instead of being half-drawn. Frames are exactly as tall as the
+  window and never wider, and the right-hand panels line up from top to bottom.
+- Fixed while doing this: the task counts (`0`) and the `RUNNING` pill were cut off at
+  smaller heights, the compact subtitle lost its word gaps (`AUTONOMOUSAIRDROPAGENT`),
+  and the configuration panel squeezed its labels (`Model End…`) when the endpoint was
+  long. The Emergency Stop row is always the last one dropped from a short panel.
 ### Fixed (terminal dashboard)
 - **The terminal dashboard shifted down and flickered every second on Windows.** It was
   redrawn in the normal screen buffer, and a frame as tall as the window leaves the cursor

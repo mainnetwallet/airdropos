@@ -310,7 +310,7 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                 # does not wrap the right border onto the next line.
                 # One row less than the window: a frame exactly as tall as the window
                 # leaves the cursor on a new line, which scrolls the screen by one.
-                live.update(build(state, max(60, width - 1), max(24, height - 1)), refresh=True)
+                live.update(build(state, max(30, width - 1), max(6, height - 1)), refresh=True)
                 await _sleep(stop, 1.0)
     finally:
         _clear_ready()
