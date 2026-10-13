@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest
 import pytest_asyncio
@@ -45,6 +45,7 @@ from backend.app.models import (
     AgentConversation,
     Base,
     ConversationMessage,
+    Task,
     InterventionRequest,
     TaskCheckpoint,
     User,
@@ -1142,6 +1143,730 @@ class TestCheckpointReuse:
             request = await InterventionService(db).active_for_task(task.id)
             assert request is not None
             assert request.reason_code == OPERATOR_PAUSE
+
+
+# ======================================================================
+# Shared helpers for the sections below
+# ======================================================================
+async def _running_task(factory, *, owner: str = OPERATOR_A) -> str:
+    """A task already claimed by a worker, i.e. one that can hit a blocking condition."""
+    async with factory() as db:
+        task = await TaskManager(db).create_task(
+            title=f't{uuid.uuid4().hex[:6]}', description='d', owner_email=owner
+        )
+        await TaskManager(db).transition(task, TaskStatus.READY, reason='queued')
+        await TaskManager(db).transition(task, TaskStatus.IN_PROGRESS, reason='claimed')
+        await db.commit()
+        return task.task_id
+
+
+# ======================================================================
+# Task creation actually reaches the worker queue
+# ======================================================================
+class TestApiCreatedTasksAreClaimable:
+    @pytest.mark.asyncio
+    async def test_api_created_task_is_actually_claimable(self, factory, operator_a):
+        """The task the API accepts must reach the worker queue.
+
+        Fails on 9badc41: POST /api/v1/tasks persists CREATED and never transitions, while
+        claim_next_task() only selects READY/RETRYING, so the task sits forever.
+        """
+        async with _client(operator_a) as client:
+            created = await client.post(
+                "/api/v1/tasks", json={"title": "API created", "description": "x"}
+            )
+        assert created.status_code == 201, created.text
+        task_id = created.json()["task_id"]
+
+        async with factory() as db:
+            task = await TaskManager(db).get_by_task_id(task_id)
+            assert task.status != TaskStatus.CREATED.value, (
+                f"an accepted task is left in {task.status} and no worker will ever claim it"
+            )
+
+        async with factory() as db:
+            claimed = await TaskManager(db).claim_next_task("worker-a")
+            assert claimed is not None, "no worker could claim an API-created task"
+            assert claimed.task_id == task_id
+            assert claimed.status == TaskStatus.IN_PROGRESS.value
+
+    @pytest.mark.asyncio
+    async def test_two_workers_cannot_claim_the_same_api_task(self, factory, operator_a):
+        async with _client(operator_a) as client:
+            created = await client.post("/api/v1/tasks", json={"title": "Only once"})
+        task_id = created.json()["task_id"]
+
+        async with factory() as db:
+            first = await TaskManager(db).claim_next_task("worker-a")
+            second = await TaskManager(db).claim_next_task("worker-b")
+            await db.commit()
+        assert first is not None and first.task_id == task_id
+        assert second is None, "the same task was claimed twice"
+
+    @pytest.mark.asyncio
+    async def test_manager_still_creates_unqueued_so_other_paths_can_validate(self, factory):
+        """Regression guard on the contract the agent chat and create_task tool rely on.
+
+        Those two paths call TaskManager.create_task and then queue the task themselves,
+        after their own validation. The fix must NOT change create_task's default status,
+        or they would be creating an already-queued task and their transition would fail.
+        """
+        async with factory() as db:
+            task = await TaskManager(db).create_task(
+                title="raw manager creation", description="d", owner_email=OPERATOR_A
+            )
+            assert task.status == TaskStatus.CREATED.value, (
+                "create_task now pre-queues tasks, which breaks the chat and tool paths"
+            )
+            # The caller queues it, which is what they already do.
+            await TaskManager(db).transition(task, TaskStatus.READY, reason="queued for the worker")
+            await db.commit()
+        async with factory() as db:
+            claimed = await TaskManager(db).claim_next_task("w")
+            assert claimed is not None and claimed.status == TaskStatus.IN_PROGRESS.value
+
+    @pytest.mark.asyncio
+    async def test_invalid_task_is_never_created_or_runnable(self, factory, operator_a):
+        """An unvalidated task must not reach the queue at all."""
+        async with _client(operator_a) as client:
+            bad_priority = await client.post(
+                "/api/v1/tasks", json={"title": "bad", "priority": 99}
+            )
+            empty_title = await client.post("/api/v1/tasks", json={"title": ""})
+        assert bad_priority.status_code == 422
+        assert empty_title.status_code == 422
+
+        async with factory() as db:
+            assert await TaskManager(db).claim_next_task("w") is None
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_creation_is_refused(self, factory):
+        async with _client(None) as client:
+            assert (await client.post("/api/v1/tasks", json={"title": "nope"})).status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_ownership_is_recorded_so_the_inbox_can_scope_it(self, factory, operator_a):
+        async with _client(operator_a) as client:
+            created = await client.post("/api/v1/tasks", json={"title": "owned"})
+        async with factory() as db:
+            task = await TaskManager(db).get_by_task_id(created.json()["task_id"])
+            assert task.owner_email == OPERATOR_A
+
+    @pytest.mark.asyncio
+    async def test_a_failed_creation_persists_nothing(self, factory, operator_a):
+        """A rejected creation must leave no runnable task behind."""
+        async with factory() as db:
+            before = await db.scalar(select(Task))
+            assert before is None
+        async with _client(operator_a) as client:
+            await client.post("/api/v1/tasks", json={"title": ""})
+        async with factory() as db:
+            assert await db.scalar(select(Task)) is None
+            assert await TaskManager(db).claim_next_task("w") is None
+
+
+# ======================================================================
+# Live session verification never claims more than it checked
+# ======================================================================
+def _gateway_session(status: str, *, waiting: Any = None, key: str = "p1", integration: str = "browser") -> Dict[str, Any]:
+    """The exact shape the worker gateway returns: a {"session": ...} wrapper."""
+    return {
+        "session": {
+            "id": f"{integration}:{key}",
+            "integration": integration,
+            "key": key,
+            "status": status,
+            "status_detail": None,
+            "waiting": waiting,
+            "task": None,
+            "meta": {"connected": True},
+        }
+    }
+
+
+class TestLiveSessionVerification:
+    """Every case below is a distinct way the old verifier could claim success wrongly."""
+
+    @staticmethod
+    def _install(monkeypatch, payload):
+        calls: List[str] = []
+
+        async def _get(path, params=None):
+            calls.append(path)
+            if isinstance(payload, Exception):
+                raise payload
+            return payload
+
+        monkeypatch.setattr("backend.app.live.client.get_json", _get)
+        return calls
+
+    @staticmethod
+    def _request():
+        class _R:
+            reason_code = "HUMAN_VERIFICATION"
+            integration_ref = "browser:p1"
+            request_id = "IR-x"
+            problem_summary = "captcha"
+        return _R()
+
+    @staticmethod
+    def _task():
+        class _T:
+            task_id = "AIR-2026-000001"
+        return _T()
+
+    @pytest.mark.asyncio
+    async def test_waiting_session_is_not_verified(self, monkeypatch):
+        """THE BUG: a session still waiting on the human was reported as verified."""
+        self._install(
+            monkeypatch,
+            _gateway_session("waiting_for_user", waiting={"reason": "solve the captcha"}),
+        )
+        result = await verification_module._verify_live_session(
+            None, self._task(), self._request()
+        )
+        assert result.ok is False, "a session still waiting for the user was treated as resolved"
+        assert result.checkable is True
+
+    @pytest.mark.asyncio
+    async def test_stopped_session_is_not_verified(self, monkeypatch):
+        self._install(monkeypatch, _gateway_session("stopped"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+
+    @pytest.mark.asyncio
+    async def test_failed_session_is_not_verified(self, monkeypatch):
+        self._install(monkeypatch, _gateway_session("failed"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+
+    @pytest.mark.asyncio
+    async def test_paused_session_is_not_verified(self, monkeypatch):
+        self._install(monkeypatch, _gateway_session("paused"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+
+    @pytest.mark.asyncio
+    async def test_running_session_is_verified(self, monkeypatch):
+        self._install(monkeypatch, _gateway_session("running"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is True
+        assert result.checkable is True
+
+    @pytest.mark.asyncio
+    async def test_missing_status_is_inconclusive_not_success(self, monkeypatch):
+        """A response without a status must never be read as 'active'."""
+        payload = {"session": {"integration": "browser", "key": "p1", "meta": {"connected": True}}}
+        self._install(monkeypatch, payload)
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+        assert result.checkable is False
+
+    @pytest.mark.asyncio
+    async def test_malformed_response_is_inconclusive(self, monkeypatch):
+        self._install(monkeypatch, {"session": "not-a-dict"})
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+        assert result.checkable is False
+
+    @pytest.mark.asyncio
+    async def test_unexpected_status_is_inconclusive(self, monkeypatch):
+        self._install(monkeypatch, _gateway_session("totally-unknown"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+        assert result.checkable is False
+
+    @pytest.mark.asyncio
+    async def test_wrong_session_identity_is_inconclusive(self, monkeypatch):
+        """A stale reference must not be satisfied by some other session's state."""
+        self._install(monkeypatch, _gateway_session("running", key="some-other-profile"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+        assert result.checkable is False
+
+    @pytest.mark.asyncio
+    async def test_missing_session_reference_is_inconclusive(self, monkeypatch):
+        self._install(monkeypatch, _gateway_session("running"))
+
+        class _R:
+            reason_code = "HUMAN_VERIFICATION"
+            integration_ref = None
+            request_id = "IR-x"
+            problem_summary = "captcha"
+
+        result = await verification_module._verify_live_session(None, self._task(), _R())
+        assert result.ok is False
+        assert result.checkable is False
+
+    @pytest.mark.asyncio
+    async def test_gateway_unavailable_is_inconclusive(self, monkeypatch):
+        from backend.app.live import client as gateway_mod
+
+        self._install(monkeypatch, gateway_mod.GatewayUnavailable("down"))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+        assert result.checkable is False
+
+    @pytest.mark.asyncio
+    async def test_session_not_found_is_reported_not_assumed_ok(self, monkeypatch):
+        from backend.app.live import client as gateway_mod
+
+        self._install(monkeypatch, gateway_mod.GatewayError(404, "not_found", "Session not found."))
+        result = await verification_module._verify_live_session(None, self._task(), self._request())
+        assert result.ok is False
+
+    @pytest.mark.asyncio
+    async def test_gateway_timeout_is_inconclusive(self, monkeypatch):
+        """A hanging gateway must not be read as a verified condition."""
+
+        async def _hang(path, params=None):
+            await asyncio.sleep(30)
+
+        monkeypatch.setattr("backend.app.live.client.get_json", _hang)
+        monkeypatch.setattr(verification_module, "VERIFY_TIMEOUT_SECONDS", 0.05)
+        result = await verification_module.verify(None, self._task(), self._request())
+        assert result.ok is False
+        assert result.checkable is False
+
+
+# ======================================================================
+# Telegram verification uses the client the worker owns
+# ======================================================================
+class TestTelegramVerificationUsesTheOwningClient:
+    @pytest.mark.asyncio
+    async def test_verifier_never_constructs_a_second_telethon_client(self, monkeypatch):
+        """It must ask the worker that owns the client, not open its own on the same file."""
+        from backend.app.core import config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_USER_ENABLED", True, raising=False)
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_API_ID", 12345, raising=False)
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_API_HASH", "hash", raising=False)
+
+        built: List[str] = []
+
+        class _ExplodingClient:
+            def __init__(self, *a, **k):
+                built.append("constructed")
+                raise AssertionError(
+                    "the API process must not open a second Telethon client on the live session file"
+                )
+
+        monkeypatch.setitem(
+            __import__("sys").modules, "telethon", type("m", (), {"TelegramClient": _ExplodingClient})
+        )
+
+        async def _get(path, params=None):
+            return _gateway_session("running", key="agent", integration="telegram")
+
+        monkeypatch.setattr("backend.app.live.client.get_json", _get)
+
+        class _R:
+            reason_code = TELEGRAM_SESSION_UNAVAILABLE
+            integration_ref = "telegram:agent"
+            request_id = "IR-x"
+            problem_summary = "telegram"
+
+        class _T:
+            task_id = "AIR-2026-000001"
+
+        result = await verification_module._verify_telegram_session(None, _T(), _R())
+        assert built == [], "a second Telegram client was constructed"
+        assert result.ok is True
+
+    @pytest.mark.asyncio
+    async def test_worker_reports_disconnected_so_it_is_not_verified(self, monkeypatch):
+        from backend.app.core import config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_USER_ENABLED", True, raising=False)
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_API_ID", 12345, raising=False)
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_API_HASH", "hash", raising=False)
+
+        payload = _gateway_session("running", key="agent", integration="telegram")
+        payload["session"]["meta"]["connected"] = False
+
+        async def _get(path, params=None):
+            return payload
+
+        monkeypatch.setattr("backend.app.live.client.get_json", _get)
+
+        class _R:
+            reason_code = TELEGRAM_SESSION_UNAVAILABLE
+            integration_ref = "telegram:agent"
+            request_id = "IR-x"
+            problem_summary = "telegram"
+
+        class _T:
+            task_id = "AIR-2026-000001"
+
+        result = await verification_module._verify_telegram_session(None, _T(), _R())
+        assert result.ok is False, "a disconnected client was reported as authorised"
+
+
+# ======================================================================
+# A clarification is recorded exactly once
+# ======================================================================
+class TestClarificationStoredOnce:
+    @pytest.mark.asyncio
+    async def test_clarification_is_stored_exactly_once(self, factory):
+        """A pause + 'use BSC instead, resume this task' must record one instruction."""
+        task_id = await _running_task(factory)
+        await _park(
+            factory, task_id, error_text="Emergency stop engaged.",
+            force_reason_code=OPERATOR_PAUSE, integration_ref=None,
+        )
+
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            task = await TaskManager(db).get_by_task_id(task_id)
+            await ReplyRouter(db).handle(
+                conversation=conversation, task=task, owner_email=OPERATOR_A,
+                text="Use BNB Smart Chain instead, and resume this task.",
+            )
+            await db.commit()
+
+        async with factory() as db:
+            task = await TaskManager(db).get_by_task_id(task_id)
+            instructions = task.operator_instructions or []
+            assert len(instructions) == 1, (
+                f"the same instruction was recorded {len(instructions)} times"
+            )
+
+
+# ======================================================================
+# A negated instruction is not a cancellation
+# ======================================================================
+class TestNegatedCancellation:
+    @pytest.mark.asyncio
+    async def test_do_not_stop_is_not_a_cancellation(self, factory):
+        task_id = await _running_task(factory)
+        await _park(factory, task_id)
+
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            task = await TaskManager(db).get_by_task_id(task_id)
+            await ReplyRouter(db).handle(
+                conversation=conversation, task=task, owner_email=OPERATOR_A,
+                text="Do not stop this task. I fixed it.",
+            )
+            await db.commit()
+
+        async with factory() as db:
+            task = await TaskManager(db).get_by_task_id(task_id)
+            assert task.status != TaskStatus.CANCELLED.value, (
+                "a negated instruction cancelled the task"
+            )
+
+
+# ======================================================================
+# The agent does not promise a resume it cannot perform
+# ======================================================================
+class TestHonestPromisesWithoutAnOpenBlocker:
+    @pytest.mark.asyncio
+    async def test_explicit_resume_without_a_blocker_is_handled_honestly(self, factory):
+        task_id = await _running_task(factory)
+        async with factory() as db:
+            await ConversationService(db).get_or_create_for_task(
+                await TaskManager(db).get_by_task_id(task_id), OPERATOR_A
+            )
+            await db.commit()
+
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            task = await TaskManager(db).get_by_task_id(task_id)
+            outcome = await ReplyRouter(db).handle(
+                conversation=conversation, task=task, owner_email=OPERATOR_A,
+                text="resume this task",
+            )
+            await db.commit()
+            assert outcome.resumed is False
+
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            messages = await ConversationService(db).list_messages(conversation.id)
+            body = messages[-1].content
+            assert "no open request" in body.lower(), (
+                f"the agent did not explain that there is nothing to resume: {body!r}"
+            )
+
+
+# ======================================================================
+# Replies that are not in English
+# ======================================================================
+class TestBengaliReplies:
+    @pytest.mark.asyncio
+    async def test_bengali_resume_of_an_operator_pause(self, factory):
+        task_id = await _running_task(factory)
+        await _park(
+            factory, task_id, error_text="Emergency stop engaged.",
+            force_reason_code=OPERATOR_PAUSE, integration_ref=None,
+        )
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            task = await TaskManager(db).get_by_task_id(task_id)
+            outcome = await ReplyRouter(db).handle(
+                conversation=conversation, task=task, owner_email=OPERATOR_A,
+                text="হ্যাঁ, এখন চালাও।",
+            )
+            await db.commit()
+            assert outcome.resumed is True, "a clear Bengali resume instruction was ignored"
+
+    @pytest.mark.asyncio
+    async def test_bengali_clarification_is_recorded(self, factory):
+        task_id = await _running_task(factory)
+        async with factory() as db:
+            await ConversationService(db).get_or_create_for_task(
+                await TaskManager(db).get_by_task_id(task_id), OPERATOR_A
+            )
+            await db.commit()
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            task = await TaskManager(db).get_by_task_id(task_id)
+            await ReplyRouter(db).handle(
+                conversation=conversation, task=task, owner_email=OPERATOR_A,
+                text="এখন BSC ব্যবহার করো।",
+            )
+            await db.commit()
+        async with factory() as db:
+            task = await TaskManager(db).get_by_task_id(task_id)
+            instructions = task.operator_instructions or []
+            assert instructions, "a Bengali network instruction was dropped"
+
+    @pytest.mark.asyncio
+    async def test_bengali_informational_reply_does_not_clear_an_operator_pause(self, factory):
+        """Bengali support must not weaken the pause rule."""
+        task_id = await _running_task(factory)
+        await _park(
+            factory, task_id, error_text="Emergency stop engaged.",
+            force_reason_code=OPERATOR_PAUSE, integration_ref=None,
+        )
+        async with factory() as db:
+            conversation = await db.scalar(
+                select(AgentConversation).where(AgentConversation.task_id.is_not(None)).limit(1)
+            )
+            task = await TaskManager(db).get_by_task_id(task_id)
+            outcome = await ReplyRouter(db).handle(
+                conversation=conversation, task=task, owner_email=OPERATOR_A,
+                text="সব ঠিক আছে।",
+            )
+            await db.commit()
+            assert outcome.resumed is False
+
+
+# ======================================================================
+# Full round trip: create -> block -> answer -> resume, end to end
+# ======================================================================
+class FakeTelegram:
+    """Deterministic stand-in for the Telegram session. Not a mock of our own code."""
+
+    def __init__(self) -> None:
+        self.signed_in = False
+        self.sign_in_calls: List[str] = []
+
+    def sign_in(self) -> None:
+        self.signed_in = True
+
+
+@pytest.fixture
+def telegram(monkeypatch) -> FakeTelegram:
+    fake = FakeTelegram()
+
+    async def _verify(db, task, request):
+        # Reports the real state of the double rather than a hard-coded "ok".
+        if fake.signed_in:
+            return VerificationResult.satisfied(
+                method="telegram_is_user_authorized",
+                outcome="The Telegram session reports it is connected and authorised.",
+            )
+        return VerificationResult.failed(
+            method="telegram_is_user_authorized",
+            outcome="The Telegram session reports the account is not authorised.",
+            question="Please sign the Telegram session in, then tell me to re-check.",
+        )
+
+    monkeypatch.setitem(verification_module._REGISTRY, TELEGRAM_SESSION_UNAVAILABLE, _verify)
+    return fake
+
+
+class TestAgentInboxEndToEnd:
+    """The whole promise in one test, over HTTP, with the real claim query.
+
+    Uses this module's factory and operator_a fixtures, so it runs against the
+    same database as the rest of the suite rather than a second one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_blocked_task_resumes_itself_after_one_good_reply(
+        self, factory, operator_a, telegram
+    ):
+        made, token = factory, operator_a
+
+        # ---------------------------------------------------------------- 1. create
+        async with _client(token) as client:
+            blocked_response = await client.post(
+                "/api/v1/tasks",
+                json={
+                    "title": "Join the Telegram announcement channel",
+                    "description": "Join the channel and report back.",
+                    "priority": 3,
+                },
+            )
+        assert blocked_response.status_code == 201, blocked_response.text
+        blocked_id = blocked_response.json()["task_id"]
+
+        async with _client(token) as client:
+            other_response = await client.post(
+                "/api/v1/tasks",
+                json={"title": "Check an unrelated deadline", "description": "Read only.", "priority": 5},
+            )
+        other_id = other_response.json()["task_id"]
+
+        # The unrelated task has a plan and is ready to run.
+        async with made() as db:
+            blocked = await TaskManager(db).get_by_task_id(blocked_id)
+            other = await TaskManager(db).get_by_task_id(other_id)
+            # Both arrive READY from the API now; the worker only has to claim them.
+            assert blocked.status == TaskStatus.READY.value, (
+                "an API-created task must arrive queued for the worker"
+            )
+            assert other.status == TaskStatus.READY.value
+            await TaskManager(db).transition(blocked, TaskStatus.IN_PROGRESS, reason="claimed by worker")
+            await TaskManager(db).transition(other, TaskStatus.IN_PROGRESS, reason="claimed by worker")
+            await db.commit()
+
+        # ------------------------------------------- 2. a blocking condition is hit
+        async with made() as db:
+            from backend.app.inbox.raise_intervention import park_for_intervention
+
+            blocked = await TaskManager(db).get_by_task_id(blocked_id)
+            result = await park_for_intervention(
+                db,
+                blocked,
+                owner_email=OPERATOR_A,
+                error_text="Telegram session is not logged in. Run the login script once.",
+                error_category="AUTH_FAILURE",
+                blocking_step="Step 1 (telegram_join_chat): join the announcement channel",
+                integration_ref="telegram:agent",
+            )
+            await db.commit()
+
+        assert result is not None and result["new_request"] is True
+
+        # -------------------------------- 3. the agent messaged the Agent Inbox
+        async with _client(token) as client:
+            listing = (await client.get("/api/v1/inbox/conversations")).json()
+            entry = next(c for c in listing["conversations"] if c["task_id"] == blocked_id)
+            assert entry["requires_reply"] is True
+            assert listing["needs_reply"] == 1
+
+            detail = (await client.get(f"/api/v1/inbox/conversations/{entry['conversation_id']}")).json()
+
+        body = detail["messages"][0]["content"]
+        assert blocked_id in body
+        assert "Telegram session" in body
+        assert "What you need to do:" in body
+        assert "I have saved the current task state" in body
+        assert detail["open_request"]["status"] == "PENDING"
+        assert detail["open_request"]["reason_code"] == TELEGRAM_SESSION_UNAVAILABLE
+
+        # The unrelated task is still in its own conversation-free state and untouched.
+        async with made() as db:
+            assert (await TaskManager(db).get_by_task_id(other_id)).status == TaskStatus.IN_PROGRESS.value
+
+        # ----------------------------------- 4. a reply that does not fix anything
+        async with _client(token) as client:
+            bad = await client.post(
+                f"/api/v1/inbox/conversations/{entry['conversation_id']}/messages",
+                json={"message": "I think it is fine now", "client_token": "reply-1"},
+            )
+        assert bad.status_code == 200, bad.text
+        assert bad.json()["resumed"] is False
+        assert bad.json()["verification"]["ok"] is False
+
+        async with made() as db:
+            assert (
+                await TaskManager(db).get_by_task_id(blocked_id)
+            ).status == TaskStatus.NEEDS_USER_ACTION.value
+
+        # ------------------------------ 5. the external condition is fixed for real
+        telegram.sign_in()
+
+        async with _client(token) as client:
+            good = await client.post(
+                f"/api/v1/inbox/conversations/{entry['conversation_id']}/messages",
+                json={"message": "Telegram session is ready.", "client_token": "reply-2"},
+            )
+        assert good.status_code == 200, good.text
+        body = good.json()
+        assert body["status"] == "RESUMED"
+        assert body["resumed"] is True
+        assert body["verification"]["ok"] is True
+
+        # ------------- 6. the task resumes from its persisted checkpoint, no Retry click
+        async with made() as db:
+            blocked = await TaskManager(db).get_by_task_id(blocked_id)
+            assert blocked.status == TaskStatus.READY.value
+            assert blocked.retry_count == 0, "a verified answer is not a retry"
+            assert blocked.next_execution_at is None
+            checkpoint = await db.scalar(
+                select(TaskCheckpoint)
+                .where(TaskCheckpoint.task_id == blocked.id)
+                .order_by(TaskCheckpoint.iteration.desc())
+            )
+            assert checkpoint is not None
+
+        # A duplicate of the accepted reply must not queue a second run.
+        async with _client(token) as client:
+            duplicate = await client.post(
+                f"/api/v1/inbox/conversations/{entry['conversation_id']}/messages",
+                json={"message": "Telegram session is ready.", "client_token": "reply-2"},
+            )
+        assert duplicate.json()["resumed"] is False
+
+        # The real worker claim query picks it up, exactly once.
+        async with made() as db:
+            claimed = await TaskManager(db).claim_next_task("worker-1")
+            assert claimed is not None and claimed.task_id == blocked_id
+            assert claimed.status == TaskStatus.IN_PROGRESS.value
+            await db.commit()
+
+        async with made() as db:
+            assert await TaskManager(db).claim_next_task("worker-2") is None, (
+                "a duplicate reply must not produce a second runnable task"
+            )
+
+        # -------- 7. the unrelated task is completely unaffected by any of the above
+        async with made() as db:
+            other = await TaskManager(db).get_by_task_id(other_id)
+            assert other.status == TaskStatus.IN_PROGRESS.value
+            assert other.retry_count == 0
+            conversations = (
+                await db.execute(
+                    select(AgentConversation).where(AgentConversation.task_id == other.id)
+                )
+            ).scalars().all()
+            assert conversations == [], "a task with no intervention gets no conversation"
+
+        # --------------------------------------- 8. history is complete and durable
+        async with _client(token) as client:
+            final = (await client.get(f"/api/v1/inbox/conversations/{entry['conversation_id']}")).json()
+
+        roles = [m["role"] for m in final["messages"]]
+        assert roles.count("user") == 2, "one accepted reply; the duplicate was stored once"
+        assert roles[0] == "assistant"
+        assert final["open_request"] is None, "the request is closed once resolved"
+        assert any("queued to resume" in m["content"] for m in final["messages"])
 
 
 # ======================================================================
