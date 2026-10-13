@@ -174,3 +174,11 @@ def test_key_reader_records_why_it_failed(monkeypatch):
     monkeypatch.setattr(reader, "_run_windows", boom)
     reader._run()
     assert "no console" in reader.error
+
+
+def test_services_do_not_inherit_the_console_keyboard():
+    """Vite reads stdin; sharing the console would eat the dashboard's keys."""
+    import re
+
+    source = (Path(__file__).resolve().parents[2] / "run.py").read_text(encoding="utf-8")
+    assert re.search(r"subprocess\.DEVNULL if capture_stdout else None", source)

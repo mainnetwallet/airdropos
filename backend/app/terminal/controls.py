@@ -210,9 +210,46 @@ class KeyReader:
         except Exception as exc:
             self.error = f"{type(exc).__name__}: {exc}"[:60]
 
+    def _raw_console_windows(self) -> None:
+        """Stop the console echoing typed characters onto the dashboard.
+
+        Left in line mode, a pressed key is echoed at the cursor (a stray "a"
+        appears and is painted over a moment later). Echo and line input are
+        switched off on the real console input buffer, keeping Ctrl+C working, and
+        switched back on when the dashboard stops.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                         wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        # GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING
+        handle = kernel32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            return
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.CloseHandle(handle)
+            return
+        saved = mode.value
+        ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT = 0x0002, 0x0004
+        kernel32.SetConsoleMode(handle, saved & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+
+        def restore() -> None:
+            kernel32.SetConsoleMode(handle, saved)
+            kernel32.CloseHandle(handle)
+
+        self._restore = restore
+
     def _run_windows(self) -> None:
         import msvcrt
 
+        try:
+            self._raw_console_windows()
+        except Exception:
+            pass  # echo may flicker, but keys still work
         while not self._stop.is_set():
             if msvcrt.kbhit():
                 char = msvcrt.getwch()

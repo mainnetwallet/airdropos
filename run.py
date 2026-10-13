@@ -540,7 +540,11 @@ class Proc:
             # silent until it exits.
             stdout=subprocess.PIPE if capture_stdout else None,
             stderr=subprocess.STDOUT if capture_stdout else None,
-            stdin=subprocess.PIPE if pipe_stdin else None,
+            # Services must not read the console. They share its input buffer with
+            # the dashboard, and Vite listens on it ("press h + enter"), so it
+            # would swallow the dashboard's keys (copy, clear, scroll). The
+            # dashboard keeps its own pipe, which is how it learns to shut down.
+            stdin=subprocess.PIPE if pipe_stdin else (subprocess.DEVNULL if capture_stdout else None),
             **kwargs,
         )
         self.t = threading.Thread(target=self._pump, daemon=True)
