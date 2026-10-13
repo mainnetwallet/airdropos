@@ -803,12 +803,22 @@ def _hint(state: RuntimeState, keyword: str, hint: str) -> str:
     return notice if keyword in notice else hint
 
 
+def _activity_hint(state: RuntimeState, rows: int) -> str:
+    total = len(state.events)
+    offset = max(0, min(state.activity_scroll, total - max(1, rows)))
+    if offset:
+        return f"↑ {offset} older lines · [End] latest"
+    if total > rows:
+        return "[a] copy · [x] clear · ↑↓ scroll"
+    return "[a] copy all · [x] clear"
+
+
 def _bottom_row(state: RuntimeState, width: int, height: int) -> RenderableType:
     activity = _panel(
         f"{theme.ICON_ACTIVITY}  RECENT ACTIVITY ({len(state.events)})",
         _activity(state, height - 2),
         height=height,
-        subtitle=_hint(state, "ACTIVITY", "[a] copy all · [x] clear"),
+        subtitle=_hint(state, "ACTIVITY", _activity_hint(state, height - 2)),
     )
     alerts = _panel(
         f"{theme.ICON_ALERTS}  WARNINGS & ERRORS ({len(state.alerts)})",
@@ -832,9 +842,15 @@ def _bottom_row(state: RuntimeState, width: int, height: int) -> RenderableType:
 
 
 def _activity(state: RuntimeState, rows: int) -> RenderableType:
-    events = list(state.events)[-max(1, rows) :]
-    if not events:
+    rows = max(1, rows)
+    state.activity_rows = rows
+    all_events = list(state.events)
+    if not all_events:
         return Text("waiting for events…", style=theme.MUTED)
+    # Scrolled back by `activity_scroll` lines from the newest; 0 follows live.
+    offset = max(0, min(state.activity_scroll, len(all_events) - rows))
+    end = len(all_events) - offset
+    events = all_events[max(0, end - rows) : end]
     grid = Table.grid(expand=True, padding=0)
     grid.add_column(width=9, no_wrap=True)
     grid.add_column(ratio=1, overflow="ellipsis", no_wrap=True)

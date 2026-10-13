@@ -156,6 +156,11 @@ class RuntimeState:
     alerts_tracked: bool = False
     # Short confirmation ("Copied 150 lines") shown for a few seconds after a key.
     notice: str = ""
+    # RECENT ACTIVITY scroll: lines back from the newest (0 = follow the live end).
+    activity_scroll: int = 0
+    # Rows the activity panel showed last frame; the renderer sets it so the
+    # dashboard can stop scrolling at the oldest line.
+    activity_rows: int = 0
     problems: List[str] = field(default_factory=list)
 
     worker_id: str = ""

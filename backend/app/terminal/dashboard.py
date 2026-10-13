@@ -319,9 +319,28 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
     keys.start()
     notice = {"text": "", "until": 0.0}
 
+    scroll = {"offset": 0, "seq": 0}
+
+    def clamp_scroll() -> None:
+        shown = latest["state"].activity_rows if latest["state"] is not None else 0
+        most = max(0, len(collector.activity) - max(1, shown))
+        scroll["offset"] = max(0, min(scroll["offset"], most))
+
     def handle_key(key: str) -> bool:
         """Run one control key. Returns True when something changed on screen."""
         state = latest["state"]
+        if key in (controls.SCROLL_UP, controls.SCROLL_DOWN, controls.PAGE_UP,
+                   controls.PAGE_DOWN, controls.SCROLL_TOP, controls.SCROLL_END):
+            step = {controls.SCROLL_UP: 1, controls.SCROLL_DOWN: -1,
+                    controls.PAGE_UP: controls.PAGE_LINES, controls.PAGE_DOWN: -controls.PAGE_LINES}
+            if key == controls.SCROLL_END:
+                scroll["offset"] = 0
+            elif key == controls.SCROLL_TOP:
+                scroll["offset"] = len(collector.activity)
+            else:
+                scroll["offset"] += step[key]
+            clamp_scroll()
+            return True
         if key == controls.COPY_ACTIVITY:
             lines = list(collector.activity)
             what = "RECENT ACTIVITY"
@@ -331,6 +350,7 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
             what = "WARNINGS & ERRORS"
         elif key == controls.CLEAR_ACTIVITY:
             count = collector.clear_activity()
+            scroll["offset"] = 0
             notice.update(text=f"Cleared RECENT ACTIVITY ({count} lines)", until=time.monotonic() + 4)
             latest["version"] += 1
             if state is not None:
@@ -385,6 +405,14 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                 if shown_notice != latest["state"].notice:
                     drawn_key = None
                 latest["state"].notice = shown_notice
+                # Hold the view still while new lines arrive, if scrolled back.
+                newest = getattr(collector, "_seq", 0)
+                if scroll["offset"] and newest > scroll["seq"]:
+                    scroll["offset"] += newest - scroll["seq"]
+                    drawn_key = None
+                scroll["seq"] = newest
+                clamp_scroll()
+                latest["state"].activity_scroll = scroll["offset"]
                 key = (width, height, latest["version"])
                 # Draw when the window size or the readings changed, and at least once a
                 # second so the uptime keeps moving. Checking every 50 ms is what makes

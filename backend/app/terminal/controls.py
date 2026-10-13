@@ -28,6 +28,17 @@ CLEAR_ACTIVITY = "x"
 CLEAR_ALERTS = "z"
 KEYS = (COPY_ACTIVITY, COPY_ALERTS, CLEAR_ACTIVITY, CLEAR_ALERTS)
 
+# Scrolling RECENT ACTIVITY. Delivered by KeyReader as these names.
+SCROLL_UP, SCROLL_DOWN = "up", "down"
+PAGE_UP, PAGE_DOWN = "pgup", "pgdn"
+SCROLL_TOP, SCROLL_END = "home", "end"
+PAGE_LINES = 10
+
+_WINDOWS_SPECIAL = {"H": SCROLL_UP, "P": SCROLL_DOWN, "I": PAGE_UP, "Q": PAGE_DOWN, "G": SCROLL_TOP, "O": SCROLL_END}
+_POSIX_SPECIAL = {"A": SCROLL_UP, "B": SCROLL_DOWN, "H": SCROLL_TOP, "F": SCROLL_END,
+                  "5~": PAGE_UP, "6~": PAGE_DOWN, "1~": SCROLL_TOP, "4~": SCROLL_END,
+                  "7~": SCROLL_TOP, "8~": SCROLL_END}
+
 
 # ----------------------------------------------------------------------
 # Text for the clipboard
@@ -166,8 +177,10 @@ class KeyReader:
         while not self._stop.is_set():
             if msvcrt.kbhit():
                 char = msvcrt.getwch()
-                if char in ("\x00", "\xe0"):  # arrow / function key: skip its second code
-                    msvcrt.getwch()
+                if char in ("\x00", "\xe0"):  # arrow / function key: a second code follows
+                    name = _WINDOWS_SPECIAL.get(msvcrt.getwch())
+                    if name:
+                        self.keys.put(name)
                     continue
                 self.keys.put(char.lower())
             else:
@@ -192,5 +205,26 @@ class KeyReader:
             ready, _, _ = select.select([fd], [], [], 0.1)
             if ready:
                 data = os.read(fd, 1)
-                if data:
+                if not data:
+                    continue
+                if data == b"\x1b":
+                    self._read_escape(fd, select)
+                else:
                     self.keys.put(data.decode("utf-8", errors="ignore").lower())
+
+    def _read_escape(self, fd, select) -> None:
+        """Parse ``ESC [ A`` style sequences; a lone ESC is ignored."""
+        seq = ""
+        while len(seq) < 4:
+            ready, _, _ = select.select([fd], [], [], 0.03)
+            if not ready:
+                return
+            ch = os.read(fd, 1).decode("ascii", errors="ignore")
+            if not seq and ch in ("[", "O"):
+                continue
+            seq += ch
+            if ch.isalpha() or ch == "~":
+                break
+        name = _POSIX_SPECIAL.get(seq)
+        if name:
+            self.keys.put(name)

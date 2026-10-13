@@ -98,3 +98,29 @@ def test_copy_text_is_one_line_per_record_oldest_first():
         "10:00:00 INFO     backend | started",
         "10:00:05 ERROR    worker | failed",
     ]
+
+
+def test_activity_panel_scrolls_back_through_older_lines():
+    import io
+
+    from rich.console import Console
+
+    from backend.app.terminal import render
+
+    state = RuntimeState(started_at=time.time())
+    for i in range(150):
+        state.events.append(EventLine(float(i), "00:00:00", "INFO", "x", "p", f"line-{i:03d}"))
+
+    def frame() -> str:
+        console = Console(width=140, height=40, file=io.StringIO(), force_terminal=True,
+                          color_system=None, highlight=False, soft_wrap=False)
+        with console.capture() as cap:
+            console.print(render.build(state, 140, 40), end="")
+        return cap.get()
+
+    live = frame()
+    assert "line-149" in live and "line-000" not in live
+    state.activity_scroll = 10_000  # far past the top: clamps to the oldest page
+    top = frame()
+    assert "line-000" in top and "line-149" not in top
+    assert "older lines" in top
