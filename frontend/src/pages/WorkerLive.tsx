@@ -1,8 +1,8 @@
 /** Live Worker: is the background worker running, what is it doing, and why might tasks be stuck. */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
-import { AlertTriangle, Bot, CheckCircle2, Copy, Send, XCircle } from 'lucide-react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { AlertTriangle, Bot, CheckCircle2, Copy, Send, Trash2, XCircle } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '@/services/api'
 import { Card, ErrorState, IconTile, Loading, PageHeader, Pill, SegmentedTabs } from '@/components/ui'
@@ -62,6 +62,19 @@ function LogView({ logs }: { logs: WorkerLogLine[] }) {
   const [copied, setCopied] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
   const stickRef = useRef(true)
+  const queryClient = useQueryClient()
+
+  // The worker is a separate process, so the clear is done on the server; the page
+  // is emptied straight away and the next refresh confirms it.
+  const clearMutation = useMutation({
+    mutationFn: api.clearWorkerLogs,
+    onSuccess: () => {
+      queryClient.setQueryData<WorkerStatus>(['worker-status'], (old) =>
+        old ? { ...old, logs: [] } : old,
+      )
+      void queryClient.invalidateQueries({ queryKey: ['worker-status'] })
+    },
+  })
 
   const visible = useMemo(
     () => (problemsOnly ? logs.filter((l) => ['WARNING', 'ERROR', 'CRITICAL'].includes(l.level)) : logs),
@@ -104,6 +117,18 @@ function LogView({ logs }: { logs: WorkerLogLine[] }) {
           <button onClick={copy} className="btn-ghost flex items-center gap-1.5 px-2 py-1">
             <Copy className="h-3.5 w-3.5" />
             {copied ? 'Copied' : 'Copy'}
+          </button>
+          <button
+            onClick={() => clearMutation.mutate()}
+            disabled={clearMutation.isPending || logs.length === 0}
+            title={clearMutation.isError ? 'Could not clear the log. Try again.' : 'Clear the live log'}
+            className={clsx(
+              'btn-ghost flex items-center gap-1.5 px-2 py-1 disabled:opacity-50',
+              clearMutation.isError && 'text-status-error',
+            )}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            {clearMutation.isPending ? 'Clearing…' : clearMutation.isError ? 'Failed' : 'Clear'}
           </button>
         </div>
       }

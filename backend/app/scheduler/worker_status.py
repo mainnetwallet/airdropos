@@ -94,6 +94,8 @@ class WorkerState:
         self.finished = 0
         self.note: str = "starting"
         self.log = LogRingHandler()
+        # ISO time of the last "Clear" pressed on the dashboard (set by the API).
+        self.logs_cleared_at: Optional[str] = None
 
     # ------------------------------------------------------------------
     def attach_logging(self) -> None:
@@ -102,6 +104,12 @@ class WorkerState:
             root.addHandler(self.log)
         if root.level == logging.NOTSET or root.level > logging.INFO:
             root.setLevel(logging.INFO)
+
+    def clear_logs(self, cleared_at: Optional[str] = None) -> None:
+        """Drop every buffered log line (the dashboard's Clear button)."""
+        self.log.records.clear()
+        if cleared_at:
+            self.logs_cleared_at = cleared_at
 
     def begin(self, worker_id: str, tool_names: List[str]) -> None:
         self.worker_id = worker_id
@@ -163,6 +171,7 @@ class WorkerState:
             "claimed": self.claimed,
             "finished": self.finished,
             "logs": list(self.log.records),
+            "logs_cleared_at": self.logs_cleared_at,
         }
 
 
@@ -172,11 +181,16 @@ state = WorkerState()
 async def publish_once() -> None:
     """Write the current snapshot to the heartbeat row."""
     now = datetime.now(timezone.utc)
-    detail = state.snapshot()
     async with AsyncSessionLocal() as db:
         row = await db.scalar(
             select(IntegrationHealth).where(IntegrationHealth.subsystem == WORKER_SUBSYSTEM)
         )
+        # The API cannot reach this process directly, so "Clear log" leaves a marker
+        # in the heartbeat row. Honour it here, then carry it forward in every publish.
+        marker = (row.detail or {}).get("logs_cleared_at") if row is not None else None
+        if marker and marker != state.logs_cleared_at:
+            state.clear_logs(marker)
+        detail = state.snapshot()
         if row is None:
             db.add(
                 IntegrationHealth(

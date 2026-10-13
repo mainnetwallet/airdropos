@@ -150,3 +150,53 @@ async def test_stale_heartbeat_means_offline(client, db_session_factory, monkeyp
 
     diag = (await client.get("/api/v1/diagnostics", headers=headers)).json()
     assert diag["subsystems"]["worker"]["status"] == "OFFLINE"
+
+
+# ----------------------------------------------------------------------
+# Clearing the Live log
+# ----------------------------------------------------------------------
+def test_clear_logs_empties_buffer_and_records_marker():
+    fresh = WorkerState()
+    fresh.log.records.append({"t": "2026-01-01T00:00:00+00:00", "level": "INFO", "source": "x", "message": "a"})
+    fresh.clear_logs("2026-01-01T00:00:05+00:00")
+    snap = fresh.snapshot()
+    assert snap["logs"] == []
+    assert snap["logs_cleared_at"] == "2026-01-01T00:00:05+00:00"
+
+
+@pytest.mark.asyncio
+async def test_clear_endpoint_empties_log_and_worker_honours_it(client, db_session_factory, monkeypatch):
+    monkeypatch.setattr(worker_status, "AsyncSessionLocal", db_session_factory)
+    fresh = WorkerState()
+    fresh.begin("worker-9", ["web_fetch"])
+    fresh.log.records.append(
+        {"t": "2026-01-01T00:00:00+00:00", "level": "INFO", "source": "x", "message": "old line"}
+    )
+    monkeypatch.setattr(worker_status, "state", fresh)
+    await worker_status.publish_once()
+
+    token, _ = await _make_user(db_session_factory, scopes={Scope.READ.value, Scope.TASK_WRITE.value})
+    headers = {"Authorization": f"Bearer {token}"}
+
+    before = (await client.get("/api/v1/worker/status", headers=headers)).json()
+    assert [l["message"] for l in before["logs"]] == ["old line"]
+
+    cleared = await client.post("/api/v1/worker/logs/clear", headers=headers)
+    assert cleared.status_code == 200
+    assert cleared.json()["cleared"] == 1
+
+    after = (await client.get("/api/v1/worker/status", headers=headers)).json()
+    assert after["logs"] == []
+
+    # The worker's next heartbeat must not bring the old lines back.
+    await worker_status.publish_once()
+    again = (await client.get("/api/v1/worker/status", headers=headers)).json()
+    assert again["logs"] == []
+    assert fresh.log.records == type(fresh.log.records)(maxlen=fresh.log.records.maxlen)
+
+
+@pytest.mark.asyncio
+async def test_clear_endpoint_needs_write_scope(client, db_session_factory):
+    headers = await _auth_headers(db_session_factory)  # read-only
+    res = await client.post("/api/v1/worker/logs/clear", headers=headers)
+    assert res.status_code in (401, 403)

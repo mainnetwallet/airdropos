@@ -1036,5 +1036,43 @@ async def worker_status(
         "telegram": telegram,
         "emergency_stop": bool(stop.get("emergency_stop_enabled")),
         "problems": problems,
-        "logs": list(reported.get("logs") or [])[-150:],
+        "logs": _visible_logs(reported),
     }
+
+
+def _visible_logs(reported: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Recent log lines, minus anything the operator already cleared."""
+    logs = list(reported.get("logs") or [])
+    cleared_at = reported.get("logs_cleared_at")
+    if cleared_at:
+        logs = [line for line in logs if str(line.get("t", "")) > str(cleared_at)]
+    return logs[-150:]
+
+
+@router.post("/worker/logs/clear", tags=["system"])
+async def clear_worker_logs(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_task_write),
+) -> Dict[str, Any]:
+    """Clear the Live log on the Live Worker page.
+
+    The worker is a separate process that republishes its log buffer every few
+    seconds, so a browser-only clear would reappear. This stores a marker in the
+    heartbeat row: the API hides older lines at once, and the worker empties its
+    own buffer on the next heartbeat.
+    """
+    enforce_rate_limit(request, "write")
+    row = await db.scalar(
+        select(IntegrationHealth).where(IntegrationHealth.subsystem == WORKER_SUBSYSTEM)
+    )
+    if row is None:
+        return {"cleared": 0, "cleared_at": None}
+    detail = dict(row.detail or {})
+    cleared = len(detail.get("logs") or [])
+    cleared_at = datetime.now(timezone.utc).isoformat()
+    detail["logs"] = []
+    detail["logs_cleared_at"] = cleared_at
+    row.detail = detail  # new dict so the JSON column change is detected
+    await db.commit()
+    return {"cleared": cleared, "cleared_at": cleared_at}

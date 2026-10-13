@@ -5,6 +5,13 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (live worker)
+- **The Live log on the Live Worker page could be copied but not cleared.** Added a
+  **Clear** button next to **Copy**. The worker is a separate process that republishes its
+  log buffer every few seconds, so a browser-only clear would have reappeared. The new
+  `POST /api/v1/worker/logs/clear` stores a marker in the worker heartbeat row: the API
+  hides older lines immediately and the worker empties its own buffer on the next
+  heartbeat. Requires the `task_write` scope.
 ### Fixed (browser)
 - **A Chrome window could appear just by viewing the Browser Profiles page.** The list
   endpoint reported the Chrome version by running `chrome.exe --version`, and the page

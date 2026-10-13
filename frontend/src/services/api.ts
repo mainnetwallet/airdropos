@@ -164,6 +164,8 @@ export const api = {
   readiness: () => request<Record<string, unknown>>('/readiness'),
   diagnostics: () => request<DiagnosticsResponse>('/diagnostics'),
   workerStatus: () => request<WorkerStatus>('/worker/status'),
+  clearWorkerLogs: () =>
+    request<{ cleared: number; cleared_at: string | null }>('/worker/logs/clear', { method: 'POST' }),
 
   // --- Agent ------------------------------------------------------------
   agentInfo: () => request<AgentInfo>('/agent/info'),
