@@ -707,7 +707,10 @@ def start_dashboard(
     deadline = time.time() + DASHBOARD_READY_TIMEOUT_SECONDS
     while time.time() < deadline:
         if _dashboard_ready(ready, token):
-            log("Terminal dashboard ready.")
+            # Not printed: the dashboard has cleared the screen and owns it now,
+            # so a line here would land on top of the first frame. It goes to the
+            # activity feed and logs/airdropos.log instead.
+            publish("INFO", "run", "Terminal dashboard ready.")
             return proc
         if proc.p.poll() is not None:
             log(

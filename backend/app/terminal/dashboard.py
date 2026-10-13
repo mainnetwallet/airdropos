@@ -211,6 +211,64 @@ async def _run_plain(collector, refresh: float) -> int:
 
 
 # ----------------------------------------------------------------------
+# Taking over the screen
+# ----------------------------------------------------------------------
+# Erase the visible screen (2J), the scrollback buffer (3J) and home the cursor (H).
+CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[2J\x1b[3J\x1b[H"
+
+_screen_taken = False
+
+
+def _enable_windows_vt(handle_id: int) -> bool:
+    """Turn on ANSI escape processing for one standard handle on Windows."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(handle_id)
+        mode = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        if mode.value & 0x0004:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
+
+
+def take_over_screen(console) -> bool:
+    """Clear the screen and scrollback, once, as the dashboard takes control.
+
+    Called immediately before the first frame so the dashboard starts at the top
+    of an empty terminal. Only what is already on screen or in the scrollback
+    buffer when this runs can be erased; whatever the terminal stored earlier is
+    removed by this clear and by nothing else, and a terminal that ignores 3J
+    keeps its scrollback (the visible screen is still cleared).
+
+    Runs at most once per process, never during updates, and never raises: a
+    terminal that cannot be cleared still gets a working dashboard.
+    """
+    global _screen_taken
+    if _screen_taken:
+        return False
+    _screen_taken = True
+    try:
+        if os.name == "nt":
+            # STD_OUTPUT_HANDLE = -11. Without VT processing the sequences would
+            # print as literal text on an old console.
+            if not _enable_windows_vt(-11):
+                console.clear()
+                return False
+        console.file.write(CLEAR_SCREEN_AND_SCROLLBACK)
+        console.file.flush()
+        return True
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
 # Live dashboard
 # ----------------------------------------------------------------------
 async def _run_live(collector, refresh: float, token: Optional[str] = None) -> int:
@@ -226,6 +284,8 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
 
     last_collect = 0.0
     state = None
+    # Once, immediately before the first frame. Nothing is printed after this.
+    take_over_screen(console)
     try:
         with Live(
             console=console,
