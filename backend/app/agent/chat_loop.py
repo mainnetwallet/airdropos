@@ -210,6 +210,7 @@ class ChatToolLoop:
         spec: Optional[Dict[str, Any]] = None
         usage: Dict[str, Any] = {}
 
+        repaired = False  # one re-ask is allowed when the model breaks the JSON contract
         for round_index in range(self.max_rounds):
             if time.perf_counter() - started > TURN_TIME_BUDGET_SECONDS:
                 result.truncated = True
@@ -232,6 +233,21 @@ class ChatToolLoop:
             try:
                 parsed = llm.parse_json(response.content)
             except LLMError:
+                if not repaired:
+                    # Ask once for the contract again before giving up. Nothing was
+                    # run, so this cannot repeat a side effect.
+                    repaired = True
+                    messages.append(Message("assistant", response.content or ""))
+                    messages.append(
+                        Message(
+                            "user",
+                            "Your last message was not a single valid JSON object. Reply again "
+                            "with ONLY the JSON object described in the system prompt (keys: "
+                            "reply, tool_calls, create_task). No text before or after it, and "
+                            "no code fences.",
+                        )
+                    )
+                    continue
                 # The model ignored the JSON contract. Its text is still shown, but no
                 # tool is run and no task is created from prose.
                 result.reply = response.content or ""

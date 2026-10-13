@@ -484,3 +484,93 @@ class TestDiagnosticsEndpoints:
             "prepare_native_transfer", "prepare_token_transfer",
             "submit_prepared_transfer", "system_diagnostics", "discover_airdrops",
         } <= names
+
+class _RawLLM:
+    """Returns raw text (not parsed dicts) and uses the real JSON extraction."""
+
+    def __init__(self, texts):
+        self._texts = list(texts)
+        self.calls: List[List[Any]] = []
+
+    async def complete(self, messages, json_mode=False, **kwargs):
+        self.calls.append(list(messages))
+        text = self._texts.pop(0)
+        return _RawResponse(text)
+
+    @staticmethod
+    def parse_json(content: str) -> Dict[str, Any]:
+        from backend.app.llm.client import FixedLLMClient
+
+        return FixedLLMClient.parse_json(content)
+
+
+class _RawResponse:
+    def __init__(self, text: str) -> None:
+        self.content = text
+        self.model = "stub"
+        self.usage: Dict[str, Any] = {}
+
+
+_TASK_JSON = json.dumps(
+    {
+        "reply": "Created and queued.",
+        "tool_calls": [],
+        "create_task": {
+            "title": "LockOn airdrop",
+            "description": "Follow the steps.",
+            "category": "airdrop",
+            "network": "solana",
+            "priority": 5,
+        },
+    }
+)
+
+
+class TestWrappedModelOutput:
+    @pytest.mark.asyncio
+    async def test_prose_plus_fenced_json_still_creates_the_task(self, factory, operator, monkeypatch):
+        from backend.app.tools import bootstrap as bootstrap_module
+
+        bootstrap_module.bootstrap_tools()
+        raw = _RawLLM(["I'll create a task for this.\n\n```json\n" + _TASK_JSON + "\n```"])
+        monkeypatch.setattr("backend.app.agent.chat_loop.llm", raw)
+
+        async with _client(operator) as client:
+            response = await client.post("/api/v1/agent/chat", json={"message": "create task"})
+
+        body = response.json()
+        assert body["task"] is not None and body["task"]["task_id"].startswith("AIR-")
+        assert not any("structured response" in b for b in body.get("blockers", []))
+        assert len(raw.calls) == 1  # no retry was needed
+
+    @pytest.mark.asyncio
+    async def test_prose_gets_one_retry_then_works(self, factory, operator, monkeypatch):
+        from backend.app.tools import bootstrap as bootstrap_module
+
+        bootstrap_module.bootstrap_tools()
+        raw = _RawLLM(["Shall I create a task for this campaign?", _TASK_JSON])
+        monkeypatch.setattr("backend.app.agent.chat_loop.llm", raw)
+
+        async with _client(operator) as client:
+            response = await client.post("/api/v1/agent/chat", json={"message": "create task"})
+
+        body = response.json()
+        assert body["task"] is not None
+        assert len(raw.calls) == 2
+        assert "valid JSON" in raw.calls[1][-1].content
+
+    @pytest.mark.asyncio
+    async def test_still_prose_after_the_retry_is_blocked_and_nothing_runs(self, factory, operator, monkeypatch):
+        from backend.app.tools import bootstrap as bootstrap_module
+
+        bootstrap_module.bootstrap_tools()
+        raw = _RawLLM(["Sure, I will do that.", "I really will, trust me."])
+        monkeypatch.setattr("backend.app.agent.chat_loop.llm", raw)
+
+        async with _client(operator) as client:
+            response = await client.post("/api/v1/agent/chat", json={"message": "create task"})
+
+        body = response.json()
+        assert body["task"] is None
+        assert len(raw.calls) == 2  # exactly one re-ask, never a loop
+        assert any("structured response" in b for b in body.get("blockers", []))

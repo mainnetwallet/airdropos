@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -209,32 +210,68 @@ class FixedLLMClient:
 
     @staticmethod
     def parse_json(content: str) -> Dict[str, Any]:
-        """Tolerant JSON extraction that still fails loudly on garbage."""
+        """Tolerant JSON extraction that still fails loudly on garbage.
+
+        Models routinely wrap the object: a sentence of prose and then a fenced
+        ```json block, or the fence alone, or text after it. Some routers also ignore
+        ``response_format``. So after trying the whole text, this looks for the object
+        inside fences and then anywhere in the text. A JSON *array* or a bare value is
+        still rejected: callers need an object.
+        """
         text = (content or "").strip()
         if not text:
             raise LLMError("LLM returned empty content", category="MALFORMED_RESPONSE", retryable=False)
 
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
+        # strict=False allows raw newlines/tabs inside strings, which models emit often.
+        decoder = json.JSONDecoder(strict=False)
 
-        # Strip markdown fences that models occasionally emit despite json_mode.
-        if text.startswith("```"):
-            text = text.split("```")[1] if "```" in text[3:] else text[3:]
-            if text.lower().startswith("json"):
-                text = text[4:]
-            text = text.strip()
+        def as_object(candidate: str) -> Optional[Dict[str, Any]]:
+            try:
+                value = decoder.decode(candidate.strip())
+            except ValueError:
+                return None
+            return value if isinstance(value, dict) else None
 
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError as exc:
-            snippet = text[:300].replace("\n", " ")
-            raise LLMError(
-                f"LLM did not return valid JSON: {exc}. Content began: {snippet}",
-                category="MALFORMED_RESPONSE",
-                retryable=False,
-            ) from exc
+        found = as_object(text)
+        if found is not None:
+            return found
+
+        candidates: List[Dict[str, Any]] = []
+
+        # 1. Fenced blocks anywhere in the text (```json ... ``` or ``` ... ```).
+        for match in re.finditer(r"```[ \t]*(?:json|JSON)?[ \t]*\r?\n?(.*?)```", text, re.DOTALL):
+            block = as_object(match.group(1))
+            if block is not None:
+                candidates.append(block)
+
+        # 2. Any JSON object embedded in prose: try to decode from each opening brace.
+        if not candidates:
+            index = text.find("{")
+            while index != -1:
+                try:
+                    value, end = decoder.raw_decode(text, index)
+                except ValueError:
+                    index = text.find("{", index + 1)
+                    continue
+                if isinstance(value, dict):
+                    candidates.append(value)
+                    index = text.find("{", end)  # skip past the object just read
+                else:
+                    index = text.find("{", index + 1)
+
+        if candidates:
+            # Prefer the object that looks like the agent contract; else the first.
+            for candidate in candidates:
+                if "reply" in candidate or "tool_calls" in candidate or "create_task" in candidate:
+                    return candidate
+            return candidates[0]
+
+        snippet = text[:300].replace("\n", " ")
+        raise LLMError(
+            f"LLM did not return valid JSON. Content began: {snippet}",
+            category="MALFORMED_RESPONSE",
+            retryable=False,
+        )
 
     async def stream(
         self, messages: List[Message], temperature: Optional[float] = None
