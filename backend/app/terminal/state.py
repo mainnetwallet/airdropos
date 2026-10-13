@@ -156,6 +156,13 @@ class RuntimeState:
     alerts_tracked: bool = False
     # Short confirmation ("Copied 150 lines") shown for a few seconds after a key.
     notice: str = ""
+    # Which log panel the notice belongs to ("activity" / "alerts") and whether it
+    # reports a failure. The renderer shows it beside that panel's title.
+    notice_panel: str = ""
+    notice_bad: bool = False
+    # Clickable buttons drawn in the last frame: (x_first, x_last, y, action), all
+    # 0-based terminal cells. Filled in by render.build, read by the dashboard.
+    click_targets: List[Tuple[int, int, int, str]] = field(default_factory=list)
     # Why the keyboard controls are off (empty when they work).
     keys_error: str = ""
     # RECENT ACTIVITY scroll: lines back from the newest (0 = follow the live end).

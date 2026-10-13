@@ -123,7 +123,7 @@ def test_activity_panel_scrolls_back_through_older_lines():
     state.activity_scroll = 10_000  # far past the top: clamps to the oldest page
     top = frame()
     assert "line-000" in top and "line-149" not in top
-    assert "older lines" in top
+    assert "older" in top and "[End] Latest" in top
 
 
 def test_terminal_escape_codes_are_stripped_from_messages():
@@ -191,6 +191,61 @@ def test_escape_sequences_decode_to_scroll_names():
     assert d("OA") == controls.SCROLL_UP
     assert d("[<64;40;12M") == controls.WHEEL_UP
     assert d("[<65;40;12M") == controls.WHEEL_DOWN
-    assert d("[<0;40;12M") is None       # a click is not a scroll
+    assert d("[<0;40;12M") == "click:40:12"  # left button press carries its position
+    assert d("[<2;40;12M") is None       # other buttons are ignored
     assert d("[<64;40;12m") is None      # a release is not a scroll
     assert d("") is None
+
+
+def _frame(state, width, height):
+    import io
+
+    from rich.console import Console
+
+    from backend.app.terminal import render
+
+    console = Console(width=width, height=height, file=io.StringIO(), force_terminal=True,
+                      color_system=None, highlight=False, soft_wrap=False)
+    with console.capture() as cap:
+        console.print(render.build(state, width, height), end="")
+    text = cap.get()
+    return (text[:-1] if text.endswith("\n") else text).split("\n")
+
+
+def _busy_state():
+    state = RuntimeState(started_at=time.time())
+    for i in range(60):
+        state.events.append(EventLine(float(i), "00:00:00", "INFO", "x", "p", f"line {i}"))
+    return state
+
+
+def test_click_targets_sit_exactly_on_the_drawn_buttons():
+    labels = {
+        controls.COPY_ACTIVITY: "[a] Copy", controls.CLEAR_ACTIVITY: "[x] Clear",
+        controls.COPY_ALERTS: "[w] Copy", controls.CLEAR_ALERTS: "[z] Clear",
+    }
+    for width, height in [(200, 60), (160, 38), (120, 30), (100, 28), (96, 26), (80, 24), (60, 30)]:
+        state = _busy_state()
+        lines = _frame(state, width, height)
+        found = {action for *_, action in state.click_targets}
+        if width >= 96 or width < 90:
+            assert controls.COPY_ACTIVITY in found or controls.COPY_ALERTS in found, f"{width}x{height}"
+        for first, last, y, action in state.click_targets:
+            assert lines[y][first : last + 1] == labels[action], f"{width}x{height} {action}: {lines[y][first:last+1]!r}"
+
+
+def test_both_panels_get_their_own_buttons_when_wide():
+    state = _busy_state()
+    _frame(state, 160, 38)
+    assert {a for *_, a in state.click_targets} == {
+        controls.COPY_ACTIVITY, controls.CLEAR_ACTIVITY, controls.COPY_ALERTS, controls.CLEAR_ALERTS,
+    }
+
+
+def test_notice_appears_beside_the_title_of_its_own_panel():
+    state = _busy_state()
+    state.notice, state.notice_panel = "Copied 60 lines", "activity"
+    top = "\n".join(_frame(state, 160, 38))
+    assert "RECENT ACTIVITY (60)  Copied 60 lines" in top
+    state.notice_panel = "alerts"
+    assert "RECENT ACTIVITY (60)  Copied" not in "\n".join(_frame(state, 160, 38))

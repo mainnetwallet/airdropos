@@ -42,7 +42,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from backend.app.terminal import theme
+from backend.app.terminal import controls, theme
 from backend.app.terminal.state import (
     DISABLED,
     RUNNING,
@@ -110,9 +110,10 @@ def build(state: RuntimeState, width: int, height: int) -> RenderableType:
     width = max(MIN_WIDTH, int(width))
     height = max(MIN_HEIGHT, int(height))
 
+    state.click_targets = []
     header, header_rows = _header_block(state, width, height)
     footer, footer_rows = _footer_block(state, width, height)
-    body = _body(state, width, max(1, height - header_rows - footer_rows))
+    body = _body(state, width, max(1, height - header_rows - footer_rows), header_rows)
 
     # Padding is the only Group-level way to paint a background; `style=` on the
     # Group itself is not a constructor argument.
@@ -183,7 +184,7 @@ def _clip(value: str, limit: int) -> str:
 # ----------------------------------------------------------------------
 # Body: status, middle, bottom
 # ----------------------------------------------------------------------
-def _body(state: RuntimeState, width: int, rows: int) -> RenderableType:
+def _body(state: RuntimeState, width: int, rows: int, top: int = 0) -> RenderableType:
     gap = 1 if rows >= 38 else 0
     cards_fit = _card_width(width) >= CARD_MIN_WIDTH
     sizes = _allocate(
@@ -200,18 +201,21 @@ def _body(state: RuntimeState, width: int, rows: int) -> RenderableType:
     )
 
     sections: List[RenderableType] = []
+    row = top  # terminal row where the next section starts
     for key in ("status", "middle", "bottom"):
         if key not in sizes:
             continue
         if sections and gap:
             sections.append(Text(""))
+            row += 1
         height = sizes[key]
         if key == "status":
             sections.append(_status_row(state, width, height))
         elif key == "middle":
             sections.append(_middle_row(state, width, height))
         else:
-            sections.append(_bottom_row(state, width, height))
+            sections.append(_bottom_row(state, width, height, row))
+        row += height
 
     shown = sum(sizes.values()) + (gap * (len(sizes) - 1))
     for _ in range(max(0, rows - shown)):
@@ -796,49 +800,107 @@ def _tool_list(state: RuntimeState, rows: int, inner_w: int) -> RenderableType:
 # ----------------------------------------------------------------------
 # Activity + alerts
 # ----------------------------------------------------------------------
-def _hint(state: RuntimeState, keyword: str, hint: str) -> str:
-    """Bottom-border text of a log panel: the last confirmation if it concerns
-    this panel and is still fresh, otherwise the key hints."""
-    notice = state.notice or ""
-    if keyword in notice:
-        return notice
-    if state.keys_error and keyword == "ACTIVITY":
-        return f"keys off: {state.keys_error}"
-    return hint
+def _buttons(parts: Sequence[Tuple[str, str, str]]) -> Tuple[Text, List[Tuple[int, int, str]]]:
+    """A line of text made of plain words and clickable buttons.
+
+    ``parts`` is ``(label, action, style)``; an empty ``action`` is plain text. Also
+    returns where each button sits inside the line, so a click can be matched.
+    """
+    line = Text(no_wrap=True)
+    spots: List[Tuple[int, int, str]] = []
+    position = 0
+    for label, action, style in parts:
+        line.append(label, style=style)
+        width = cell_len(label)
+        if action:
+            spots.append((position, position + width - 1, action))
+        position += width
+    return line, spots
 
 
-def _activity_hint(state: RuntimeState, rows: int) -> str:
+def _log_title(state: RuntimeState, icon: str, name: str, count: int, panel: str) -> Text:
+    """Panel title, with the latest copy/clear confirmation beside it."""
+    title = Text(f"{icon}  {name} ({count})", style="bold " + theme.CYAN, no_wrap=True)
+    if state.notice and state.notice_panel == panel:
+        title.append("  " + state.notice, style="bold " + (theme.YELLOW if state.notice_bad else theme.GREEN))
+    return title
+
+
+def _activity_buttons(state: RuntimeState, rows: int):
     total = len(state.events)
     offset = max(0, min(state.activity_scroll, total - max(1, rows)))
+    parts: List[Tuple[str, str, str]] = []
+    if state.keys_error:
+        return _buttons([(f"keys off: {state.keys_error}", "", theme.YELLOW)])
     if offset:
-        return f"↑ {offset} older lines · [End] latest"
-    if total > rows:
-        return "[a] copy · [x] clear · ↑↓ / wheel scroll"
-    return "[a] copy all · [x] clear"
+        parts += [(f"↑ {offset} older  ", "", theme.MUTED), ("[End] Latest", controls.SCROLL_END, "bold " + theme.CYAN), ("  ", "", "")]
+    elif total > rows:
+        parts += [("↑↓ / wheel scroll  ", "", theme.MUTED)]
+    parts += [
+        ("[a] Copy", controls.COPY_ACTIVITY, "bold " + theme.GREEN),
+        ("  ", "", ""),
+        ("[x] Clear", controls.CLEAR_ACTIVITY, "bold " + theme.YELLOW),
+    ]
+    return _buttons(parts)
 
 
-def _bottom_row(state: RuntimeState, width: int, height: int) -> RenderableType:
+def _alert_buttons():
+    return _buttons([
+        ("[w] Copy", controls.COPY_ALERTS, "bold " + theme.GREEN),
+        ("  ", "", ""),
+        ("[z] Clear", controls.CLEAR_ALERTS, "bold " + theme.YELLOW),
+    ])
+
+
+def _register_buttons(state: RuntimeState, spots, *, x0: int, panel_w: int, y: int, text: Text) -> None:
+    """Record where a panel's bottom-border buttons are, in terminal cells.
+
+    The border reads ``╰─ <subtitle> ─╯``: Rich right-aligns the subtitle with one
+    space and one dash between it and the corner, so the last subtitle cell is
+    four cells in from the panel's right edge. If the subtitle was too long to fit
+    untrimmed, its position is unknown, so no buttons are registered.
+    """
+    length = text.cell_len
+    if length + 2 > panel_w - 4:
+        return
+    start = x0 + panel_w - 3 - length
+    for first, last, action in spots:
+        state.click_targets.append((start + first, start + last, y, action))
+
+
+def _bottom_row(state: RuntimeState, width: int, height: int, top: int = 0) -> RenderableType:
+    act_text, act_spots = _activity_buttons(state, height - 2)
+    alr_text, alr_spots = _alert_buttons()
     activity = _panel(
-        f"{theme.ICON_ACTIVITY}  RECENT ACTIVITY ({len(state.events)})",
+        _log_title(state, theme.ICON_ACTIVITY, "RECENT ACTIVITY", len(state.events), "activity"),
         _activity(state, height - 2),
         height=height,
-        subtitle=_hint(state, "ACTIVITY", _activity_hint(state, height - 2)),
+        subtitle=act_text,
     )
     alerts = _panel(
-        f"{theme.ICON_ALERTS}  WARNINGS & ERRORS ({len(state.alerts)})",
+        _log_title(state, theme.ICON_ALERTS, "WARNINGS & ERRORS", len(state.alerts), "alerts"),
         _alerts(state, height - 2),
         height=height,
         border_style=theme.BORDER if not state.alerts else theme.YELLOW,
-        subtitle=_hint(state, "WARNINGS", "[w] copy all · [z] clear"),
+        subtitle=alr_text,
     )
+    border_row = top + height - 1
     if width < 90:
         # Not enough width for both: show whichever matters right now.
-        return alerts if state.alerts else activity
+        if state.alerts:
+            _register_buttons(state, alr_spots, x0=0, panel_w=width, y=border_row, text=alr_text)
+            return alerts
+        _register_buttons(state, act_spots, x0=0, panel_w=width, y=border_row, text=act_text)
+        return activity
     columns = Table.grid(expand=True, padding=0)
     if width >= MEDIUM:
-        columns.add_column(width=width - _side_width(width), no_wrap=True)
+        left_w = width - _side_width(width)
+        columns.add_column(width=left_w, no_wrap=True)
         columns.add_column(ratio=1)
+        _register_buttons(state, act_spots, x0=0, panel_w=left_w, y=border_row, text=act_text)
+        _register_buttons(state, alr_spots, x0=left_w, panel_w=width - left_w, y=border_row, text=alr_text)
     else:
+        # Ratio columns: the split is Rich's to decide, so no click targets here.
         columns.add_column(ratio=2)
         columns.add_column(ratio=1)
     columns.add_row(activity, alerts)
@@ -971,18 +1033,20 @@ def _interleave(cells: Sequence[RenderableType]) -> List[RenderableType]:
 
 
 def _panel(
-    title: str,
+    title: "str | Text",
     body: RenderableType,
     *,
     height: int,
     border_style: str = theme.BORDER,
-    subtitle: str = "",
+    subtitle: "str | Text" = "",
 ) -> RenderableType:
+    if not isinstance(subtitle, Text) and subtitle:
+        subtitle = Text(subtitle, style=theme.MUTED, no_wrap=True)
     return Panel(
         body,
-        title=Text(title, style="bold " + theme.CYAN, no_wrap=True),
+        title=title if isinstance(title, Text) else Text(title, style="bold " + theme.CYAN, no_wrap=True),
         title_align="left",
-        subtitle=Text(subtitle, style=theme.MUTED, no_wrap=True) if subtitle else None,
+        subtitle=subtitle or None,
         subtitle_align="right",
         border_style=border_style,
         box=_rounded(),

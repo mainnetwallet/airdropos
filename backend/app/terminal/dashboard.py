@@ -317,7 +317,11 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
 
     keys = controls.KeyReader()
     keys.start()
-    notice = {"text": "", "until": 0.0}
+    notice = {"text": "", "until": 0.0, "panel": "", "bad": False}
+    ui = {"targets": []}  # clickable buttons of the frame on screen
+
+    def say(text: str, panel: str, *, bad: bool = False, seconds: float = 4.0) -> None:
+        notice.update(text=text, panel=panel, bad=bad, until=time.monotonic() + seconds)
 
     scroll = {"offset": 0, "seq": 0}
 
@@ -329,6 +333,17 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
     def handle_key(key: str) -> bool:
         """Run one control key. Returns True when something changed on screen."""
         state = latest["state"]
+        if key.startswith("click:"):
+            # 1-based terminal coordinates -> 0-based cells of the drawn frame.
+            try:
+                _, col, row = key.split(":")
+                x, y = int(col) - 1, int(row) - 1
+            except ValueError:
+                return False
+            for first, last, target_y, action in ui["targets"]:
+                if target_y == y and first <= x <= last:
+                    return handle_key(action)
+            return False
         if key in (controls.SCROLL_UP, controls.SCROLL_DOWN, controls.PAGE_UP,
                    controls.PAGE_DOWN, controls.SCROLL_TOP, controls.SCROLL_END,
                    controls.WHEEL_UP, controls.WHEEL_DOWN):
@@ -336,10 +351,7 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
             total = len(collector.activity)
             if shown and total <= shown:
                 scroll["offset"] = 0
-                notice.update(
-                    text=f"RECENT ACTIVITY: all {total} lines fit on screen, nothing to scroll",
-                    until=time.monotonic() + 3,
-                )
+                say(f"All {total} lines fit, nothing to scroll", "activity", seconds=3)
                 return True
             step = {controls.SCROLL_UP: 1, controls.SCROLL_DOWN: -1,
                     controls.PAGE_UP: controls.PAGE_LINES, controls.PAGE_DOWN: -controls.PAGE_LINES,
@@ -362,40 +374,37 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
         elif key == controls.CLEAR_ACTIVITY:
             count = collector.clear_activity()
             scroll["offset"] = 0
-            notice.update(text=f"Cleared RECENT ACTIVITY ({count} lines)", until=time.monotonic() + 4)
+            say(f"Cleared {count} lines", "activity")
             latest["version"] += 1
             if state is not None:
                 state.events.clear()
             return True
         elif key == controls.CLEAR_ALERTS:
             count = collector.clear_alerts()
-            notice.update(text=f"Cleared WARNINGS & ERRORS ({count} lines)", until=time.monotonic() + 4)
+            say(f"Cleared {count} lines", "alerts")
             latest["version"] += 1
             if state is not None:
                 state.alert_events.clear()
             return True
         else:
             if len(key) == 1 and key.isprintable():
-                notice.update(
-                    text=f"Key '{key}' unused. RECENT ACTIVITY: [a] copy [x] clear. WARNINGS: [w] [z]",
-                    until=time.monotonic() + 4,
-                )
+                say(f"Key '{key}' unused", "activity", bad=True, seconds=2)
                 return True
             return False
         text = controls.format_lines(lines)
         slug = "activity" if key == controls.COPY_ACTIVITY else "warnings"
+        panel = "activity" if key == controls.COPY_ACTIVITY else "alerts"
         if not lines:
-            message = f"Nothing to copy in {what}"
+            say("Nothing to copy", panel, bad=True)
         else:
             how = controls.copy_to_clipboard(text)
             saved = controls.save_copy(slug, text)
             if how == "native":
-                message = f"Copied {len(lines)} lines from {what}"
+                say(f"Copied {len(lines)} lines", panel)
             elif how == "osc52":
-                message = f"Sent {len(lines)} lines from {what} to the terminal; also in {saved or 'no file'}"
+                say(f"Sent {len(lines)} lines to terminal (also {saved or 'unsaved'})", panel, bad=True)
             else:
-                message = f"Clipboard failed for {what}; saved {len(lines)} lines to {saved or 'nowhere'}"
-        notice.update(text=message, until=time.monotonic() + 4)
+                say(f"Clipboard failed, saved {saved or 'nowhere'}", panel, bad=True)
         return True
 
     # Once, immediately before the first frame. Nothing is printed after this.
@@ -415,8 +424,8 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
         ) as live:
             _announce_ready(token)
             if not keys.error:
-                # Mouse wheel scrolls RECENT ACTIVITY. Mouse selection still works
-                # while holding Shift; [a] / [w] copy everything anyway.
+                # Mouse wheel scrolls RECENT ACTIVITY and the Copy / Clear buttons
+                # are clickable. Selecting text by mouse needs Shift held.
                 try:
                     console.file.write(controls.MOUSE_ON)
                     console.file.flush()
@@ -437,6 +446,8 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                 if shown_notice != latest["state"].notice:
                     drawn_key = None
                 latest["state"].notice = shown_notice
+                latest["state"].notice_panel = notice["panel"]
+                latest["state"].notice_bad = notice["bad"]
                 latest["state"].keys_error = keys.error
                 # Hold the view still while new lines arrive, if scrolled back.
                 newest = getattr(collector, "_seq", 0)
@@ -459,6 +470,7 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                         build(latest["state"], max(30, width - 1), max(6, height - 1)),
                         refresh=True,
                     )
+                    ui["targets"] = list(latest["state"].click_targets)
                     drawn_key = key
                     drawn_at = now
                 await _sleep(stop, FRAME_POLL_SECONDS)

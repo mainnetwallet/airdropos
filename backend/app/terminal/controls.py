@@ -179,9 +179,11 @@ def decode_escape(body: str) -> Optional[str]:
         if not body.endswith("M"):
             return None
         try:
-            button = int(body[2:].split(";")[0])
+            button, col, row = (int(part) for part in body[2:-1].split(";")[:3])
         except ValueError:
             return None
+        if button == 0:  # left button pressed: "click:<column>:<row>", 1-based
+            return f"click:{col}:{row}"
         return {64: WHEEL_UP, 65: WHEEL_DOWN}.get(button)
     return _POSIX_SPECIAL.get(body[1:] if body[:1] in ("[", "O") else body)
 
