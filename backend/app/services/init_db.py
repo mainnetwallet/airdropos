@@ -16,10 +16,16 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
+from backend.app.core.logging_setup import configure_logging
 from backend.app.database.session import AsyncSessionLocal, Base, engine
 from backend.app.models import SystemSetting
+from backend.app.terminal.events import publish_success
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+# The shared configuration, not a private basicConfig: this script runs as its own
+# process, and it has to write to the same rotating diagnostic log and the same
+# event stream as the API and the worker, or the launcher's startup record has a
+# hole where the database was created.
+configure_logging()
 logger = logging.getLogger("airdropos.init_db")
 
 # Baseline settings. Secrets are stored encrypted in a real deployment; these
@@ -71,6 +77,9 @@ async def main() -> None:
 
     await engine.dispose()
     logger.info("Database initialization complete at %s", datetime.now(timezone.utc).isoformat())
+    # A milestone the caller has actually reached, not an inference drawn by the
+    # dashboard: the schema exists and the baseline settings are committed.
+    publish_success("airdropos.init_db", "Database initialization complete")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,25 @@ Works on Windows CMD, Windows PowerShell, Ubuntu and a VPS. Standard library onl
 
 First run: creates .venv, installs Python and npm dependencies, initialises the
 database, then starts everything. Press Ctrl+C once to stop all processes.
+
+Terminal output
+---------------
+`run.py` is the only thing that owns the screen. When stdout is an interactive
+terminal it starts one Rich dashboard (``python -m backend.app.terminal``) that
+renders the whole deployment and stays put, and routes every process's log
+records into the dashboard's activity feed through a shared, structured event
+stream (``backend.app.terminal.events``) instead of letting them print over it.
+Nothing is lost: the same records go to a rotating diagnostic log, and
+``--no-dashboard`` restores the previous behaviour of streaming them to the
+terminal directly.
+
+This script stays standard-library only. It imports ``backend.app.terminal.events``
+- which is itself standard-library only - to publish its own progress lines, and
+never imports the application, the tool registry or a database driver.
+
+Redirecting stdout (``python run.py > session.txt``) is the supported way to
+capture a run: the dashboard is skipped and the structured logs are streamed
+instead, because escape sequences written to a file would be meaningless bytes.
 """
 
 from __future__ import annotations
@@ -26,6 +45,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent
@@ -35,13 +55,89 @@ VENV_PY = VENV / ("Scripts/python.exe" if IS_WIN else "bin/python")
 FRONTEND = ROOT / "frontend"
 STAMP = VENV / ".requirements-stamp"
 
+# Set once the dashboard owns the screen. Everything printed after that point
+# would punch a hole in its live region, so it goes to the event stream instead.
+_quiet = False
+
+
+def _events():
+    """The shared event stream, or None if this checkout cannot provide it.
+
+    Standard library only and import-light by design, so `run.py` never has to
+    import the application to publish a line. A failure here degrades the
+    dashboard's activity feed and nothing else: the platform still runs.
+    """
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        from backend.app.terminal import events
+
+        return events
+    except Exception:
+        return None
+
+
+def publish(level: str, source: str, message: str, *, proc: str = "run") -> None:
+    """Record one structured event. Best effort, and silent when unavailable."""
+    module = _events()
+    if module is None:
+        return
+    try:
+        module.publish(level, source, message, proc=proc)
+    except Exception:
+        pass
+
+
+def emit(text: str) -> None:
+    """Print one line without ever dying on an unencodable character.
+
+    A child process is free to print anything, including characters the local
+    code page cannot represent. Losing a glyph is cosmetic; losing the reader
+    thread would silently hide every later line from that process.
+    """
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, "replace").decode(encoding, "replace"), flush=True)
+    except Exception:
+        pass
+
+
+def enable_utf8_console() -> None:
+    """Let box-drawing characters survive on a Windows console.
+
+    Delegated to the shared terminal module so the launcher and the dashboard
+    cannot disagree about it; `run.py` still only imports standard library plus
+    that one module.
+    """
+    module = _events()
+    if module is not None:
+        try:
+            module.enable_utf8_output()
+            return
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
 
 def log(msg: str) -> None:
-    print(f"[run] {msg}", flush=True)
+    if not _quiet:
+        emit(f"[run] {msg}")
+    publish("INFO", "run", msg)
 
 
 def die(msg: str, code: int = 1) -> None:
-    print(f"[run] ERROR: {msg}", file=sys.stderr, flush=True)
+    publish("ERROR", "run", msg)
+    if not _quiet:
+        try:
+            print(f"[run] ERROR: {msg}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
     sys.exit(code)
 
 
@@ -385,8 +481,48 @@ def uvicorn_command(venv_python: Path, host: str, port: str, *, access_log: bool
     return cmd
 
 
+def _line_level(line: str) -> str:
+    """Severity for a line of a child's unstructured output.
+
+    Only for output with no Python logging behind it (the Vite dev server, and
+    uvicorn's own logger, which keeps its own handler). Anything that does log
+    reaches the event stream through its own handlers, so this never has to guess
+    about the API or the worker.
+
+    The severity word has to LEAD the line, which is how node and vite emit it.
+    Matching the word anywhere would turn a request for `/api/v1/errors` into an
+    error event.
+    """
+    low = line.strip().lower()
+    if low.startswith("critical") or "traceback (most recent call last)" in low:
+        return "CRITICAL"
+    if low.startswith(("error", "err!", "fatal")) or low.endswith("exception"):
+        return "ERROR"
+    if low.startswith(("warn", "warning")):
+        return "WARNING"
+    return "INFO"
+
+
 class Proc:
-    def __init__(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str]):
+    """One managed child process.
+
+    stdout and stderr are normally captured so the lines can be published as
+    structured events instead of being printed over the dashboard.
+    ``capture_stdout=False`` hands the child the real console, which is what the
+    dashboard needs: Rich only redraws in place when stdout is a terminal, and a
+    pipe would make it dump a full screen of text on every refresh.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        cmd: list[str],
+        cwd: Path,
+        env: dict[str, str],
+        *,
+        capture_stdout: bool = True,
+        pipe_stdin: bool = False,
+    ):
         self.name = name
         kwargs: dict = {}
         if IS_WIN:
@@ -394,16 +530,38 @@ class Proc:
         else:
             kwargs["start_new_session"] = True
         self.p = subprocess.Popen(
-            cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs
+            cmd,
+            cwd=cwd,
+            env=env,
+            # stdout and stderr are merged into ONE pipe on purpose. Draining them
+            # with two sequential readers deadlocks: a process that writes nothing
+            # to stdout (uvicorn logs to stderr) leaves the stdout reader blocked
+            # forever, and its stderr fills the pipe buffer, so the service looks
+            # silent until it exits.
+            stdout=subprocess.PIPE if capture_stdout else None,
+            stderr=subprocess.STDOUT if capture_stdout else None,
+            stdin=subprocess.PIPE if pipe_stdin else None,
+            **kwargs,
         )
         self.t = threading.Thread(target=self._pump, daemon=True)
         self.t.start()
 
     def _pump(self) -> None:
-        assert self.p.stdout is not None
+        if self.p.stdout is None:
+            return
         for raw in iter(self.p.stdout.readline, b""):
             line = raw.decode("utf-8", errors="replace").rstrip()
-            print(f"[{self.name}] {line}", flush=True)
+            if not _quiet:
+                emit(f"[{self.name}] {line}")
+            publish(_line_level(line), self.name, line, proc=self.name)
+
+    def close_stdin(self) -> None:
+        """Ask a child to shut down cleanly (the dashboard watches for EOF)."""
+        try:
+            if self.p.stdin is not None and not self.p.stdin.closed:
+                self.p.stdin.close()
+        except (OSError, ValueError):
+            pass
 
     def stop(self) -> None:
         if self.p.poll() is not None:
@@ -428,10 +586,146 @@ class Proc:
                     pass
 
 
+def run_capture(cmd: list[str], env: dict[str, str], cwd: Path = ROOT) -> int:
+    """Run a command to completion, echoing its output to the terminal.
+
+    Used for the database bootstrap, which has to finish before the dashboard can
+    describe anything. The child's log records reach the event stream through its
+    own handlers, so echoing here does not duplicate them: it only replaces an
+    inherited console handle with a captured one.
+    """
+    log("$ " + " ".join(cmd))
+    # Name the process after the module it runs, so its events are attributed to
+    # `init_db` rather than to the `-m` flag in front of it.
+    name = cmd[2].rsplit(".", 1)[-1] if len(cmd) > 2 and cmd[1] == "-m" else "child"
+    result = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=dict(env, AIRDROPOS_PROC=name),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert result.stdout is not None
+    for raw in iter(result.stdout.readline, b""):
+        emit("  " + raw.decode("utf-8", errors="replace").rstrip())
+    result.wait()
+    return result.returncode
+
+
+# ----------------------------------------------------------------------
+# Dashboard
+# ----------------------------------------------------------------------
+DASHBOARD_READY_TIMEOUT_SECONDS = 30.0
+
+
+def _terminal_is_interactive() -> bool:
+    """Whether this terminal may be taken over.
+
+    A pipe, a redirect and `TERM=dumb` all mean escape sequences would be written
+    as literal bytes into a file instead of moving a cursor, so the services
+    print their logs directly, exactly as they always have. That is the supported
+    way to capture a session, and it needs no flag.
+    """
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except Exception:
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    return os.environ.get("AIRDROPOS_DASHBOARD", "").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _ready_file() -> Optional[Path]:
+    module = _events()
+    if module is None:
+        return None
+    return module.LOG_DIR / "dashboard.ready"
+
+
+def _dashboard_ready(path: Optional[Path], token: str) -> bool:
+    """Whether the dashboard owns the screen yet.
+
+    Matched on a token rather than a pid on purpose. On Windows the venv's
+    ``python.exe`` is a launcher that spawns the real interpreter as a child, so
+    the pid ``run.py`` holds is not the pid the dashboard reports from the
+    inside. The token is generated here and handed over on the command line, so
+    it is this run's dashboard and no other. A file left behind by a killed run
+    therefore cannot make this one think the screen is taken.
+    """
+    if path is None:
+        return False
+    try:
+        return path.read_text(encoding="utf-8").strip().endswith(token)
+    except OSError:
+        return False
+
+
+def start_dashboard(
+    env: dict[str, str],
+    *,
+    started_at: float,
+    backend_url: str,
+    api_prefix: str,
+    frontend_url: str,
+    gateway_host: str,
+    gateway_port: int,
+    interactive: bool,
+) -> Optional[Proc]:
+    """Start the dashboard, or return None to keep printing to the terminal.
+
+    Returning None is a supported outcome, not a failure: stdout may be a pipe,
+    the terminal may be dumb, or the dashboard may be unable to start. The
+    services are then launched exactly as they were before it existed.
+    """
+    if not interactive or not VENV_PY.exists():
+        return None
+    ready = _ready_file()
+    if ready is None:
+        # Without the shared event stream there is no activity feed to render and
+        # no handshake file to wait on; stream the logs instead.
+        log("The shared event stream is unavailable; streaming service logs instead.")
+        return None
+    token = secrets.token_hex(8)
+    cmd = [
+        str(VENV_PY), "-m", "backend.app.terminal",
+        "--started", str(started_at),
+        "--ready-token", token,
+        "--backend-url", backend_url,
+        "--api-prefix", api_prefix,
+        "--frontend-url", frontend_url,
+        "--gateway-host", gateway_host,
+        "--gateway-port", str(gateway_port),
+    ]
+    dashboard_env = dict(env)
+    dashboard_env["AIRDROPOS_PROC"] = "dashboard"
+    dashboard_env.pop("AIRDROPOS_QUIET", None)
+    proc = Proc("dashboard", cmd, ROOT, dashboard_env, capture_stdout=False, pipe_stdin=True)
+
+    deadline = time.time() + DASHBOARD_READY_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if _dashboard_ready(ready, token):
+            log("Terminal dashboard ready.")
+            return proc
+        if proc.p.poll() is not None:
+            log(
+                f"The dashboard exited immediately (code {proc.p.returncode}); "
+                "using plain logs on this terminal."
+            )
+            return None
+        time.sleep(0.2)
+
+    log("The dashboard did not take over the screen in time; stopping it and using plain logs.")
+    proc.stop()
+    return None
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Run AirdropOS backend + worker + frontend.")
     ap.add_argument("--no-worker", action="store_true", help="do not start the background worker")
-    ap.add_argument("--no-frontend", action="store_true", help="do not start the dashboard")
+    ap.add_argument("--no-frontend", action="store_true", help="do not start the web dashboard (Vite dev server)")
     ap.add_argument("--sqlite", action="store_true", help="use a local SQLite file instead of PostgreSQL (no Docker needed); saved in .env")
     ap.add_argument("--no-infra", action="store_true", help="do not check/start PostgreSQL and Redis")
     ap.add_argument("--skip-install", action="store_true", help="skip pip/npm install steps")
@@ -446,13 +740,31 @@ def main() -> None:
         help="print one line per HTTP request (off by default; also settable with ACCESS_LOG=true in .env)",
     )
     ap.add_argument("--keep-existing", action="store_true", help="do not stop old AirdropOS processes that still hold the ports")
+    ap.add_argument(
+        "--no-dashboard",
+        action="store_true",
+        help="stream service logs to the terminal instead of the live dashboard",
+    )
     args = ap.parse_args()
 
     if sys.version_info < (3, 10):
         die("Python 3.10+ is required (3.11 recommended).")
 
+    # Before anything prints: the dashboard and the captured service output are
+    # both full of characters a default Windows code page cannot represent.
+    enable_utf8_console()
+
     if args.update and not os.environ.get("AIRDROPOS_UPDATED"):
         update_code()
+
+    # One event stream per run. Truncating before anything else starts means the
+    # dashboard's activity feed is exactly this run, never a previous one's.
+    events = _events()
+    if events is not None:
+        try:
+            events.reset_event_stream()
+        except Exception:
+            pass
 
     env_file = ROOT / ".env"
     if not env_file.exists():
@@ -477,26 +789,51 @@ def main() -> None:
     ensure_python_env(args.skip_install)
     npm = None if args.no_frontend else ensure_node()
 
+    started_at = time.time()
     child_env = os.environ.copy()
     child_env["PYTHONUNBUFFERED"] = "1"
     child_env["PYTHONIOENCODING"] = "utf-8"
     child_env["FORCE_COLOR"] = "0"
+    # The launcher owns rotation of the shared diagnostic log, and only the
+    # processes it starts may rename it.
+    child_env["AIRDROPOS_LOG_OWNER"] = "1"
 
     host = args.host
     port = env_vals.get("BACKEND_PORT", "8000")
+    gateway_host = env_vals.get("LIVE_GATEWAY_HOST", "127.0.0.1")
+    gateway_port = env_vals.get("LIVE_GATEWAY_PORT", "8765")
 
     if not args.keep_existing:
         # A previous `py run.py` that is still running (another terminal, closed window, crash) would
         # hold these ports. Stop it so this run starts fresh instead of clashing with it.
         ports: dict[int, str] = {int(port): "backend"}
         if not args.no_worker and env_vals.get("LIVE_GATEWAY_ENABLED", "true").lower() != "false":
-            ports[int(env_vals.get("LIVE_GATEWAY_PORT", "8765"))] = "worker gateway"
+            ports[int(gateway_port)] = "worker gateway"
         if npm:
             ports[5173] = "dashboard"
         free_ports(ports)
 
     log("Initialising database...")
-    run_checked([str(VENV_PY), "-m", "backend.app.services.init_db"], env=child_env)
+    if run_capture([str(VENV_PY), "-m", "backend.app.services.init_db"], child_env) != 0:
+        die("Database initialisation failed. See the output above.")
+
+    # The dashboard comes up before the services so it can report their startup
+    # as it happens, which is what an operator watching a cold start needs.
+    dashboard = start_dashboard(
+        child_env,
+        started_at=started_at,
+        backend_url=f"http://127.0.0.1:{port}",
+        api_prefix=env_vals.get("API_V1_PREFIX", "/api/v1"),
+        frontend_url="http://127.0.0.1:5173" if npm else "",
+        gateway_host=gateway_host,
+        gateway_port=int(gateway_port),
+        interactive=not args.no_dashboard and _terminal_is_interactive(),
+    )
+    if dashboard is not None:
+        # From here the dashboard owns the screen, so the services stop printing
+        # to it and report through the shared event stream instead.
+        globals()["_quiet"] = True
+        child_env["AIRDROPOS_QUIET"] = "1"
 
     procs: list[Proc] = []
     uvicorn_cmd = uvicorn_command(
@@ -506,18 +843,23 @@ def main() -> None:
         access_log=args.access_log or _env_flag(env_vals, "ACCESS_LOG"),
         reload=args.reload,
     )
-    procs.append(Proc("backend", uvicorn_cmd, ROOT, child_env))
+    procs.append(Proc("backend", uvicorn_cmd, ROOT, dict(child_env, AIRDROPOS_PROC="backend")))
     if not args.no_worker:
-        procs.append(Proc("worker", [str(VENV_PY), "-m", "backend.app.scheduler.worker"], ROOT, child_env))
+        procs.append(
+            Proc(
+                "worker",
+                [str(VENV_PY), "-m", "backend.app.scheduler.worker"],
+                ROOT,
+                dict(child_env, AIRDROPOS_PROC="worker"),
+            )
+        )
     if npm:
-        procs.append(Proc("web", [npm, "run", "dev"], FRONTEND, child_env))
+        procs.append(Proc("web", [npm, "run", "dev"], FRONTEND, dict(child_env, AIRDROPOS_PROC="web")))
 
-    log("-" * 60)
     log(f"Backend API : http://localhost:{port}   (docs: /docs)")
     if npm:
         log("Dashboard   : http://localhost:5173")
     log("Press Ctrl+C to stop everything.")
-    log("-" * 60)
 
     def _graceful(signum, frame):  # Ctrl+C, `kill`, systemd stop
         raise KeyboardInterrupt
@@ -535,13 +877,34 @@ def main() -> None:
                     log(f"'{pr.name}' exited with code {rc}. Stopping everything.")
                     exit_code = rc or 1
                     raise KeyboardInterrupt
+            if dashboard is not None and dashboard.p.poll() is not None:
+                # The dashboard is the operator's only view. If it dies, say so
+                # and stop rather than leaving services running invisibly.
+                log(
+                    f"The terminal dashboard exited with code {dashboard.p.returncode}. "
+                    "Stopping everything; see logs/airdropos.log for details."
+                )
+                exit_code = dashboard.p.returncode or 1
+                raise KeyboardInterrupt
             time.sleep(1)
     except KeyboardInterrupt:
         pass
     finally:
+        # The dashboard goes first: closing its stdin lets it leave the live
+        # display cleanly, which restores the cursor and clears the screen before
+        # anything else prints.
+        if dashboard is not None:
+            dashboard.close_stdin()
+            try:
+                dashboard.p.wait(timeout=6)
+            except subprocess.TimeoutExpired:
+                pass
+        globals()["_quiet"] = False
         log("Stopping...")
         for pr in reversed(procs):
             pr.stop()
+        if dashboard is not None:
+            dashboard.stop()
         log("Stopped.")
     sys.exit(exit_code)
 

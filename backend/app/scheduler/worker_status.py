@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional
@@ -28,6 +27,12 @@ from sqlalchemy import select
 from backend.app.database.session import AsyncSessionLocal
 from backend.app.models import IntegrationHealth
 
+# Logs are shown in the browser, so strip anything that looks like a credential.
+# The rules live in the terminal event stream, which writes the same kind of
+# record to disk and needs the same guarantee; importing them here keeps one list
+# instead of two that drift apart.
+from backend.app.terminal.events import redact
+
 logger = logging.getLogger("airdropos.worker.status")
 
 WORKER_SUBSYSTEM = "worker"
@@ -36,21 +41,6 @@ HEARTBEAT_INTERVAL_SECONDS = 5
 STALE_AFTER_SECONDS = 20
 MAX_LOG_LINES = 200
 MAX_LOG_MESSAGE_CHARS = 600
-
-# Logs are shown in the browser, so strip anything that looks like a credential.
-_REDACTIONS = [
-    (re.compile(r"(?i)\b(bearer|token|api[_-]?key|secret|password|authorization)(\s*[=:]\s*|\s+)(?:(?:bearer|basic)\s+)?[^\s,;'\"]+"), r"\1\2***"),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), "***"),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "***"),
-    (re.compile(r"\b(?:0x)?[0-9a-fA-F]{64}\b"), "***"),
-    (re.compile(r"\b\d{6,10}:[A-Za-z0-9_-]{30,}\b"), "***"),  # Telegram bot tokens
-]
-
-
-def redact(text: str) -> str:
-    for pattern, replacement in _REDACTIONS:
-        text = pattern.sub(replacement, text)
-    return text
 
 
 class LogRingHandler(logging.Handler):

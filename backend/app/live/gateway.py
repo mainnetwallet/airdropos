@@ -28,6 +28,7 @@ from backend.app.live.models import Conflict, NotSupported, SessionNotFound
 from backend.app.live.providers import PROVIDERS
 from backend.app.live.security import GATEWAY_HEADER, bind_allowed, secret_matches
 from backend.app.security.emergency_stop import emergency_stop
+from backend.app.terminal.events import publish_success
 
 logger = logging.getLogger("airdropos.live.gateway")
 
@@ -346,6 +347,12 @@ async def serve(shutdown_event: asyncio.Event) -> None:
         task = asyncio.create_task(server.serve(sockets=[sock]))
         sweeper = asyncio.create_task(_sweep_loop(shutdown_event))
         logger.info("Live gateway listening on %s:%s", settings.LIVE_GATEWAY_HOST, settings.LIVE_GATEWAY_PORT)
+        # The socket is bound and serving: a fact this process established, so
+        # it is published as a completed start rather than inferred downstream.
+        publish_success(
+            __name__,
+            f"Live gateway listening on {settings.LIVE_GATEWAY_HOST}:{settings.LIVE_GATEWAY_PORT}",
+        )
         await shutdown_event.wait()
         server.should_exit = True
         sweeper.cancel()

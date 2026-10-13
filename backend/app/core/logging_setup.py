@@ -1,14 +1,5 @@
 """Shared logging configuration for every AirdropOS process.
 
-The API (``backend.app.main``) and the background worker
-(``backend.app.scheduler.worker``) used to configure logging separately and
-identically, and both let the ASGI access log run. Two consequences, neither of
-them a defect:
-
-* every registered tool logged one line at INFO, in two processes, on every start;
-* the dashboard polls a handful of endpoints every few seconds, so the terminal
-  filled with one line per request and warnings scrolled past unread.
-
 This module is the one place that decides what is printed, and it is deliberately
 narrow about what it silences:
 
@@ -20,19 +11,37 @@ narrow about what it silences:
   loggers. Transaction, authentication, emergency-stop and audit events all log at
   INFO or above and keep working exactly as before.
 
+Where the records go:
+
+``logs/airdropos.log``
+    Rotating human-readable diagnostics. Everything at INFO and above, always,
+    whatever the terminal is doing.
+
+``logs/airdropos-events.jsonl``
+    Structured one-line-per-record stream consumed by the terminal dashboard.
+    Only DEBUG is dropped from *this* sink; DEBUG stays in the diagnostic log.
+
+the terminal
+    Present only when ``run.py`` has handed the screen to the dashboard
+    (``AIRDROPOS_QUIET=1``). Without it the console handler prints exactly as
+    before, so a piped run, CI, or a crash before the dashboard starts still
+    shows the log.
+
 Security-relevant history is not in this path at all. ``security.auth.write_audit``
 writes every login, revocation, emergency-stop change and similar to the
-``audit_logs`` table, readable through ``GET /api/v1/audit``. Quietening stdout
-therefore hides nothing an auditor relies on; it only stops the dashboard's polling
-from burying the lines that matter.
+``audit_logs`` table, readable through ``GET /api/v1/audit``. Neither sink hides
+anything an auditor relies on; the dashboard only decides where records are
+*displayed*, and every message is redacted before it is written.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from backend.app.core.config import settings
+from backend.app.terminal import events
 
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 
@@ -47,22 +56,47 @@ _ACCESS_LOGGERS = ("uvicorn.access", "hypercorn.access")
 _configured = False
 
 
-def configure_logging(force: bool = False) -> None:
-    """Install the AirdropOS log format and quieten request-only loggers.
+def _quiet_console() -> bool:
+    """True when the terminal dashboard owns the screen and must stay unbroken."""
+    return os.environ.get("AIRDROPOS_QUIET", "").strip().lower() in ("1", "true", "yes", "on")
 
-    Safe to call more than once: the root handler is installed only the first time,
+
+def configure_logging(force: bool = False) -> None:
+    """Install the AirdropOS log sinks and quieten request-only loggers.
+
+    Safe to call more than once: handlers are installed only the first time,
     so an importer that configures logging early cannot double every later line.
     """
     global _configured
     if _configured and not force:
         return
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
-    logging.basicConfig(level=level, format=LOG_FORMAT)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(level=level, format=LOG_FORMAT)
+        root.setLevel(level)
+    else:
+        root.setLevel(level)
+
     for name in _REQUEST_ONLY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
     if not access_log_enabled():
         for name in _ACCESS_LOGGERS:
             logging.getLogger(name).setLevel(logging.WARNING)
+
+    # Rotating diagnostics and the structured event stream, in every process,
+    # console or not. Idempotent, so a re-import cannot duplicate every line.
+    events.install_handlers(root)
+
+    if _quiet_console():
+        # The dashboard renders the activity feed; a console handler here would
+        # punch holes through its live region.
+        for handler in list(root.handlers):
+            if type(handler).__name__ == "StreamHandler" and not isinstance(
+                handler, logging.FileHandler
+            ):
+                root.removeHandler(handler)
+
     _configured = True
 
 

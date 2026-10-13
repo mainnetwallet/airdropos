@@ -20,6 +20,7 @@ from backend.app.core.config import settings
 from backend.app.core.logging_setup import configure_logging
 from backend.app.live.relay import relay_loop
 from backend.app.security.emergency_stop import emergency_stop
+from backend.app.terminal.events import publish_success
 from backend.app.tools.bootstrap import bootstrap_tools
 from backend.app.tools.registry import registry  # noqa: F401  (re-exported for callers)
 from backend.app.transactions.approvals import bind_verifier
@@ -43,11 +44,52 @@ async def lifespan(app: FastAPI):
         logger.warning("EMERGENCY STOP ACTIVE at startup: %s", emergency_stop.status()["reason"])
     relay_stop = asyncio.Event()
     relay_task = asyncio.create_task(relay_loop(relay_stop)) if settings.LIVE_GATEWAY_ENABLED else None
+    # "Started" is only true once this process answers on its own port, and the
+    # lifespan body finishes before uvicorn binds the socket. Readiness is
+    # therefore confirmed, not assumed.
+    ready_task = asyncio.create_task(_announce_ready_when_serving())
     yield
+    ready_task.cancel()
     relay_stop.set()
     if relay_task is not None:
         relay_task.cancel()
     logger.info("AirdropOS backend shutting down")
+
+
+# How long startup confirmation waits for the socket to answer before giving up.
+READY_PROBE_ATTEMPTS = 40
+READY_PROBE_INTERVAL_SECONDS = 0.5
+
+
+async def _announce_ready_when_serving() -> None:
+    """Publish a confirmed start once the API answers its own health endpoint.
+
+    The probe is the unauthenticated liveness route a load balancer would use, so
+    this proves the API is reachable rather than merely that the process exists.
+    Bounded: it gives up and logs instead of polling forever, and it can never
+    delay startup - it is a background task.
+    """
+    import httpx
+
+    prefix = settings.API_V1_PREFIX
+    url = f"http://127.0.0.1:{settings.BACKEND_PORT}{prefix}/health"
+    for _ in range(READY_PROBE_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                response = await client.get(url)
+            if response.status_code == 200:
+                host = settings.BACKEND_HOST
+                if host in ("127.0.0.1", "0.0.0.0", "::"):
+                    host = "localhost"
+                publish_success(
+                    "airdropos.api",
+                    f"Backend API started (http://{host}:{settings.BACKEND_PORT})",
+                )
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(READY_PROBE_INTERVAL_SECONDS)
+    logger.warning("Backend API did not answer its own health probe on %s.", url)
 
 
 app = FastAPI(

@@ -70,6 +70,11 @@ class EventBus:
                 self._live_ok.add(websocket)
             if session_hash:
                 self._sessions[websocket] = session_hash
+            clients = len(self._clients)
+        # One line per authenticated socket, not per frame: the terminal
+        # dashboard shows it as a client coming up. The access log, which used
+        # to cover this, is off by default.
+        logger.info("WebSocket client connected (%d live)", clients)
 
     async def disconnect(self, websocket: WebSocket) -> None:
         async with self._lock:

@@ -43,6 +43,11 @@ lxml>=5.2.2
 python-dotenv>=1.0.1
 pyyaml>=6.0.1
 
+# Terminal dashboard (python -m backend.app.terminal). Optional at runtime: the
+# dashboard falls back to structured plain logs when it is missing or when
+# stdout is not an interactive terminal.
+rich>=13.7.0
+
 # Future Test Dependencies (Created only, NOT executed during creation phase)
 pytest>=8.2.0
 pytest-asyncio>=0.23.6

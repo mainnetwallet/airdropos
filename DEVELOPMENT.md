@@ -579,13 +579,37 @@ Windows: `py run.py ...`. Ubuntu: `python3 run.py ...`.
 | `--sqlite` | Use a local SQLite file instead of PostgreSQL (no Docker). Saved in `.env`. Fine for one person on one PC. |
 | `--no-worker` | Do not start the background worker |
 | `--no-frontend` | Backend + worker only (no Node.js needed) |
+| `--no-dashboard` | Stream service logs to the terminal instead of the live terminal dashboard |
 | `--no-infra` | Do not check/start PostgreSQL (use your own) |
 | `--skip-install` | Skip pip install |
 | `--reload` | Auto-reload backend on code changes (development) |
 | `--host 0.0.0.0` | Bind the backend to all interfaces (default `127.0.0.1`) |
 
 Addresses: Dashboard http://localhost:5173 (Docker: 3000), API docs http://localhost:8000/docs.
-Logs are prefixed `[backend]`, `[worker]`, `[web]`. If one process crashes, the others are stopped and the reason is shown.
+If one process crashes, the others are stopped and the reason is shown.
+
+### 5.2a The terminal dashboard
+
+`py run.py` opens one live terminal dashboard instead of a wall of log lines: system
+status, agent configuration, task counts, scheduler jobs, the tool registry, recent
+activity and current warnings. It is redrawn in place, so nothing scrolls away.
+
+- It only reads. Every value comes from a source the platform already keeps: the API's
+  own health endpoint, a socket connect for the frontend and the live gateway, the
+  worker's heartbeat row, the task and schedule tables, the shared emergency-stop state
+  file, and a structured event stream every process appends to. A service that is down
+  or unreachable is shown as down; nothing is reported healthy because the dashboard is
+  running.
+- Full diagnostics keep going to `logs/airdropos.log` (rotating) and
+  `logs/airdropos-events.jsonl` (structured, one run per file). Nothing is filtered out
+  of them; every message is redacted before it is written.
+- `--no-dashboard` prints the same logs directly, which is also what happens
+  automatically when stdout is not an interactive terminal. Redirecting stdout
+  (`py run.py > session.txt`) captures the run that way.
+- Layout: the full three-column layout needs about 140x40. Below that it rearranges into
+  two columns, and the activity feed is the only panel that shrinks. The logo is drawn
+  from the same monochrome glyphs as the rest of the UI because a terminal cannot scale
+  a glyph; nothing else is approximated.
 
 ### 5.3 Run the tests
 

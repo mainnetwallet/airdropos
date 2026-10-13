@@ -5,6 +5,40 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added (live terminal dashboard)
+- **`py run.py` now opens one live terminal dashboard.** It shows the AirdropOS header
+  and version, environment/model/endpoint, four system-status cards (backend API,
+  frontend, worker, live gateway), the agent configuration panel, four task statistic
+  cards, all nine scheduler jobs with their intervals and last recorded run, the tool
+  registry grouped by category, a recent-activity feed, a warnings-and-errors panel
+  and a footer with uptime, log level and the log path. It is redrawn in place by
+  `rich.live.Live`, so services printing a line no longer push the screen away and
+  warnings cannot scroll out of view.
+- **Every number on it is read, not assumed.** The backend is probed through its own
+  `/health`, the frontend and the live gateway through a socket connect, the worker
+  through the `integration_health` heartbeat row it already republishes (with the same
+  staleness rule the API uses), task counts and scheduler jobs from the tables the API
+  reads, and the emergency stop from the shared state file every process honours.
+  Emergency Stop shows `UNKNOWN` rather than `INACTIVE` whenever that state cannot be
+  established, and a service that is stopped appears in the warnings panel even when it
+  logged nothing.
+- **Tool categories are derived from the registry**, from each tool's declared
+  `required_permissions`, so the counts sum to the registered total instead of being a
+  hand-maintained list. The inventory is the one `bootstrap_tools()` produces, with its
+  own log line suppressed in that process so the inventory is not logged twice.
+- **`backend/app/terminal/`** (new): `events` (cross-process JSON-lines stream and the
+  rotating diagnostic log), `state` (the probes and database reads), `catalog`, `theme`,
+  `render`, `dashboard` and `__main__`. Started by `run.py` as
+  `python -m backend.app.terminal`.
+- **`logs/airdropos.log`** (new, rotating) and **`logs/airdropos-events.jsonl`** (new):
+  full diagnostics and the structured stream the dashboard reads. Every message is
+  redacted before it is written, using the rules the worker's log ring already applied.
+- **`--no-dashboard`** on `run.py` restores the previous behaviour of streaming service
+  logs to the terminal, which is also what happens automatically when stdout is not an
+  interactive terminal. Redirecting stdout (`python run.py > session.txt`) captures a run
+  that way, because escape sequences written to a file would only be bytes.
+- **`rich>=13.7.0`** added to `backend/requirements.txt` and `backend/pyproject.toml`.
+
 ### Changed (startup logging, quieter terminal)
 - **The tool list was printed twice, and then at enormous length.** `ToolRegistry.register`
   logged one INFO line per tool, and the API and the worker each run the same bootstrap, so a
@@ -45,6 +79,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
   bus, and reconnection after a genuine network drop is unchanged (exponential backoff, reset
   on a successful open). Authentication, scope checks and server-side revalidation are
   untouched.
+### Fixed (launcher output handling)
+- **A service could look silent until it exited.** `run.py` read a child's stdout and
+  stderr with two sequential readers on one merged pipe. A process that writes nothing to
+  stdout (uvicorn logs to stderr) left the stdout reader blocked forever, so every line
+  it wrote to stderr stayed in the pipe buffer until the process ended. Both streams are
+  now drained by one reader over one pipe, as before.
+- **One unprintable character killed a log reader.** A child printing a character the
+  local code page cannot represent raised `UnicodeEncodeError` inside the reader thread,
+  and every later line from that process disappeared. Printing is now non-fatal, and
+  `run.py` switches the Windows console to UTF-8 before anything else starts so the
+  dashboard's box-drawing characters render at all.
+
 ### Fixed (pre-login requests)
 - **Every page load produced a 401 before an operator could log in.** The login gate called
   the protected `GET /api/v1/overview` to find out whether there was a session, so a

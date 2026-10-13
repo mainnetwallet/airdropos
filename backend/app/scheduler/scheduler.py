@@ -18,6 +18,7 @@ from backend.app.core.config import settings
 from backend.app.database.session import AsyncSessionLocal
 from backend.app.models import AutomationSchedule, ScheduledRun
 from backend.app.security.emergency_stop import emergency_stop
+from backend.app.terminal.events import publish_success
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,10 @@ class Scheduler:
             return
         self._running = True
         logger.info("Scheduler started: %d jobs registered", len(self._jobs))
+        # The milestone the operator cares about, published by the component
+        # that reached it, so the dashboard shows a completed start rather than
+        # inferring one from a line of log text.
+        publish_success(__name__, f"Scheduler started — {len(self._jobs)} jobs registered")
         self._tasks["loop"] = asyncio.create_task(self._loop(db))
 
     async def stop(self) -> None:

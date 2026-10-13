@@ -35,6 +35,7 @@ from backend.app.scheduler.worker_status import heartbeat_loop, redact, state as
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
+from backend.app.terminal.events import publish_success
 from backend.app.tools.bootstrap import bootstrap_tools
 from backend.app.tools.registry import registry
 
@@ -551,6 +552,9 @@ async def main() -> None:
     # thing for its own registry; neither prints the tool names.
     bootstrap_tools()
     worker_state.begin(WORKER_ID, list(registry._tools))
+    # Published by the process that finished initialising, so the dashboard can
+    # say "worker initialized" as a fact rather than guessing from a log line.
+    publish_success("airdropos.worker", f"Worker initialized ({WORKER_ID})")
     if emergency_stop.is_stopped:
         logger.warning("EMERGENCY STOP IS ACTIVE. No new execution or submissions.")
 
