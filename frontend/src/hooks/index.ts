@@ -1,7 +1,7 @@
 /** Real-time WebSocket event hook with automatic reconnection. */
 
 import { useEffect, useRef, useState } from 'react'
-import { wsProtocols, wsUrl } from '@/services/api'
+import { canOpenLiveStream, wsProtocols, wsUrl } from '@/services/api'
 import type { WsEvent } from '@/types'
 
 export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
@@ -19,6 +19,16 @@ export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
 
     const connect = () => {
       if (closed) return
+      // A refused handshake is not a retryable failure: without a session token the
+      // server closes the connection before accepting it, so every attempt would be
+      // a guaranteed rejection (visible to the operator as a burst of failed
+      // connection attempts). Waiting for a token costs nothing and keeps the
+      // dashboard quiet. Re-opening is driven by remounting after login, which clears
+      // this effect and runs `connect` again with a token present.
+      if (!canOpenLiveStream()) {
+        setConnected(false)
+        return
+      }
       const socket = new WebSocket(wsUrl(), wsProtocols())
       socketRef.current = socket
 
@@ -44,6 +54,9 @@ export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
         setConnected(false)
         if (heartbeat) window.clearInterval(heartbeat)
         if (closed) return
+        // The session may have ended while the socket was open. Reconnecting without
+        // a token would only produce another refused handshake.
+        if (!canOpenLiveStream()) return
         // Exponential backoff, capped so a downed backend is not hammered.
         const delay = Math.min(1000 * 2 ** retryRef.current, 30000)
         retryRef.current += 1

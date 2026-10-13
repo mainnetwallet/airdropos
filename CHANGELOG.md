@@ -5,6 +5,36 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed (startup logging, quieter terminal)
+- **The tool list was printed twice.** `ToolRegistry.register` logged one INFO line per
+  tool, and the API and the worker each run the same bootstrap, so a single start produced
+  ~70 identical lines across two processes and pushed the startup banner off screen. The
+  per-tool line is now DEBUG (still visible with `LOG_LEVEL=DEBUG`), and the full inventory
+  is printed once, on one line, by the API process — the one that serves `GET /tools`. The
+  worker logs the count only.
+- **The per-request access log is off by default.** The dashboard polls several endpoints
+  every few seconds, so one line per request outweighed everything else combined. Set
+  `ACCESS_LOG=true` in `.env`, or pass `python run.py --access-log`, to turn it back on.
+  Nothing else was filtered: server warnings, errors and tracebacks come from a different
+  logger and always print, and no AirdropOS logger had its level raised. Security history
+  does not depend on stdout at all — every login, revocation and emergency-stop change is
+  written to `audit_logs` by `security.auth.write_audit` and read through
+  `GET /api/v1/audit`.
+- **`backend/app/core/logging_setup.py`** (new): the single place both processes configure
+  logging, replacing two identical copies in `main.py` and `worker.py`.
+### Fixed (pre-login requests)
+- **Every page load produced a 401 before an operator could log in.** The login gate called
+  the protected `GET /api/v1/overview` to find out whether there was a session, so a
+  browser with no token always got a guaranteed failure, on every reload. The
+  unauthenticated `GET /api/v1/health` now reports `auth_required`, and the dashboard asks
+  that first: no request is made to a protected endpoint unless there is actually a token
+  to present. A stored session is still validated, a deployment with `AUTH_ENABLED=false`
+  still goes straight in, and a 401 is still handled exactly as before.
+- **The live event socket was opened with no session.** With authentication on, the
+  handshake was refused before it was accepted, and the reconnect loop retried on a timer
+  for as long as the login form was open. It is now not opened at all until a token
+  exists. The server-side check is unchanged and still refuses an unauthenticated socket.
+
 ### Fixed (live worker)
 - **The Live log on the Live Worker page could be copied but not cleared.** Added a
   **Clear** button next to **Copy**. The worker is a separate process that republishes its

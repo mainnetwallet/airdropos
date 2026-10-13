@@ -71,8 +71,19 @@ async def health() -> Dict[str, Any]:
     credentials, so it deliberately reports only liveness. It reveals nothing
     about the fixed model, endpoints, wallet state, or subsystem internals —
     those live behind `/health/detail` and require the `read` scope.
+
+    `auth_required` is deployment configuration, not subsystem state: it says
+    whether a session token is needed to reach anything else. The dashboard needs it
+    to decide between the login form and the app, and asking by calling a protected
+    endpoint instead cost a guaranteed 401 on every page load. It is not a secret —
+    an unauthenticated caller learns the same by sending one request and reading the
+    status code.
     """
-    return {"status": "ok", "service": "airdropos"}
+    return {
+        "status": "ok",
+        "service": "airdropos",
+        "auth_required": bool(settings.AUTH_ENABLED),
+    }
 
 
 @router.get("/health/detail", tags=["system"])

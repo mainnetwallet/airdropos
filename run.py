@@ -359,6 +359,32 @@ def ensure_node() -> str:
     return npm
 
 
+def _env_flag(env_vals: dict[str, str], key: str) -> bool:
+    """Read a boolean out of the already-parsed .env values.
+
+    Only the spellings an operator realistically writes are accepted; anything else
+    is False, which is the safe answer for a logging toggle.
+    """
+    return env_vals.get(key, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def uvicorn_command(venv_python: Path, host: str, port: str, *, access_log: bool, reload: bool) -> list[str]:
+    """Build the backend command line.
+
+    The access log prints one line per HTTP request. The dashboard polls several
+    endpoints every few seconds, so it produced far more output than everything else
+    combined and pushed warnings and errors off the screen. It is off unless it is
+    explicitly asked for, which it can be from .env (ACCESS_LOG) or with --access-log.
+    Nothing else is filtered: server warnings, errors and tracebacks still print.
+    """
+    cmd = [str(venv_python), "-m", "uvicorn", "backend.app.main:app", "--host", host, "--port", port]
+    if reload:
+        cmd.append("--reload")
+    if not access_log:
+        cmd.append("--no-access-log")
+    return cmd
+
+
 class Proc:
     def __init__(self, name: str, cmd: list[str], cwd: Path, env: dict[str, str]):
         self.name = name
@@ -414,6 +440,11 @@ def main() -> None:
     ap.add_argument("--hide-password", action="store_true", help="with --set-password: do not show the password while typing")
     ap.add_argument("--host", default="127.0.0.1", help="backend bind address (default 127.0.0.1)")
     ap.add_argument("--reload", action="store_true", help="auto-reload backend on code changes")
+    ap.add_argument(
+        "--access-log",
+        action="store_true",
+        help="print one line per HTTP request (off by default; also settable with ACCESS_LOG=true in .env)",
+    )
     ap.add_argument("--keep-existing", action="store_true", help="do not stop old AirdropOS processes that still hold the ports")
     args = ap.parse_args()
 
@@ -468,9 +499,13 @@ def main() -> None:
     run_checked([str(VENV_PY), "-m", "backend.app.services.init_db"], env=child_env)
 
     procs: list[Proc] = []
-    uvicorn_cmd = [str(VENV_PY), "-m", "uvicorn", "backend.app.main:app", "--host", host, "--port", port]
-    if args.reload:
-        uvicorn_cmd.append("--reload")
+    uvicorn_cmd = uvicorn_command(
+        VENV_PY,
+        host,
+        port,
+        access_log=args.access_log or _env_flag(env_vals, "ACCESS_LOG"),
+        reload=args.reload,
+    )
     procs.append(Proc("backend", uvicorn_cmd, ROOT, child_env))
     if not args.no_worker:
         procs.append(Proc("worker", [str(VENV_PY), "-m", "backend.app.scheduler.worker"], ROOT, child_env))

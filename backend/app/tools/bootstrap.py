@@ -29,11 +29,22 @@ logger = logging.getLogger("airdropos.tools")
 _bootstrapped = False
 
 
-def bootstrap_tools() -> None:
+def registered_tool_names() -> list[str]:
+    """Sorted names of every registered tool."""
+    return sorted(registry._tools)
+
+
+def bootstrap_tools(*, announce_inventory: bool = False) -> None:
     """Register every tool the agent may invoke, then apply authorization.
 
     Permissions are granted by the operator at startup. The agent cannot grant
     itself access to anything not listed here. Safe to call more than once.
+
+    ``announce_inventory`` prints the full tool list, on one line, the first time
+    the tools are registered. Only the API process asks for it: the API serves the
+    ``/tools`` endpoint, so that is the one place an operator needs the list, and the
+    worker would otherwise repeat it in a second process. Either way the names are
+    available at DEBUG (``LOG_LEVEL=DEBUG``) through the registry.
     """
     global _bootstrapped
     if _bootstrapped:
@@ -99,11 +110,13 @@ def bootstrap_tools() -> None:
         allow_wallet_signing=value_moving_enabled,
     )
     _bootstrapped = True
+    names = registered_tool_names()
     logger.info(
-        "Registered %s tools (telegram user client: %s, value-moving: %s) with authorization policy",
-        len(registry._tools),
+        "Registered %s tools (telegram user client: %s, value-moving: %s)%s",
+        len(names),
         "ENABLED" if telegram_user_enabled else "disabled",
         "ENABLED" if value_moving_enabled else "disabled (no signing/submission permission)",
+        f": {', '.join(names)}" if announce_inventory else "",
     )
 
 

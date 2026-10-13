@@ -191,7 +191,10 @@ class ToolRegistry:
             raise ValueError(f"Tool '{tool.name}' is already registered")
         self._tools[tool.name] = tool
         self._metrics.setdefault(tool.name, {"success": 0, "failure": 0, "total_ms": 0.0, "calls": 0})
-        logger.info("Registered tool: %s v%s (%s)", tool.name, tool.version, tool.side_effect.value)
+        # DEBUG, not INFO: the API and the worker each hold their own registry, so an
+        # INFO line here printed the whole inventory twice on every start and buried
+        # the startup banner. The inventory is logged once instead, by bootstrap.
+        logger.debug("Registered tool: %s v%s (%s)", tool.name, tool.version, tool.side_effect.value)
 
     def register_many(self, tools: List[BaseTool]) -> None:
         for tool in tools:

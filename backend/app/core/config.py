@@ -31,6 +31,16 @@ class Settings(BaseSettings):
     # Environment & Server
     ENVIRONMENT: str = Field(default="development", description="Current environment")
     LOG_LEVEL: str = Field(default="INFO", description="Logging verbosity")
+    # One line per HTTP request. Off by default: the dashboard polls several endpoints
+    # every few seconds, so the access log buried warnings and errors in the terminal.
+    # This only ever removed the per-request line. Warnings, errors and tracebacks are
+    # unaffected, and security-relevant history does not depend on it: every login,
+    # revocation and emergency-stop change is written to the `audit_logs` table by
+    # `security.auth.write_audit` and read back through `GET /api/v1/audit`.
+    ACCESS_LOG: bool = Field(
+        default=False,
+        description="Print one access-log line per HTTP request. Off by default.",
+    )
     SECRET_KEY: str = Field(
         default=_DEV_SECRET_KEY,
         description="Application secret key for signing tokens",

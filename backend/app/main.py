@@ -17,35 +17,31 @@ from fastapi.responses import JSONResponse
 
 from backend.app.api.v1.router import api_router
 from backend.app.core.config import settings
+from backend.app.core.logging_setup import configure_logging
 from backend.app.live.relay import relay_loop
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tools.bootstrap import bootstrap_tools
 from backend.app.tools.registry import registry  # noqa: F401  (re-exported for callers)
 from backend.app.transactions.approvals import bind_verifier
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-)
+configure_logging()
 logger = logging.getLogger("airdropos.api")
-# httpx logs every request at INFO; the live-event poll runs every second and floods the terminal.
-for _noisy in ("httpx", "httpcore"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=" * 70)
     logger.info("AirdropOS backend starting (environment=%s)", settings.ENVIRONMENT)
     logger.info("Fixed model: %s @ %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
-    bootstrap_tools()
+    # The API process is the one that serves the tool catalog, so it is the one that
+    # prints the inventory. The worker holds the same tools and logs only the count,
+    # instead of repeating the whole list in a second process.
+    bootstrap_tools(announce_inventory=True)
     # Server-side approvals are what let a verified transfer be broadcast at all.
     # Without this the engine correctly refuses every broadcast, so an approved
     # transfer could never complete.
     bind_verifier()
     if emergency_stop.is_stopped:
         logger.warning("EMERGENCY STOP ACTIVE at startup: %s", emergency_stop.status()["reason"])
-    logger.info("=" * 70)
     relay_stop = asyncio.Event()
     relay_task = asyncio.create_task(relay_loop(relay_stop)) if settings.LIVE_GATEWAY_ENABLED else None
     yield

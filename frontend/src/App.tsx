@@ -17,7 +17,7 @@ import LiveBroadcast from '@/pages/LiveBroadcast'
 import LiveSessionPage from '@/pages/LiveSession'
 import Login from '@/pages/Login'
 import { ErrorState } from '@/components/ui'
-import { api, ApiError, UNAUTHORIZED_EVENT } from '@/services/api'
+import { api, ApiError, hasSession, setAuthRequired, UNAUTHORIZED_EVENT } from '@/services/api'
 import {
   Airdrops,
   Automation,
@@ -73,14 +73,43 @@ const router = createBrowserRouter([
 
 type AuthState = 'checking' | 'login' | 'ready' | 'down'
 
-/** Shows the login page when the backend answers 401; works unchanged if auth is disabled. */
-function AuthGate() {
+/**
+ * Decides between the login form, the dashboard, and "the backend is not there".
+ *
+ * The unauthenticated liveness probe is asked first. It answers with 200 either way,
+ * so nothing here manufactures a 401 before an operator has had the chance to log in.
+ * A 401 is still handled below: a stored session has to be validated, and an older
+ * backend that does not report `auth_required` is answered that way.
+ */
+export function AuthGate() {
   const [state, setState] = useState<AuthState>('checking')
   const [problem, setProblem] = useState<unknown>(null)
 
   const check = useCallback(async () => {
     setState('checking')
     try {
+      // The liveness probe is unauthenticated, so it answers with 200 whether or not
+      // a session exists. Asking it first is what keeps a page load from producing a
+      // guaranteed 401: no request is made to a protected endpoint unless there is
+      // actually a token to present.
+      const health = await api.healthBanner()
+      const requiresAuth = health.auth_required
+      // `undefined` means an older backend that does not report it. Leave that
+      // unknown rather than guessing, and let the 401 below answer it.
+      setAuthRequired(typeof requiresAuth === 'boolean' ? requiresAuth : null)
+
+      if (requiresAuth === false) {
+        // Authentication is switched off on this deployment; there is nothing to log
+        // in to, and asking for a token would only ever produce a 401.
+        setState('ready')
+        return
+      }
+      if (requiresAuth === true && !hasSession()) {
+        setState('login')
+        return
+      }
+
+      // Either a token exists, or the backend did not say which case it is.
       await api.overview()
       setState('ready')
     } catch (e) {

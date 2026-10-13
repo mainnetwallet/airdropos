@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from backend.app.agent.controller import AgentController
 from backend.app.core.config import settings
+from backend.app.core.logging_setup import configure_logging
 from backend.app.inbox.raise_intervention import park_for_intervention
 from backend.app.inbox.service import OPERATOR_FALLBACK_EMAIL, UNKNOWN_REASON
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,17 +35,11 @@ from backend.app.scheduler.worker_status import heartbeat_loop, redact, state as
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
-from backend.app.tools.bootstrap import bootstrap_tools
+from backend.app.tools.bootstrap import bootstrap_tools, registered_tool_names
 from backend.app.tools.registry import registry
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-)
+configure_logging()
 logger = logging.getLogger("airdropos.worker")
-# httpx logs every request at INFO; the live-event poll runs every second and floods the terminal.
-for _noisy in ("httpx", "httpcore"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 WORKER_ID = f"worker-{os.getpid()}"
 _shutdown_event = asyncio.Event()
@@ -552,13 +547,13 @@ async def main() -> None:
     worker_state.attach_logging()
     bootstrap_tools()
     worker_state.begin(WORKER_ID, list(registry._tools))
-    logger.info("=" * 70)
     logger.info("AirdropOS Worker %s starting", WORKER_ID)
     logger.info("Fixed model: %s at %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
-    logger.info("Registered tools: %s", len(registry._tools))
+    # The count only. The API process prints the full tool inventory once; repeating
+    # that list here would just duplicate it in a second process's terminal.
+    logger.info("Tools available to the worker: %s", len(registered_tool_names()))
     if emergency_stop.is_stopped:
         logger.warning("EMERGENCY STOP IS ACTIVE. No new execution or submissions.")
-    logger.info("=" * 70)
 
     await recover_interrupted_tasks()
 

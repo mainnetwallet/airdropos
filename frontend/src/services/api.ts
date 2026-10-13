@@ -39,6 +39,13 @@ import type {
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api/v1'
 
+export interface HealthBanner {
+  status: string
+  service: string
+  /** Whether this deployment requires a session token. Older backends omit it. */
+  auth_required?: boolean
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -93,6 +100,38 @@ export function clearSession(): void {
   }
 }
 
+// --- Whether this deployment needs a session ------------------------------
+// `null` until the liveness probe has answered, which it does without credentials.
+let authRequired: boolean | null = null
+
+export function isAuthRequired(): boolean | null {
+  return authRequired
+}
+
+export function setAuthRequired(value: boolean | null): void {
+  authRequired = value
+}
+
+/** True when a session token is present. Says nothing about whether it is still valid. */
+export function hasSession(): boolean {
+  return getToken() !== ''
+}
+
+/**
+ * Whether opening the live event stream can succeed right now.
+ *
+ * With authentication on and no token the handshake is refused before it is
+ * accepted, so the browser sees a failed connection, the hook schedules a retry,
+ * and every attempt leaves a refused handshake in the log. Deciding locally turns
+ * that loop into a socket that is simply not opened. With authentication off the
+ * backend accepts an anonymous stream, so one is still opened, and an older backend
+ * that does not report the flag keeps the original reconnect behaviour.
+ */
+export function canOpenLiveStream(): boolean {
+  if (authRequired === true) return hasSession()
+  return true
+}
+
 /** Turn the backend's error body ({detail: string | {error, hint}}) into readable text. */
 function errorMessage(body: unknown, status: number): string {
   const detail = (body as { detail?: unknown } | undefined)?.detail ?? body
@@ -145,6 +184,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   // --- Auth -------------------------------------------------------------
+  /**
+   * The unauthenticated liveness probe, which also reports whether this deployment
+   * needs a session token.
+   *
+   * Deliberately NOT sent with a session token: it needs none, and this is the call
+   * the login gate makes on every page load, including before there is a token.
+   * Sending no credentials is also why it can never fail with a 401.
+   */
+  healthBanner: async () => {
+    const response = await fetch(`${API_BASE}/health`, {
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+    })
+    if (!response.ok) throw new ApiError(`Service health check failed with ${response.status}`, response.status)
+    return (await response.json()) as HealthBanner
+  },
   login: async (email: string, password: string) => {
     const session = await request<{ token: string; email: string; expires_at: string }>(
       '/auth/login',
@@ -164,7 +219,6 @@ export const api = {
 
   // --- System -----------------------------------------------------------
   overview: () => request<Overview>('/overview'),
-  health: () => request<Record<string, unknown>>('/health'),
   readiness: () => request<Record<string, unknown>>('/readiness'),
   diagnostics: () => request<DiagnosticsResponse>('/diagnostics'),
   workerStatus: () => request<WorkerStatus>('/worker/status'),
