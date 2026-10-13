@@ -813,7 +813,7 @@ def _activity_hint(state: RuntimeState, rows: int) -> str:
     if offset:
         return f"↑ {offset} older lines · [End] latest"
     if total > rows:
-        return "[a] copy · [x] clear · ↑↓ scroll"
+        return "[a] copy · [x] clear · ↑↓ / wheel scroll"
     return "[a] copy all · [x] clear"
 
 

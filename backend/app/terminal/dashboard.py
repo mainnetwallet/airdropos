@@ -330,9 +330,20 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
         """Run one control key. Returns True when something changed on screen."""
         state = latest["state"]
         if key in (controls.SCROLL_UP, controls.SCROLL_DOWN, controls.PAGE_UP,
-                   controls.PAGE_DOWN, controls.SCROLL_TOP, controls.SCROLL_END):
+                   controls.PAGE_DOWN, controls.SCROLL_TOP, controls.SCROLL_END,
+                   controls.WHEEL_UP, controls.WHEEL_DOWN):
+            shown = state.activity_rows if state is not None else 0
+            total = len(collector.activity)
+            if shown and total <= shown:
+                scroll["offset"] = 0
+                notice.update(
+                    text=f"RECENT ACTIVITY: all {total} lines fit on screen, nothing to scroll",
+                    until=time.monotonic() + 3,
+                )
+                return True
             step = {controls.SCROLL_UP: 1, controls.SCROLL_DOWN: -1,
-                    controls.PAGE_UP: controls.PAGE_LINES, controls.PAGE_DOWN: -controls.PAGE_LINES}
+                    controls.PAGE_UP: controls.PAGE_LINES, controls.PAGE_DOWN: -controls.PAGE_LINES,
+                    controls.WHEEL_UP: controls.WHEEL_LINES, controls.WHEEL_DOWN: -controls.WHEEL_LINES}
             if key == controls.SCROLL_END:
                 scroll["offset"] = 0
             elif key == controls.SCROLL_TOP:
@@ -403,6 +414,14 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
             refresh_per_second=8,
         ) as live:
             _announce_ready(token)
+            if not keys.error:
+                # Mouse wheel scrolls RECENT ACTIVITY. Mouse selection still works
+                # while holding Shift; [a] / [w] copy everything anyway.
+                try:
+                    console.file.write(controls.MOUSE_ON)
+                    console.file.flush()
+                except Exception:
+                    pass
             drawn_key = None
             drawn_at = 0.0
             while not stop.is_set():
@@ -444,6 +463,11 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                     drawn_at = now
                 await _sleep(stop, FRAME_POLL_SECONDS)
     finally:
+        try:
+            console.file.write(controls.MOUSE_OFF)
+            console.file.flush()
+        except Exception:
+            pass
         keys.stop()
         collector_task.cancel()
         try:

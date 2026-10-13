@@ -182,3 +182,15 @@ def test_services_do_not_inherit_the_console_keyboard():
 
     source = (Path(__file__).resolve().parents[2] / "run.py").read_text(encoding="utf-8")
     assert re.search(r"subprocess\.DEVNULL if capture_stdout else None", source)
+
+
+def test_escape_sequences_decode_to_scroll_names():
+    d = controls.decode_escape
+    assert d("[A") == controls.SCROLL_UP and d("[B") == controls.SCROLL_DOWN
+    assert d("[5~") == controls.PAGE_UP and d("[6~") == controls.PAGE_DOWN
+    assert d("OA") == controls.SCROLL_UP
+    assert d("[<64;40;12M") == controls.WHEEL_UP
+    assert d("[<65;40;12M") == controls.WHEEL_DOWN
+    assert d("[<0;40;12M") is None       # a click is not a scroll
+    assert d("[<64;40;12m") is None      # a release is not a scroll
+    assert d("") is None

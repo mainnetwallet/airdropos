@@ -32,7 +32,13 @@ KEYS = (COPY_ACTIVITY, COPY_ALERTS, CLEAR_ACTIVITY, CLEAR_ALERTS)
 SCROLL_UP, SCROLL_DOWN = "up", "down"
 PAGE_UP, PAGE_DOWN = "pgup", "pgdn"
 SCROLL_TOP, SCROLL_END = "home", "end"
+WHEEL_UP, WHEEL_DOWN = "wheelup", "wheeldown"
 PAGE_LINES = 10
+WHEEL_LINES = 3
+
+# Ask the terminal to report mouse wheel turns as key-like sequences (SGR mode).
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+MOUSE_OFF = "\x1b[?1000l\x1b[?1006l"
 
 _WINDOWS_SPECIAL = {"H": SCROLL_UP, "P": SCROLL_DOWN, "I": PAGE_UP, "Q": PAGE_DOWN, "G": SCROLL_TOP, "O": SCROLL_END}
 _POSIX_SPECIAL = {"A": SCROLL_UP, "B": SCROLL_DOWN, "H": SCROLL_TOP, "F": SCROLL_END,
@@ -163,6 +169,23 @@ def save_copy(name: str, text: str) -> str:
         return ""
 
 
+def decode_escape(body: str) -> Optional[str]:
+    """Name for the characters that followed an ESC: arrows, paging, mouse wheel.
+
+    ``body`` is what came after the ESC, e.g. ``[A``, ``[5~`` or ``[<64;12;7M``.
+    Anything else (a click, a release, an unknown key) gives ``None``.
+    """
+    if body.startswith("[<"):  # SGR mouse report: [<button;col;row then M (press) or m
+        if not body.endswith("M"):
+            return None
+        try:
+            button = int(body[2:].split(";")[0])
+        except ValueError:
+            return None
+        return {64: WHEEL_UP, 65: WHEEL_DOWN}.get(button)
+    return _POSIX_SPECIAL.get(body[1:] if body[:1] in ("[", "O") else body)
+
+
 # ----------------------------------------------------------------------
 # Keyboard
 # ----------------------------------------------------------------------
@@ -235,7 +258,11 @@ class KeyReader:
             return
         saved = mode.value
         ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT = 0x0002, 0x0004
-        kernel32.SetConsoleMode(handle, saved & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT))
+        raw = saved & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT)
+        kernel32.SetConsoleMode(handle, raw)
+        # Lets the terminal deliver mouse-wheel reports. If the console refuses, the
+        # call fails harmlessly: keys still work and only the wheel is lost.
+        kernel32.SetConsoleMode(handle, raw | 0x0200)
 
         def restore() -> None:
             kernel32.SetConsoleMode(handle, saved)
@@ -256,6 +283,22 @@ class KeyReader:
                 if char in ("\x00", "\xe0"):  # arrow / function key: a second code follows
                     name = _WINDOWS_SPECIAL.get(msvcrt.getwch())
                     if name:
+                        self.keys.put(name)
+                    continue
+                if char == "\x1b":  # arrow / mouse delivered as an escape sequence
+                    body = ""
+                    while len(body) < 24:
+                        if not msvcrt.kbhit():
+                            self._stop.wait(0.02)
+                            if not msvcrt.kbhit():
+                                break
+                        ch = msvcrt.getwch()
+                        body += ch
+                        if len(body) > 1 and (ch.isalpha() or ch == "~"):
+                            break
+                    name = decode_escape(body)
+                    if name:
+                        self.received += 1
                         self.keys.put(name)
                     continue
                 self.received += 1
@@ -290,18 +333,17 @@ class KeyReader:
                     self.keys.put(data.decode("utf-8", errors="ignore").lower())
 
     def _read_escape(self, fd, select) -> None:
-        """Parse ``ESC [ A`` style sequences; a lone ESC is ignored."""
-        seq = ""
-        while len(seq) < 4:
+        """Parse ``ESC [ A`` and ``ESC [ < 64 ; x ; y M`` sequences; a lone ESC is ignored."""
+        body = ""
+        while len(body) < 24:
             ready, _, _ = select.select([fd], [], [], 0.03)
             if not ready:
-                return
-            ch = os.read(fd, 1).decode("ascii", errors="ignore")
-            if not seq and ch in ("[", "O"):
-                continue
-            seq += ch
-            if ch.isalpha() or ch == "~":
                 break
-        name = _POSIX_SPECIAL.get(seq)
+            ch = os.read(fd, 1).decode("ascii", errors="ignore")
+            body += ch
+            if len(body) > 1 and (ch.isalpha() or ch == "~"):
+                break
+        name = decode_escape(body)
         if name:
+            self.received += 1
             self.keys.put(name)
