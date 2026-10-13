@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -172,76 +171,6 @@ def _parse_tool_calls(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
     return calls
 
 
-# ---------------------------------------------------------------------------
-# Dynamic task gating
-#
-# Not every chat message is a job. A task is created only when (a) the operator
-# explicitly asks for one, or (b) the work cannot be finished inside this turn.
-# The model makes the call (b); this module only reads the operator's own words for
-# the explicit cases so the model is told, and the loop can enforce, the one thing
-# that must never be guessed: "yes, create a task" and "do NOT create a task".
-# Covers English, romanized Bangla (Banglish) and Bangla script.
-# ---------------------------------------------------------------------------
-_TASK_WORD = re.compile(r"(task|টাস্ক|\btaask\b|\btasks\b)", re.IGNORECASE)
-_CREATE_WORD = re.compile(
-    r"(create|make|add|queue|new|schedule|banao|banaw|bana\b|koro\b|kor\b|kore\b|dao\b|de\b|"
-    r"ekta|তৈরি|বানাও|বানা|করো|কর\b|যোগ|দাও)",
-    re.IGNORECASE,
-)
-_NEGATION = re.compile(
-    r"(don'?t|do not|dont|no need|without (a )?task|never|stop|cancel|"
-    r"koro ?na|kor ?na|korona|korbe ?na|korba ?na|kore ?na|korio ?na|"
-    r"lagbe ?na|lagena|dorkar ?nai|dorkar ?nei|proyojon ?nai|"
-    r"banao ?na|dio ?na|dis ?na|"
-    r"(করো|কর|কোরো|বানাও|বানিও|দাও|দিও|করবে|করিস|বানাবে) ?না|লাগবে ?না|দরকার ?নেই)",
-    re.IGNORECASE,
-)
-_AFFIRM = re.compile(
-    r"^\s*(yes|yep|yeah|y|ok|okay|sure|do it|go ahead|please do|haan|han|ha|hya|hyan|hum|"
-    r"koro|kor|kore dao|kore felo|korey? dao|thik ache|hoye jak|হ্যাঁ|হা|হ্যা|করো|কর|ঠিক আছে|ঠিকাছে)"
-    r"[\s.!]*$",
-    re.IGNORECASE,
-)
-
-
-def operator_task_signal(message: str, history: List[Any]) -> str:
-    """Read the operator's explicit intent about tasks: 'yes', 'no' or 'none'.
-
-    'no' beats 'yes'. A bare "yes / koro / do it" only counts when the agent's
-    previous turn offered to create a task.
-    """
-    text = (message or "").strip()
-    if _TASK_WORD.search(text) and _NEGATION.search(text):
-        return "no"
-    if _TASK_WORD.search(text) and _CREATE_WORD.search(text):
-        return "yes"
-    if _AFFIRM.match(text) and history:
-        last = history[-1]
-        if getattr(last, "role", "") == "assistant":
-            body = str(getattr(last, "content", ""))[-600:]
-            if _TASK_WORD.search(body) and "?" in body:
-                return "yes"
-    return "none"
-
-
-def _task_signal_note(signal: str) -> str:
-    if signal == "yes":
-        return (
-            "[OPERATOR TASK SIGNAL: EXPLICIT. The operator asked for a task in this "
-            "message. Set create_task with a self-contained description.]"
-        )
-    if signal == "no":
-        return (
-            "[OPERATOR TASK SIGNAL: FORBIDDEN. The operator said not to create a task. "
-            "create_task must be null.]"
-        )
-    return (
-        "[OPERATOR TASK SIGNAL: NONE. The operator did not mention a task. Set "
-        "create_task only if finishing the request truly needs background work that "
-        "this turn's tools cannot do; otherwise null and just answer.]"
-    )
-
-
 class ChatToolLoop:
     """Runs one operator turn: decide, execute, verify, report."""
 
@@ -274,8 +203,7 @@ class ChatToolLoop:
         messages: List[Message] = [Message("system", system)]
         for turn in history:
             messages.append(Message(turn.role, turn.content))
-        task_signal = operator_task_signal(message, history)
-        messages.append(Message("user", f"{message}\n\n{_task_signal_note(task_signal)}"))
+        messages.append(Message("user", message))
 
         # Appended so the final answer is produced with the tool results in context.
         transcript: List[str] = []
@@ -363,13 +291,6 @@ class ChatToolLoop:
 
         if not result.reply:
             result.reply = self._fallback_reply(result)
-
-        if spec:
-            allowed, why = self._task_allowed(task_signal, result)
-            if not allowed:
-                logger.info("Chat task suppressed: %s", why)
-                result.blockers.append(f"No task was created: {why}")
-                spec = None
 
         if spec and create_task is not None:
             task_info, task_error = await create_task(spec)
@@ -467,23 +388,6 @@ class ChatToolLoop:
             duration_ms=outcome.duration_ms,
             evidence=outcome.evidence,
         )
-
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _task_allowed(signal: str, result: "ChatTurnResult") -> tuple[bool, str]:
-        """Enforce the task policy the prompt describes.
-
-        The operator's explicit word is final in both directions. Without one, a task
-        is only legitimate when the turn's own tools did not already answer the
-        request: a finished tool answer is never wrapped in a background job.
-        """
-        if signal == "no":
-            return False, "the operator said not to create a task."
-        if signal == "yes":
-            return True, ""
-        if any(c.status == "success" for c in result.tool_calls):
-            return False, "the request was already answered with tools, so no background work is needed."
-        return True, ""
 
     # ------------------------------------------------------------------
     @staticmethod

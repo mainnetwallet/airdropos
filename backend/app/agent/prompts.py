@@ -327,8 +327,7 @@ just a reply (plus tool_calls if a tool obtains the answer). Decide per message:
   Set create_task ONLY in one of these two cases:
   1. EXPLICIT: the operator tells you to create a task / queue it / add it to the task
      list, in any language ("create a task", "task create koro", "task banao",
-     "ekta task add koro", "queue this"). Each turn carries an "OPERATOR TASK
-     SIGNAL" line telling you whether this message explicitly asked for one.
+     "ekta task add koro", "queue this").
   2. NEEDED TO FINISH THE WORK: the operator asked you to actually DO something
      (join, claim, register, connect, complete, monitor, track, research at length)
      that cannot be finished inside this chat turn with the live tools, because it
