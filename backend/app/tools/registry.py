@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
 from backend.app.security.emergency_stop import StopPolicy, emergency_stop
+from backend.app.tools.context import task_context
 from backend.app.tools.base import (
     BaseTool,
     SideEffect,
@@ -383,7 +384,10 @@ class ToolRegistry:
         current = self._inflight.get(name, 0)
         self._inflight[name] = current + 1
         try:
-            result = await asyncio.wait_for(tool.execute(validated), timeout=tool.timeout_seconds)
+            # Publish the task id BEFORE wait_for: it wraps the coroutine in a task that
+            # copies the current context, so tools see the task they are running for.
+            with task_context(task_id):
+                result = await asyncio.wait_for(tool.execute(validated), timeout=tool.timeout_seconds)
         except asyncio.TimeoutError:
             result = ToolResult.failure(
                 f"Tool '{name}' exceeded its {tool.timeout_seconds}s timeout.",

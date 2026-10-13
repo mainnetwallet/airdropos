@@ -22,8 +22,13 @@ the operator in ``bootstrap_tools`` before the registry will run the tool at all
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+from sqlalchemy import func, select
 
 from backend.app.browser import chrome
 from backend.app.browser import interaction
@@ -31,14 +36,19 @@ from backend.app.browser import profiles as profile_store
 from backend.app.browser.controller import _safe_error, controller, upload_allowed
 from backend.app.browser.interaction import LocatorNotFound
 from backend.app.browser.profiles import normalize_session_key, resolve_session_key
+from backend.app.database.session import session_scope
 from backend.app.live import hub
+from backend.app.models import TaskEvidence
+from backend.app.tasks.manager import TaskManager
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult
+from backend.app.tools.context import get_current_task_id
 
 logger = logging.getLogger(__name__)
 
 # Bounds so a single tool call cannot flood the model or the log.
 MAX_WAIT_MS = 120_000
 MAX_TEXT = 20_000
+MAX_EVIDENCE_LABEL = 100
 DEFAULT_ACTION_TIMEOUT_MS = 10_000
 
 
@@ -1292,10 +1302,25 @@ class UploadFileTool(BaseTool):
 # ----------------------------------------------------------------------
 # Evidence & diagnostics
 # ----------------------------------------------------------------------
+def _hash_file(path: str) -> Tuple[str, int]:
+    """SHA-256 and size of the file as it is on disk right now (blocking; run off-thread)."""
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
+
+
 class CaptureEvidenceTool(BaseTool):
     name = "capture_evidence"
-    version = "1.1.0"
-    description = "Capture a screenshot of an open session as durable task evidence (full page by default)."
+    version = "1.2.0"
+    description = (
+        "Capture a screenshot of an open session as durable task evidence (full page by default). "
+        "When run for a task the screenshot is recorded against that task with its SHA-256, so it "
+        "shows up in get_task."
+    )
     required_permissions = ["browser.read"]
     side_effect = SideEffect.EXTERNAL_READ
     timeout_seconds = 45
@@ -1309,6 +1334,14 @@ class CaptureEvidenceTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        label = params.get("label") or "evidence"
+        if not isinstance(label, str) or len(label) > MAX_EVIDENCE_LABEL:
+            # The registry enforces maxLength too; this keeps direct callers honest.
+            return ToolResult.failure(
+                f"label must be a string of at most {MAX_EVIDENCE_LABEL} characters.",
+                category="INVALID_INPUT",
+                retryable=False,
+            )
         blocked = _gate(params)
         if blocked:
             return blocked
@@ -1316,15 +1349,100 @@ class CaptureEvidenceTool(BaseTool):
         page = await controller.get_page(key)
         if page is None:
             return _no_browser(params)
-        path = await controller.screenshot(
-            key, params.get("label", "evidence"), full_page=bool(params.get("full_page", True))
-        )
+        path = await controller.screenshot(key, label, full_page=bool(params.get("full_page", True)))
         if not path:
             return ToolResult.failure("Screenshot capture failed.", category="CAPTURE_FAILED", retryable=True)
+
+        # A path is not proof of a file. Hash what is actually on disk; no file, no record.
+        try:
+            sha256, size = await asyncio.to_thread(_hash_file, path)
+        except OSError as exc:
+            return ToolResult.failure(
+                f"Screenshot file could not be read back ({type(exc).__name__}); no evidence was recorded.",
+                category="CAPTURE_FAILED",
+                retryable=True,
+            )
+        if size == 0:
+            return ToolResult.failure(
+                "Screenshot file is empty; no evidence was recorded.",
+                category="CAPTURE_FAILED",
+                retryable=True,
+            )
         _event(params, "browser.screenshot", "Screenshot captured")
+
+        file_data = {"screenshot_path": path, "sha256": sha256, "size_bytes": size}
+        task_public_id = get_current_task_id()
+        if task_public_id is None:
+            return ToolResult.success(
+                data={
+                    **file_data,
+                    "evidence_linked": False,
+                    "warning": (
+                        "No task context: the screenshot was saved but is NOT linked to any task, "
+                        "so it will not appear in get_task."
+                    ),
+                    **_session_context(params),
+                },
+                evidence={"authoritative": False, "kind": "screenshot", "uri": path, "sha256": sha256},
+            )
+
+        captured_at = datetime.now(timezone.utc).isoformat()
+        try:
+            async with session_scope() as db:
+                manager = TaskManager(db)
+                task = await manager.get_by_task_id(task_public_id)
+                if task is None:
+                    return ToolResult.failure(
+                        f"The screenshot was saved, but task '{task_public_id}' does not exist, so it was "
+                        f"not linked as evidence.",
+                        category="TASK_NOT_FOUND",
+                        retryable=False,
+                        data={**file_data, "evidence_linked": False},
+                    )
+                record = await manager.record_evidence(
+                    task,
+                    evidence_type="SCREENSHOT",
+                    source=self.name,
+                    uri_reference=path,
+                    meta={
+                        "label": label,
+                        "sha256": sha256,
+                        "size_bytes": size,
+                        "captured_at": captured_at,
+                        "session_key": key,
+                    },
+                )
+                evidence_id = str(record.id)
+                total = await db.scalar(
+                    select(func.count(TaskEvidence.id)).where(TaskEvidence.task_id == task.id)
+                ) or 0
+            # session_scope commits when the block exits; any failure there lands below.
+        except Exception as exc:
+            logger.error("Evidence link failed for %s: %s", task_public_id, _safe_error(exc))
+            return ToolResult.failure(
+                "The screenshot was saved, but recording it as task evidence FAILED "
+                f"({type(exc).__name__}). The file is kept at the path below and is not linked to the task.",
+                category="EVIDENCE_PERSIST_FAILED",
+                retryable=True,
+                data={**file_data, "evidence_linked": False},
+            )
+
         return ToolResult.success(
-            data={"screenshot_path": path, **_session_context(params)},
-            evidence={"authoritative": True, "kind": "screenshot", "uri": path},
+            data={
+                **file_data,
+                "evidence_linked": True,
+                "evidence_id": evidence_id,
+                "task_id": task_public_id,
+                "evidence_count": int(total),
+                **_session_context(params),
+            },
+            evidence={
+                "authoritative": True,
+                "kind": "screenshot",
+                "uri": path,
+                "sha256": sha256,
+                "task_id": task_public_id,
+            },
         )
 
 

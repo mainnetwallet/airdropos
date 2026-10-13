@@ -47,6 +47,7 @@ export interface TaskSummary {
 export interface TaskReport {
   task_id: string
   title: string
+  description?: string
   status: TaskStatus
   priority: number
   progress: number
@@ -60,6 +61,19 @@ export interface TaskReport {
   failed_actions: Array<Record<string, unknown>>
   checkpoints: number
   evidence_count: number
+  evidence?: Array<{
+    id: string
+    task_id: string
+    type: string
+    source: string
+    uri: string | null
+    label: string | null
+    sha256: string | null
+    size_bytes: number | null
+    captured_at: string | null
+    recorded_at: string | null
+    is_verified: boolean
+  }>
   error_details: Record<string, unknown>
   next_planned_action: string | null
   blocker: string | null
