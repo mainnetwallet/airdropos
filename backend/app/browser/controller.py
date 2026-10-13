@@ -553,6 +553,9 @@ class BrowserController:
                 executable_path=executable or None,
                 headless=headless,
                 args=args,
+                # Playwright's default --disable-extensions would keep every installed
+                # extension (MetaMask etc.) from loading in this profile.
+                ignore_default_args=list(chrome.PLAYWRIGHT_IGNORED_DEFAULT_ARGS),
                 **options,
             )
             self._browser = context.browser
@@ -873,6 +876,47 @@ class BrowserController:
                     # so the second attempt (and later calls) start from a fresh one.
                     await self._discard_context(session_key)
             return None
+
+    async def show_new_tab(self, session_key: str) -> Dict[str, Any]:
+        """Turn the blank first tab of a freshly opened managed Chrome into the New Tab page.
+
+        Playwright starts a persistent Chrome on ``about:blank``. This reuses that one
+        tab (it never opens another and never closes anything) and navigates it to
+        Chrome's own New Tab page. A tab that already shows something is left alone, so
+        calling this on a reused or already-navigated session is a no-op. A failure is
+        reported but never fatal: the profile is still open and usable.
+
+        Not exposed to the agent: ``chrome://newtab`` is not on the agent's allowlist.
+        """
+        session_key = normalize_session_key(session_key)
+        if self._modes.get(session_key) != "persistent":
+            return {"ok": True, "changed": False, "reason": "not_managed_chrome"}
+        context = self._contexts.get(session_key)
+        if context is None:
+            return {"ok": False, "changed": False, "reason": "session_missing"}
+        page = self._pages.get(session_key)
+        try:
+            if page is None or page.is_closed():
+                page = next((p for p in context.pages if not p.is_closed()), None)
+            if page is None:
+                return {"ok": False, "changed": False, "reason": "no_page"}
+            if not chrome.is_blank_page_url(page.url):
+                return {"ok": True, "changed": False, "url": safe_url(page.url)}
+        except Exception as exc:
+            return {"ok": False, "changed": False, "reason": "page_unavailable", "detail": _safe_error(exc)}
+        try:
+            # "commit": the New Tab page redirects internally (and on a Google profile
+            # loads its own content), so waiting for domcontentloaded can time out.
+            await page.goto(chrome.NEW_TAB_URL, wait_until="commit", timeout=settings.BROWSER_NAVIGATION_TIMEOUT_MS)
+        except Exception as exc:
+            logger.warning("Could not show the New Tab page for '%s': %s", session_key, type(exc).__name__)
+            return {"ok": False, "changed": False, "reason": "newtab_failed", "detail": _safe_error(exc)}
+        self._pages[session_key] = page
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        return {"ok": True, "changed": True, "url": safe_url(page.url)}
 
     async def _new_or_adopt_page(self, context):
         """Reuse the browser's existing first tab, or open one. Returns None if neither works."""
@@ -1527,6 +1571,9 @@ class BrowserController:
                 status["reused"] = True
                 return {"ok": True, **status}
             context = await self._ensure_context(session_key)
+            if context is not None and not profile.start_url:
+                # A profile with a start URL is navigated there by the caller instead.
+                await self.show_new_tab(session_key)
         if context is None:
             return {
                 "ok": False,

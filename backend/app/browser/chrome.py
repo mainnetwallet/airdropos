@@ -437,6 +437,24 @@ BASE_CHROME_ARGS: Tuple[str, ...] = (
 )
 
 
+# Chrome's own New Tab page. Playwright's launch_persistent_context() ALWAYS appends
+# "about:blank" to the command line (and rejects any URL passed through ``args``), so a
+# managed Chrome starts on a blank white tab. This is the supported way to show the
+# normal New Tab experience instead: reuse that first tab and navigate it here.
+NEW_TAB_URL = "chrome://newtab/"
+BLANK_PAGE_URLS: Tuple[str, ...] = ("", "about:blank")
+
+# Default switches Playwright adds that must NOT reach a managed, extension-capable
+# Chrome. ``--disable-extensions`` switches off every installed extension (MetaMask and
+# the like) no matter what ``--load-extension`` / ``--disable-extensions-except`` say.
+PLAYWRIGHT_IGNORED_DEFAULT_ARGS: Tuple[str, ...] = ("--disable-extensions",)
+
+
+def is_blank_page_url(url: Optional[str]) -> bool:
+    """True for the empty tab Chrome opens on a fresh launch (about:blank or no URL yet)."""
+    return str(url or "").strip().lower() in BLANK_PAGE_URLS
+
+
 def build_chrome_args(
     *,
     headless: bool,

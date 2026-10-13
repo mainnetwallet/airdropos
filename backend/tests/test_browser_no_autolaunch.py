@@ -86,6 +86,26 @@ def chrome_for(directory: str) -> int:
     return len(chrome.chrome_processes_for(directory))
 
 
+def browser_instances_for(directory: str) -> int:
+    """Chrome BROWSER (main) processes for THIS profile directory.
+
+    Renderer, GPU and utility children share the same ``--user-data-dir`` and come and
+    go with whatever page is showing (the New Tab page starts its own renderer a moment
+    after launch), so they say nothing about whether a second Chrome was started.
+    """
+    import psutil
+
+    count = 0
+    for entry in chrome.chrome_processes_for(directory):
+        try:
+            cmdline = psutil.Process(entry["pid"]).cmdline()
+        except Exception:
+            continue
+        if not any(str(arg).startswith("--type=") for arg in cmdline):
+            count += 1
+    return count
+
+
 # ======================================================================
 # 1. Nothing on the read path may execute the browser
 # ======================================================================
@@ -340,11 +360,12 @@ def test_concurrent_open_and_reconnect_produce_one_instance(store, profile, brow
 
 def test_status_check_during_a_session_creates_no_extra_instance(store, profile, browser_loop):
     assert run(controller.open_profile(profile.id))["ok"]
-    before = chrome_for(profile.resolved_user_data_dir)
+    before = browser_instances_for(profile.resolved_user_data_dir)
+    assert before == 1
     for _ in range(5):
         status = run(controller.profile_status(profile.id))
         assert status["running"] is True
-    assert chrome_for(profile.resolved_user_data_dir) == before
+    assert browser_instances_for(profile.resolved_user_data_dir) == before
     hub.browser_sessions.mark_stopped(profile.id, by_operator=True, reason="test")
     run(controller.close_session(profile.id))
 
