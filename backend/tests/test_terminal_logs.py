@@ -124,3 +124,21 @@ def test_activity_panel_scrolls_back_through_older_lines():
     top = frame()
     assert "line-000" in top and "line-149" not in top
     assert "older lines" in top
+
+
+def test_terminal_escape_codes_are_stripped_from_messages():
+    from backend.app.terminal.events import strip_terminal_codes
+
+    vite = "\x1b[32m  \x1b[32m➜\x1b[39m  \x1b[1mLocal\x1b[22m:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m"
+    assert strip_terminal_codes(vite) == "  ➜  Local:   http://localhost:5173/"
+    link = "\x1b]8;;http://x.test\x1b\\label\x1b]8;;\x1b\\ done\r\x07"
+    assert strip_terminal_codes(link) == "label done"
+    assert strip_terminal_codes("a\tb") == "a b"
+
+
+def test_event_tail_cleans_old_lines_with_escape_codes(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_text(json.dumps({"ts": 1, "t": "01:52:21", "level": "INFO", "source": "frontend",
+                                "proc": "frontend", "message": "\x1b[1mLocal\x1b[22m: http://localhost:5173/"}) + "\n")
+    [event] = EventTail(path).poll()
+    assert event.message == "Local: http://localhost:5173/"

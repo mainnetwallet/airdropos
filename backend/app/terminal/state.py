@@ -240,6 +240,8 @@ class EventTail:
         self.offset += len(chunk)
         pieces = (self.pending + chunk.decode("utf-8", errors="replace")).split("\n")
         self.pending = pieces.pop()  # incomplete tail
+        from backend.app.terminal.events import strip_terminal_codes
+
         events: List[EventLine] = []
         for piece in pieces:
             piece = piece.strip()
@@ -258,7 +260,9 @@ class EventTail:
                     level=str(data.get("level") or "INFO").upper(),
                     source=str(data.get("source") or ""),
                     proc=str(data.get("proc") or ""),
-                    message=str(data.get("message") or ""),
+                    # Also cleaned here: the file may hold lines written before the
+                    # writer stripped them, or by an older process.
+                    message=strip_terminal_codes(str(data.get("message") or "")),
                 )
             )
         return events[-limit:]

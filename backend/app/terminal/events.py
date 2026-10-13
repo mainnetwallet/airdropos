@@ -98,6 +98,31 @@ _REDACTIONS = [
 ]
 
 
+# Terminal control sequences: OSC (hyperlinks, titles) ending in BEL or ESC \,
+# CSI (colours, cursor moves), and any other two-byte ESC sequence.
+_ANSI = re.compile(
+    r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"
+    r"|\x1b\[[0-?]*[ -/]*[@-~]"
+    r"|\x1b[@-Z\\-_]"
+)
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_terminal_codes(text: str) -> str:
+    """Remove colour/cursor/hyperlink escape sequences and control characters.
+
+    Frontend (Vite) output carries them. Left in, the dashboard would write them
+    straight to the terminal: the cell widths no longer match what Rich counted,
+    so borders tear and fragments of old frames stay on screen. Never raises.
+    """
+    try:
+        text = _ANSI.sub("", str(text))
+        text = text.replace("\t", " ")
+        return _CONTROL.sub("", text)
+    except Exception:  # pragma: no cover
+        return str(text)
+
+
 def redact(text: str) -> str:
     """Mask anything that looks like a credential. Never raises."""
     try:
@@ -163,7 +188,7 @@ def publish(
         "source": str(source or ""),
         "proc": proc or process_name(),
         "pid": os.getpid(),
-        "message": redact(str(message))[:MAX_MESSAGE_CHARS],
+        "message": redact(strip_terminal_codes(message))[:MAX_MESSAGE_CHARS],
     }
     try:
         line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8", "replace")
