@@ -218,6 +218,9 @@ CLEAR_SCREEN_AND_SCROLLBACK = "\x1b[2J\x1b[3J\x1b[H"
 
 _screen_taken = False
 
+# How often the live loop checks whether the window size or the readings changed.
+FRAME_POLL_SECONDS = 0.05
+
 
 def _enable_windows_vt(handle_id: int) -> bool:
     """Turn on ANSI escape processing for one standard handle on Windows."""
@@ -282,8 +285,37 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
     _install_signal_handlers(stop)
     _wait_for_stop_signal(stop, honour_eof=bool(token))
 
-    last_collect = 0.0
-    state = None
+    # Reading the system (HTTP and database probes) can take a second or more. It
+    # runs in its own task so a slow probe never holds up drawing: the screen keeps
+    # responding to resizes and ticking the uptime while the next reading is in flight.
+    latest: dict = {"state": None, "version": 0}
+    first_reading = asyncio.Event()
+
+    async def collect_loop() -> None:
+        while not stop.is_set():
+            try:
+                latest["state"] = await collector.collect()
+                latest["version"] += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # pragma: no cover - the dashboard must never die
+                # Nothing may be printed while the dashboard owns the screen, so a
+                # failed reading simply keeps the previous one on display.
+                pass
+            first_reading.set()
+            await _sleep(stop, refresh)
+
+    collector_task = asyncio.create_task(collect_loop())
+    try:
+        # Give the first reading a moment so the first frame is not all "unknown".
+        await asyncio.wait_for(first_reading.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        pass
+    if latest["state"] is None:
+        from backend.app.terminal.state import RuntimeState
+
+        latest["state"] = RuntimeState(started_at=getattr(collector, "started_at", time.time()))
+
     # Once, immediately before the first frame. Nothing is printed after this.
     take_over_screen(console)
     try:
@@ -300,19 +332,33 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
             refresh_per_second=8,
         ) as live:
             _announce_ready(token)
+            drawn_key = None
+            drawn_at = 0.0
             while not stop.is_set():
-                now = time.monotonic()
-                if state is None or now - last_collect >= refresh:
-                    state = await collector.collect()
-                    last_collect = now
                 width, height = console.size
-                # -1 keeps the render off the last column so a wide terminal
-                # does not wrap the right border onto the next line.
-                # One row less than the window: a frame exactly as tall as the window
-                # leaves the cursor on a new line, which scrolls the screen by one.
-                live.update(build(state, max(30, width - 1), max(6, height - 1)), refresh=True)
-                await _sleep(stop, 1.0)
+                key = (width, height, latest["version"])
+                now = time.monotonic()
+                # Draw when the window size or the readings changed, and at least once a
+                # second so the uptime keeps moving. Checking every 50 ms is what makes
+                # a resize show up at once instead of at the next one-second tick.
+                if key != drawn_key or now - drawn_at >= 1.0:
+                    # -1 keeps the render off the last column so a wide terminal does not
+                    # wrap the right border onto the next line, and one row less than the
+                    # window: a frame exactly as tall as the window leaves the cursor on a
+                    # new line, which scrolls the screen by one.
+                    live.update(
+                        build(latest["state"], max(30, width - 1), max(6, height - 1)),
+                        refresh=True,
+                    )
+                    drawn_key = key
+                    drawn_at = now
+                await _sleep(stop, FRAME_POLL_SECONDS)
     finally:
+        collector_task.cancel()
+        try:
+            await collector_task
+        except (asyncio.CancelledError, Exception):
+            pass
         _clear_ready()
     return 0
 

@@ -5,6 +5,15 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (terminal dashboard lag)
+- **The dashboard reacted about a second late.** Resizing the window, or anything else on
+  screen, only showed up at the next one-second tick, and a slow HTTP or database probe
+  froze drawing while it waited. Reading the system now runs in its own background task,
+  and the draw loop checks the window size every 50 ms, redrawing at once when the size or
+  the readings change (and once a second so the uptime keeps moving). Measured in a
+  pseudo-terminal: resize to new frame went from a median of 230 ms (worst 764 ms) to
+  a median of about 33 ms (worst about 65 ms).
+
 ### Changed (terminal dashboard)
 - **The dashboard now adapts to any terminal size instead of being cut off.** Making the
   window smaller used to crop the bottom panels and truncate text (`Frontend (V…`,
