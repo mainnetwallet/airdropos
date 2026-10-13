@@ -217,8 +217,54 @@ def _clean_path(raw: Any, label: str, *, must_exist: bool = False, must_be_dir: 
     return resolved
 
 
+# A bare folder name the operator may type instead of a full path. Letters, digits and
+# "-", "_", "." only: it becomes ONE directory directly under the AirdropOS profile root,
+# so it can never point outside it or at somebody's own browser data.
+_FOLDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+)
+
+
+def _is_bare_folder_name(text: str) -> bool:
+    """True when the text is a single name rather than a path (no separators, drive, ~, $ or %)."""
+    return not re.search(r"[\\/:~$%]", text)
+
+
+def _managed_folder_path(name: str) -> str:
+    """``<profile root>/<name>`` for an operator-typed folder name, or a ProfileError."""
+    if (
+        not _FOLDER_NAME_RE.match(name)
+        or name.endswith(".")
+        or name.split(".")[0].lower() in _WINDOWS_RESERVED_NAMES
+    ):
+        raise ProfileError(
+            "Chrome profile folder name may only contain letters, digits, '-', '_' and '.' "
+            "(1-64 characters, starting with a letter or digit). Or enter a full path."
+        )
+    return chrome.normalize_path(str(chrome.profile_root() / name))
+
+
+def _same_directory(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def _assert_directory_unused(profiles: List[BrowserProfile], directory: str, exclude_id: str = "") -> None:
+    """Two profiles on one Chrome directory would share logins and fight over its lock."""
+    for other in profiles:
+        if other.id != exclude_id and _same_directory(other.resolved_user_data_dir, directory):
+            raise ProfileError(
+                f"The profile '{other.name}' already uses this Chrome profile directory. "
+                "Pick a different folder name.",
+                409,
+            )
+
+
 def _clean_user_data_dir(raw: Any, profile_id: str = "") -> str:
     """Validate a managed Chrome profile directory.
+
+    Accepts a full path or a bare folder name (created under the AirdropOS profile root).
+    Empty means "choose automatically" (the random default, see ``chrome.default_user_data_dir``).
 
     Refuses a real person's Chrome/Chromium profile root: launching Chrome against it
     would put the agent inside the operator's own logged-in browser, and a later
@@ -227,7 +273,10 @@ def _clean_user_data_dir(raw: Any, profile_id: str = "") -> str:
     text = str(raw or "").strip()
     if not text:
         return chrome.default_user_data_dir(profile_id) if profile_id else ""
-    resolved = _clean_path(text, "Chrome profile directory", must_be_dir=True)
+    if _is_bare_folder_name(text):
+        resolved = _clean_path(_managed_folder_path(text), "Chrome profile directory", must_be_dir=True)
+    else:
+        resolved = _clean_path(text, "Chrome profile directory", must_be_dir=True)
     if chrome.is_personal_user_data_dir(resolved):
         raise ProfileError(
             "That directory is a real Chrome/Chromium profile (a person's own browser data). "
@@ -474,6 +523,8 @@ def create_profile(data: Dict[str, Any]) -> BrowserProfile:
             cleaned["user_data_dir"] = chrome.default_user_data_dir(profile_id)
         profile = BrowserProfile(id=profile_id, **cleaned)
         _validate_attach_settings(profile)
+        if profile.launch_mode == "managed":
+            _assert_directory_unused(profiles, profile.resolved_user_data_dir)
         profiles.append(profile)
         _write_all(profiles)
         # First profile created becomes the agent's default, so a fresh install works
@@ -503,6 +554,8 @@ def update_profile(profile_id: str, data: Dict[str, Any]) -> BrowserProfile:
         for k, v in cleaned.items():
             setattr(target, k, v)
         _validate_attach_settings(target)
+        if target.launch_mode == "managed" and not _same_directory(target.resolved_user_data_dir, previous_dir):
+            _assert_directory_unused(profiles, target.resolved_user_data_dir, exclude_id=profile_id)
         target.updated_at = _now()
         if target.resolved_user_data_dir != previous_dir and target.launch_mode == "managed":
             logger.info(

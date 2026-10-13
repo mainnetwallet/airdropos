@@ -150,7 +150,7 @@ function ProfileForm({
         {!attach && (
           <>
             <label className="block text-xs font-medium text-slate-400">
-              Chrome profile directory (optional)
+              Chrome profile directory (optional): type a folder name or a full path
               <input
                 className="input mt-1 w-full"
                 placeholder={defaultDirHint}
@@ -158,8 +158,10 @@ function ProfileForm({
                 onChange={(e) => set('user_data_dir', e.target.value)}
               />
               <span className="mt-1 block text-[11px] text-slate-500">
-                Leave empty for the dedicated default directory. A real Chrome/Chromium profile (your own
-                browser data) is refused. Environment variables such as %LOCALAPPDATA% are resolved on the server.
+                Type a folder name such as <span className="font-mono">wallet-1</span> and it is created inside the
+                AirdropOS profiles folder, or enter a full path. Leave empty and AirdropOS picks a random name. A real
+                Chrome/Chromium profile (your own browser data) is refused. Environment variables such as
+                %LOCALAPPDATA% are resolved on the server.
               </span>
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
