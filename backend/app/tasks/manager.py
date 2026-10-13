@@ -6,6 +6,7 @@ infer task progress (Specification Part 7.4).
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
@@ -30,6 +31,11 @@ from backend.app.tasks.state_machine import (
 )
 
 logger = logging.getLogger(__name__)
+
+# TaskEvidence.source / uri_reference are String(512); descriptions are capped like create_agent_task.
+EVIDENCE_URI_MAX = 512
+DESCRIPTION_MAX = 6000
+EVIDENCE_LIST_LIMIT = 50
 
 SEVERITY_BY_STATUS = {
     TaskStatus.COMPLETED: "INFO",
@@ -258,6 +264,76 @@ class TaskManager:
         return execution
 
     # ------------------------------------------------------------------
+    # Evidence
+    # ------------------------------------------------------------------
+    async def record_evidence(
+        self,
+        task: Task,
+        *,
+        evidence_type: str,
+        source: str,
+        uri_reference: str,
+        meta: Dict[str, Any],
+    ) -> TaskEvidence:
+        """Persist one evidence record linked to ``task`` (its internal UUID).
+
+        ``meta`` (label, sha256, size, capture time, ...) is stored as JSON in ``content``
+        together with the task's PUBLIC id, so a record stays auditable on its own. Raises
+        ValueError rather than truncating a path: a clipped path would silently break the link
+        between the record and the file it proves.
+        """
+        if not uri_reference:
+            raise ValueError("uri_reference is required for evidence")
+        if len(uri_reference) > EVIDENCE_URI_MAX:
+            raise ValueError(f"Evidence path is {len(uri_reference)} characters; the limit is {EVIDENCE_URI_MAX}")
+        if len(source) > EVIDENCE_URI_MAX:
+            raise ValueError("Evidence source is too long")
+
+        record = TaskEvidence(
+            task_id=task.id,
+            evidence_type=evidence_type,
+            source=source,
+            uri_reference=uri_reference,
+            content=json.dumps({"task_public_id": task.task_id, **meta}, sort_keys=True),
+        )
+        self.db.add(record)
+        await self.db.flush()
+        await self._record_event(
+            task,
+            "EVIDENCE_CAPTURED",
+            "INFO",
+            {
+                "reason": f"{evidence_type.title()} evidence recorded ({meta.get('label') or 'no label'})",
+                "evidence_id": str(record.id),
+                "sha256": meta.get("sha256"),
+            },
+        )
+        return record
+
+    @staticmethod
+    def evidence_view(record: TaskEvidence, public_task_id: str) -> Dict[str, Any]:
+        """Auditable, read-only view of one evidence record."""
+        try:
+            meta = json.loads(record.content) if record.content else {}
+            if not isinstance(meta, dict):
+                meta = {}
+        except (TypeError, ValueError):
+            meta = {}  # legacy / free-text content: still listed, just without parsed metadata
+        return {
+            "id": str(record.id),
+            "task_id": public_task_id,
+            "type": record.evidence_type,
+            "source": record.source,
+            "uri": record.uri_reference,
+            "label": meta.get("label"),
+            "sha256": meta.get("sha256"),
+            "size_bytes": meta.get("size_bytes"),
+            "captured_at": meta.get("captured_at"),
+            "recorded_at": record.created_at.isoformat() if record.created_at else None,
+            "is_verified": bool(record.is_verified),
+        }
+
+    # ------------------------------------------------------------------
     # Claiming (concurrency safety)
     # ------------------------------------------------------------------
     async def claim_next_task(self, worker_id: str) -> Optional[Task]:
@@ -358,6 +434,14 @@ class TaskManager:
         evidence_count = await self.db.scalar(
             select(func.count(TaskEvidence.id)).where(TaskEvidence.task_id == task.id)
         ) or 0
+        evidence_rows = (
+            await self.db.execute(
+                select(TaskEvidence)
+                .where(TaskEvidence.task_id == task.id)
+                .order_by(TaskEvidence.created_at.desc(), TaskEvidence.id)
+                .limit(EVIDENCE_LIST_LIMIT)
+            )
+        ).scalars().all()
         checkpoint_count = await self.db.scalar(
             select(func.count(TaskCheckpoint.id)).where(TaskCheckpoint.task_id == task.id)
         ) or 0
@@ -385,6 +469,7 @@ class TaskManager:
         return {
             "task_id": task.task_id,
             "title": task.title,
+            "description": (task.description or "")[:DESCRIPTION_MAX],
             "status": task.status,
             "priority": task.priority,
             "progress": task.progress,
@@ -398,6 +483,7 @@ class TaskManager:
             "failed_actions": task.failed_actions or [],
             "checkpoints": checkpoint_count,
             "evidence_count": evidence_count,
+            "evidence": [self.evidence_view(r, task.task_id) for r in evidence_rows],
             "error_details": task.error_details or {},
             "next_planned_action": task.next_planned_action,
             "blocker": blocker,

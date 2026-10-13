@@ -1481,7 +1481,10 @@ class BrowserController:
             return None
         out_dir = USER_DATA_ROOT / "screenshots"
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{label}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.png"
+        # Filename only: a label such as "../../x" must not be able to leave the screenshots
+        # directory. The caller keeps the raw label for its own records.
+        safe_label = re.sub(r"[^A-Za-z0-9._-]", "_", label or "evidence")[:100].lstrip(".") or "evidence"
+        path = out_dir / f"{safe_label}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.png"
         try:
             await page.screenshot(path=str(path), full_page=full_page, timeout=20000)
             return str(path)
