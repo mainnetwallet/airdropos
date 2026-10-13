@@ -32,10 +32,9 @@ logger = logging.getLogger("airdropos.api")
 async def lifespan(app: FastAPI):
     logger.info("AirdropOS backend starting (environment=%s)", settings.ENVIRONMENT)
     logger.info("Fixed model: %s @ %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
-    # The API process is the one that serves the tool catalog, so it is the one that
-    # prints the inventory. The worker holds the same tools and logs only the count,
-    # instead of repeating the whole list in a second process.
-    bootstrap_tools(announce_inventory=True)
+    # Count only. `bootstrap_tools` logs one summary line; the individual tool
+    # names are DEBUG and are also served by GET /tools.
+    bootstrap_tools()
     # Server-side approvals are what let a verified transfer be broadcast at all.
     # Without this the engine correctly refuses every broadcast, so an approved
     # transfer could never complete.

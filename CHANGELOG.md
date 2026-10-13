@@ -6,12 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 ### Changed (startup logging, quieter terminal)
-- **The tool list was printed twice.** `ToolRegistry.register` logged one INFO line per
-  tool, and the API and the worker each run the same bootstrap, so a single start produced
-  ~70 identical lines across two processes and pushed the startup banner off screen. The
-  per-tool line is now DEBUG (still visible with `LOG_LEVEL=DEBUG`), and the full inventory
-  is printed once, on one line, by the API process — the one that serves `GET /tools`. The
-  worker logs the count only.
+- **The tool list was printed twice, and then at enormous length.** `ToolRegistry.register`
+  logged one INFO line per tool, and the API and the worker each run the same bootstrap, so a
+  single start produced ~70 identical lines across two processes. The per-tool line is now
+  DEBUG (still visible with `LOG_LEVEL=DEBUG`), and each process logs a single startup line
+  carrying the count only — `Registered 68 tools (telegram user client: …, value-moving: …)`.
+  The tool names are never printed at INFO in either process; the full catalog is served by
+  `GET /tools`, which is unchanged.
+- **The scheduler printed one line per job at startup.** `register_job`, and the first-boot
+  `ensure_schedule` insertion, are now DEBUG. `Scheduler.start` reports the accurate total
+  once: `Scheduler started: 9 jobs registered`. Every job, schedule, interval and trigger is
+  unchanged, and scheduler warnings and failures are untouched.
 - **The per-request access log is off by default.** The dashboard polls several endpoints
   every few seconds, so one line per request outweighed everything else combined. Set
   `ACCESS_LOG=true` in `.env`, or pass `python run.py --access-log`, to turn it back on.
@@ -22,6 +27,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
   `GET /api/v1/audit`.
 - **`backend/app/core/logging_setup.py`** (new): the single place both processes configure
   logging, replacing two identical copies in `main.py` and `worker.py`.
+### Fixed (duplicate live-event connections)
+- **One browser tab opened several live-event sockets.** `useLiveEvents` owned its own
+  `new WebSocket(...)` and three components call it — `DashboardLayout`, `AgentInbox` and
+  `useLiveFeed` — so the Inbox and Live pages held two live connections per tab, each with
+  its own 25-second heartbeat and its own reconnect timer. React StrictMode then made each
+  of those mount, tear down and remount synchronously in development, so the server logged
+  a `[accepted]` / `connection open` pair twice for a single subscription. The two lines were
+  never a connection bug on the server: uvicorn passes `uvicorn.error` into the websockets
+  library, so both lines belong to one connection.
+- **`frontend/src/services/liveSocket.ts`** (new): one shared, reference-counted connection
+  per browser tab. The first subscriber opens it and the last one closes it, with the close
+  deferred to a microtask so a StrictMode remount or a route change reuses the open socket
+  instead of reconnecting. Heartbeat, reconnect backoff and the existing auth gate
+  (`canOpenLiveStream`) now exist once instead of once per subscriber. A second browser tab
+  still gets its own connection, which is legitimate and still reaches the server's fan-out
+  bus, and reconnection after a genuine network drop is unchanged (exponential backoff, reset
+  on a successful open). Authentication, scope checks and server-side revalidation are
+  untouched.
 ### Fixed (pre-login requests)
 - **Every page load produced a 401 before an operator could log in.** The login gate called
   the protected `GET /api/v1/overview` to find out whether there was a session, so a

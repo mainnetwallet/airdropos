@@ -35,7 +35,7 @@ from backend.app.scheduler.worker_status import heartbeat_loop, redact, state as
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
-from backend.app.tools.bootstrap import bootstrap_tools, registered_tool_names
+from backend.app.tools.bootstrap import bootstrap_tools
 from backend.app.tools.registry import registry
 
 configure_logging()
@@ -542,16 +542,15 @@ async def recover_interrupted_tasks() -> int:
 # Lifecycle
 # ----------------------------------------------------------------------
 async def main() -> None:
-    # The worker is its own process with its own (initially empty) tool registry.
-    # Without this, every planned step ran with no tools.
     worker_state.attach_logging()
-    bootstrap_tools()
-    worker_state.begin(WORKER_ID, list(registry._tools))
     logger.info("AirdropOS Worker %s starting", WORKER_ID)
     logger.info("Fixed model: %s at %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
-    # The count only. The API process prints the full tool inventory once; repeating
-    # that list here would just duplicate it in a second process's terminal.
-    logger.info("Tools available to the worker: %s", len(registered_tool_names()))
+    # The worker is its own process with its own (initially empty) tool registry, so
+    # it must bootstrap them itself: without this, every planned step ran with no
+    # tools. Logs one summary line with the count. The API process logs the same
+    # thing for its own registry; neither prints the tool names.
+    bootstrap_tools()
+    worker_state.begin(WORKER_ID, list(registry._tools))
     if emergency_stop.is_stopped:
         logger.warning("EMERGENCY STOP IS ACTIVE. No new execution or submissions.")
 

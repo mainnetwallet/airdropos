@@ -38,7 +38,11 @@ class Scheduler:
             logger.warning("Job '%s' already registered; ignoring duplicate.", job_name)
             return
         self._jobs[job_name] = handler
-        logger.info("Registered scheduler job '%s' every %smin", job_name, interval_minutes)
+        # DEBUG, not INFO: the worker registers every default job on every start, so
+        # this was one line per job before the summary existed. `start()` reports the
+        # count, which is the number an operator actually wants; the per-job detail
+        # (name, interval) stays one `LOG_LEVEL=DEBUG` away.
+        logger.debug("Registered scheduler job '%s' every %smin", job_name, interval_minutes)
 
     # ------------------------------------------------------------------
     async def ensure_schedule(self, db: AsyncSession, job_name: str, job_type: str, interval_minutes: int) -> AutomationSchedule:
@@ -59,7 +63,9 @@ class Scheduler:
         )
         db.add(schedule)
         await db.flush()
-        logger.info("Persisted schedule '%s'", job_name)
+        # DEBUG for the same reason as register_job: on a first boot this is one line
+        # per job, and nothing changed for the operator beyond "the scheduler is up".
+        logger.debug("Persisted schedule '%s'", job_name)
         return schedule
 
     async def start(self, db: AsyncSession) -> None:
@@ -67,7 +73,7 @@ class Scheduler:
         if self._running:
             return
         self._running = True
-        logger.info("Scheduler started with %s registered job(s)", len(self._jobs))
+        logger.info("Scheduler started: %d jobs registered", len(self._jobs))
         self._tasks["loop"] = asyncio.create_task(self._loop(db))
 
     async def stop(self) -> None:
