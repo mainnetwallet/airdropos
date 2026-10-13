@@ -266,3 +266,69 @@ describe('Browser Profiles page', () => {
     expect(screen.queryByText(/Chrome started/i)).toBeNull()
   })
 })
+
+/**
+ * Chrome must only ever start from an explicit click. These guard the wiring that
+ * caused a Chrome window to appear just by viewing the page.
+ */
+describe('Browser Profiles never launches Chrome implicitly', () => {
+  const launches = () => requests.filter((r) => r.method === 'POST' && /\/open$|\/reconnect$|\/close$/.test(r.url))
+
+  it('only reads the list when the page is opened', async () => {
+    response = payload({ profiles: [profile({})] })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Trading')).toBeTruthy())
+    expect(requests.length).toBeGreaterThan(0)
+    expect(requests.every((r) => r.method === 'GET')).toBe(true)
+    expect(launches()).toEqual([])
+  })
+
+  it('does not launch Chrome when the page is refreshed (re-rendered)', async () => {
+    response = payload({ profiles: [profile({})] })
+    const client = renderPage()
+    await waitFor(() => expect(screen.getByText('Trading')).toBeTruthy())
+    const afterFirstRender = requests.length
+    // A refresh remounts and refetches; it must still be read-only.
+    await client.invalidateQueries({ queryKey: ['browser-profiles'] })
+    await waitFor(() => expect(requests.length).toBeGreaterThan(afterFirstRender))
+    expect(requests.every((r) => r.method === 'GET')).toBe(true)
+    expect(launches()).toEqual([])
+  })
+
+  it('does not launch Chrome when the extensions modal is opened', async () => {
+    response = payload({ profiles: [profile({})] })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: /extensions/i }))
+    await waitFor(() => expect(screen.getByText(/Read from the Chrome profile's own state/i)).toBeTruthy())
+    expect(requests.every((r) => r.method === 'GET')).toBe(true)
+    expect(launches()).toEqual([])
+  })
+
+  it('does not launch Chrome when a profile is edited', async () => {
+    response = payload({ profiles: [profile({})] })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: /^edit$/i }))
+    await waitFor(() => expect(screen.getByLabelText(/^name$/i)).toBeTruthy())
+    expect(requests.every((r) => r.method === 'GET')).toBe(true)
+    expect(launches()).toEqual([])
+  })
+
+  it('launches Chrome only when Open Browser is clicked, and only once', async () => {
+    response = payload({ profiles: [profile({})] })
+    renderPage()
+    fireEvent.click(await screen.findByRole('button', { name: /open browser/i }))
+    await waitFor(() => expect(launches()).toHaveLength(1))
+    expect(launches()[0].url).toContain('/open')
+  })
+
+  it('shows Stop Browser instead of Open Browser once the backend says it is running', async () => {
+    response = payload({
+      profiles: [profile({ browser_running: true, connection: 'managed_persistent', session_status: 'running' })],
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByRole('button', { name: /stop browser/i })).toBeTruthy())
+    expect(screen.queryByRole('button', { name: /open browser/i })).toBeNull()
+    // Reconnect is a deliberate action, never fired on load.
+    expect(launches()).toEqual([])
+  })
+})

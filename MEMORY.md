@@ -37,10 +37,20 @@ These cost real debugging time. Keep them in mind before changing pp/browser/:
 6. **Session cookies do not persist across a Chrome restart; cookies with expires do.**
    Use an explicit expiry when testing persistence.
 
-7. **A tool name containing profile_ trips the existing "no tool implies filesystem
-   access" guard** (substring ile_). The four profile tools are therefore named
-   rowser_list_profiles / rowser_start_profile / rowser_status_profile /
-   rowser_stop_profile. Renaming them back would fail that regression test.
+7. **A tool name containing `profile_` trips the existing "no tool implies filesystem
+   access" guard** (substring `file_`). The four profile tools are therefore named
+   `browser_list_profiles` / `browser_start_profile` / `browser_status_profile` /
+   `browser_stop_profile`. Renaming them back would fail that regression test.
+
+8. **NEVER run `chrome.exe --version` (or any browser binary) to read a version.**
+   On Windows Chrome has no such switch: it forwards to, or starts, the full browser
+   with the operator's PERSONAL user-data directory. That produced the recurring
+   "Who's using Chrome?" popup every time the Browser Profiles page was loaded (it
+   polls `GET /api/v1/browser/profiles` every 8s, which called
+   `executable_version()`). Read the PE version resource instead - see
+   `_read_version_windows` in `app/browser/chrome.py`. The probe also silently
+   returned None forever, so a working probe would have been obvious earlier.
+   Regression guard: `backend/tests/test_browser_no_autolaunch.py`.
 
 ---
 

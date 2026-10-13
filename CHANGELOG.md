@@ -5,6 +5,23 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (browser)
+- **A Chrome window could appear just by viewing the Browser Profiles page.** The list
+  endpoint reported the Chrome version by running `chrome.exe --version`, and the page
+  polls that endpoint every 8 seconds. Chrome has no `--version` switch on Windows: the
+  command forwards to, or starts, the full browser — with the **operator's personal
+  profile directory**, which is where the first-run "Who's using Chrome?" picker came
+  from. The version is now read from the executable's file metadata (Windows PE version
+  resource, macOS `Info.plist`, Linux `product_version`) and cached; the module can no
+  longer execute anything at all. It also now resolves correctly (it was permanently
+  blank before), which confirms the probe was never working.
+- Chrome could fall back to the operator's own profile if `--user-data-dir` was missing
+  or unusable. The controller now refuses, immediately before any launch, to open a
+  directory that is or is inside a real personal Chrome/Chromium profile root, or one
+  that resolves to nothing.
+- Chrome discovery is cached briefly so an 8-second poll does not re-stat every
+  candidate path per profile.
+
 ### Browser automation (unified persistent Chrome, extensions, full control)
 - **Managed persistent Google Chrome.** A browser profile can now be a real Chrome
   user-data directory, so cookies, storage, installed extensions and extension settings

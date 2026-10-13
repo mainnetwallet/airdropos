@@ -306,6 +306,30 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
       `browser_status_profile`, `browser_stop_profile`, `browser_close`.
 - [x] New permissions `browser.profile` and `browser.extension` are granted in
       `bootstrap_tools`, so they can be withheld per deployment without touching source.
+
+### No implicit Chrome launch
+- [x] **Chrome starts only on an explicit action.** Opening `/browser-profiles`, its
+      8-second poll, reading status/health, the extensions modal, and editing all leave
+      Chrome closed. There is **no** auto-start option and none is needed: nothing
+      launches a browser at startup, on login or on a timer.
+- [x] **Root cause of the recurring "Who's using Chrome?" popup removed.** The list
+      endpoint reported the Chrome version by running `chrome.exe --version`, and Chrome
+      has no such switch on Windows: the command forwards to, or starts, the full browser
+      **against the operator's personal profile directory**, producing the first-run
+      profile picker. The version is now read from file metadata (Windows PE version
+      resource, macOS `Info.plist`, Linux `product_version`) and cached. The probe had
+      been silently returning `None` forever, which is why it went unnoticed.
+- [x] **Defence in depth at the launch site.** Chrome falls back to the operator's own
+      profile when `--user-data-dir` is missing or unusable, so the controller refuses,
+      before any lock scan or directory creation, to open a directory that is or is
+      inside a real personal Chrome/Chromium profile root, or one that resolves to
+      nothing.
+- [x] Regression suite `test_browser_no_autolaunch.py` (22 tests) and six frontend tests
+      ("Browser Profiles never launches Chrome implicitly") cover: listing, refreshing,
+      status, extensions, edit and health launch nothing; Open Browser launches the
+      selected profile with the correct `user_data_dir`; concurrent open+reconnect
+      produce one instance; stop releases the lock before reopening; cleanup only ever
+      targets processes naming that exact managed directory.
 - [x] Tool names avoid the substring `file_` so the existing "no tool implies shell,
       SQL or filesystem access" regression guard still holds for all 27 of them.
 

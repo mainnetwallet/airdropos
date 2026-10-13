@@ -490,6 +490,22 @@ class BrowserController:
             return None
 
         user_data_dir = profile.resolved_user_data_dir
+
+        # Defence in depth, checked FIRST and before anything is even probed. Chrome
+        # silently falls back to the OPERATOR'S OWN profile directory when
+        # --user-data-dir is missing or points somewhere unusable, which is how a stray
+        # Chrome window can appear with the wrong (or somebody else's) profile. Refuse
+        # rather than risk it, before any lock scan touches the filesystem.
+        if not user_data_dir or chrome.is_personal_user_data_dir(user_data_dir):
+            detail = (
+                "Refusing to launch Chrome against a real personal browser profile directory. "
+                "AirdropOS only opens its own managed profile directories."
+            )
+            self._last_error = detail
+            profile_store.record_use(session_key, error=detail)
+            logger.error("Refusing to launch '%s': %s", session_key, detail)
+            return None
+
         lock = chrome.profile_lock(user_data_dir)
         if lock["locked"]:
             detail = (

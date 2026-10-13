@@ -150,7 +150,44 @@ Honest-reporting rules the tools enforce:
 
 ---
 
-## 6. Security notes
+## 6. When Chrome may start
+
+Chrome starts **only** as the result of an explicit action:
+
+| Action | Starts Chrome? |
+|---|---|
+| Opening `/browser-profiles` | **No** |
+| The 8-second list poll | **No** |
+| Reading a profile's status / health | **No** |
+| Opening the extensions modal | **No** |
+| Editing, or listing, profiles | **No** |
+| Opening the extensions list | **No** |
+| **Clicking "Open Browser"** | Yes |
+| An agent browser tool that needs a page (`browser_navigate`, `browser_click`, …) | Yes |
+| Worker shutdown | No — it closes |
+
+There is **no auto-start option**: nothing launches a browser at startup, on login, or on
+a timer. If Chrome should start, an operator starts it.
+
+Two independent guarantees back this up:
+
+1. Nothing on the read path executes a process. The Chrome version shown on the page is
+   read from the executable's file metadata (Windows PE resource / macOS `Info.plist` /
+   Linux `product_version`), never by running `chrome.exe --version` — that switch does
+   not exist on Windows and starts the browser against the **operator's personal profile**,
+   which is what produced the first-run profile picker.
+2. Immediately before a launch, the controller refuses any profile directory that is (or
+   is inside) a real personal Chrome/Chromium profile root, and refuses to launch when no
+   managed directory resolves. Chrome silently falls back to the user's own profile when
+   `--user-data-dir` is missing, so that fallback is closed off rather than relied upon.
+
+`backend/tests/test_browser_no_autolaunch.py` and the
+`Browser Profiles never launches Chrome implicitly` suite in
+`frontend/src/pages/BrowserProfiles.test.tsx` lock both in.
+
+---
+
+## 7. Security notes
 
 See `SECURITY.md` §2.5.0 for the full list. In short:
 
@@ -164,12 +201,14 @@ See `SECURITY.md` §2.5.0 for the full list. In short:
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Symptom | Cause and fix |
 |---|---|
+| A Chrome window appears without clicking "Open Browser" | Should be impossible. AirdropOS never executes the Chrome binary outside a launch: the version shown on the page is read from the executable's file metadata. `backend/tests/test_browser_no_autolaunch.py` proves it, including that no process of any kind is spawned while reading the list. |
 | "This Chrome profile is already open in another process" | Another Chrome has that directory. Close it, or use Reconnect. AirdropOS will not take the profile over. |
 | "Google Chrome was not found" | Set `BROWSER_CHROME_EXECUTABLE`, or the executable path on the profile. |
 | "Status unknown" on the page | The browser worker is unreachable. Status is never reported as "stopped" when it cannot be confirmed. |
+| The Chrome version field is blank | Only populated on platforms where the version can be read from file metadata (Windows via the PE resource, macOS via `Info.plist`, Linux via the `product_version` file). It is display-only and never blocks anything. |
 | An extension is not listed | Only extensions actually **installed into the profile** are listed. A developer extension passed with `--load-extension` is deliberately session-scoped. |
 | A Web Store install is not automated | Chrome requires a person to accept it. The tool opens the listing and pauses the session for that click. |

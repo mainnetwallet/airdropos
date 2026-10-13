@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,6 +63,15 @@ _LINUX_CHROME = (
 )
 
 _EXTENSION_ID_RE = re.compile(r"^[a-p]{32}$")
+
+# Version and discovery are display-only and read from FILE METADATA. They are cached
+# because the browser-profile listing is polled every few seconds, and — more
+# importantly — nothing here may ever execute the Chrome binary (see
+# ``executable_version``).
+_VERSION_CACHE: Dict[Tuple[str, Tuple[int, int]], Optional[str]] = {}
+_DISCOVERY_CACHE: Dict[Tuple[str, str], Dict[str, Any]] = {}
+_DISCOVERY_TTL_SECONDS = 30.0
+_DISCOVERY_CACHED_AT = 0.0
 
 
 class ChromeError(Exception):
@@ -101,6 +111,14 @@ def default_user_data_dir(profile_id: str) -> str:
     return str(profile_root() / (safe or "profile"))
 
 
+def reset_caches() -> None:
+    """Forget the display caches. Used by tests and after an operator changes the setting."""
+    _VERSION_CACHE.clear()
+    _DISCOVERY_CACHE.clear()
+    global _DISCOVERY_CACHED_AT
+    _DISCOVERY_CACHED_AT = 0.0
+
+
 def is_personal_user_data_dir(raw: str) -> bool:
     """True when ``raw`` is (or is inside) a real person's Chrome/Chromium profile root."""
     try:
@@ -115,8 +133,26 @@ def is_personal_user_data_dir(raw: str) -> bool:
 
 
 def find_chrome_executable() -> Dict[str, Any]:
-    """Locate the Google Chrome executable. Reports honestly when it cannot be found."""
+    """Locate the Google Chrome executable. Reports honestly when it cannot be found.
+
+    Pure filesystem inspection — it never starts Chrome. Cached briefly because the
+    profile listing resolves this once per profile per poll.
+    """
+    global _DISCOVERY_CACHED_AT
     configured = str(settings.BROWSER_CHROME_EXECUTABLE or "").strip()
+    cache_key = (configured, os.name)
+    now = time.monotonic()
+    cached = _DISCOVERY_CACHE.get(cache_key)
+    if cached is not None and now - _DISCOVERY_CACHED_AT < _DISCOVERY_TTL_SECONDS:
+        return cached
+    result = _find_chrome_executable_uncached(configured)
+    _DISCOVERY_CACHE.clear()
+    _DISCOVERY_CACHE[cache_key] = result
+    _DISCOVERY_CACHED_AT = now
+    return result
+
+
+def _find_chrome_executable_uncached(configured: str) -> Dict[str, Any]:
     tried: List[str] = []
     if configured:
         candidate = expand(configured)
@@ -146,23 +182,120 @@ def find_chrome_executable() -> Dict[str, Any]:
 
 
 def executable_version(path: str) -> Optional[str]:
-    """Version string of a Chrome executable, or None when it cannot be read."""
+    """Version string of a Chrome executable, read WITHOUT executing it.
+
+    Chrome on Windows has no ``--version`` switch: it forwards to, or starts, the full
+    browser with the operator's PERSONAL user-data directory. Probing it therefore made
+    every read of the browser-profile list pop a Chrome window (and show the first-run
+    profile picker) whenever Chrome was not already running. The version is read from
+    file metadata instead, which is the same source Windows Explorer shows.
+
+    Display-only: a failure here returns None and must never block anything.
+    """
     if not path:
         return None
-    try:
-        import subprocess
+    key = (str(path), _stat_signature(path))
+    cached = _VERSION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    version = _read_version_windows(path) or _read_version_macos(path) or _read_version_linux(path)
+    _VERSION_CACHE[key] = version
+    # Bound the cache: the listing is polled, the key space is tiny.
+    if len(_VERSION_CACHE) > 32:
+        _VERSION_CACHE.clear()
+    return version
 
-        proc = subprocess.run(  # noqa: S603 - fixed argv, no shell, operator-supplied binary
-            [str(path), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-        text = f"{proc.stdout} {proc.stderr}".strip()
-        match = re.search(r"(\d+\.\d+\.\d+\.\d+)", text)
-        return match.group(1) if match else None
+
+def _stat_signature(path: str) -> Tuple[int, int]:
+    """(mtime, size) so a replaced executable is re-read."""
+    try:
+        stat = os.stat(path)
+        return (int(stat.st_mtime), int(stat.st_size))
+    except OSError:
+        return (0, 0)
+
+
+def _four_parts(ms: int, ls: int) -> str:
+    return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+
+
+def _read_version_windows(path: str) -> Optional[str]:
+    """The PE ``VS_FIXEDFILEINFO`` resource, read in-process. No subprocess, no shell.
+
+    The version block is fetched with the Win32 version API and then parsed directly:
+    ``VerQueryValueW`` is unreliable here, whereas walking the documented layout
+    (header, NUL-terminated ``VS_VERSION_INFO`` key, DWORD alignment, then the fixed
+    info struct) is deterministic and cross-checkable via the 0xFEEF04BD signature.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import struct
+        from ctypes import wintypes
+
+        api = ctypes.WinDLL("version", use_last_error=True)  # type: ignore[attr-defined]
+        api.GetFileVersionInfoSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        api.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        api.GetFileVersionInfoW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p]
+        api.GetFileVersionInfoW.restype = wintypes.BOOL
+
+        size = api.GetFileVersionInfoSizeW(str(path), None)
+        if not size or size > 4 * 1024 * 1024:  # a version block is never megabytes
+            return None
+        buffer = ctypes.create_string_buffer(size)
+        if not api.GetFileVersionInfoW(str(path), 0, size, ctypes.byref(buffer)):
+            return None
+        raw = bytes(buffer.raw)
+
+        marker = b"V\x00S\x00_\x00V\x00E\x00R\x00S\x00I\x00O\x00N\x00_\x00I\x00N\x00F\x00O\x00"
+        index = raw.find(marker)
+        if index < 0:
+            return None
+        value_at = (index + len(marker) + 2 + 3) & ~3  # past the NUL terminator, DWORD aligned
+        if value_at + 16 > len(raw):
+            return None
+        signature, _struct, ms, ls = struct.unpack_from("<IIII", raw, value_at)
+        if signature != 0xFEEF04BD:  # VS_FFI_SIGNATURE
+            return None
+        return _four_parts(ms, ls)
     except Exception:
         return None
+
+
+def _read_version_macos(path: str) -> Optional[str]:
+    """`CFBundleShortVersionString` from the app bundle's Info.plist."""
+    try:
+        parts = Path(path).parts
+        if ".app" not in parts:
+            return None
+        plist = Path(*parts[: parts.index(".app") + 1]) / "Contents" / "Info.plist"
+        if not plist.is_file():
+            return None
+        text = plist.read_text(encoding="utf-8", errors="replace")
+        match = re.search(
+            r"<key>CFBundleShortVersionString</key>\s*<string>([^<]+)</string>", text
+        )
+        return match.group(1).strip() if match else None
+    except Exception:
+        return None
+
+
+def _read_version_linux(path: str) -> Optional[str]:
+    """The `product_version` file the Debian/Ubuntu Chrome package installs."""
+    try:
+        if os.name == "nt" or Path(path).suffix.lower() == ".exe":
+            return None
+        resolved = Path(os.path.realpath(str(path)))
+        for marker in (resolved.parent / "product_version",
+                       resolved.parent.parent / "etc" / "product_version"):
+            if marker.is_file():
+                value = marker.read_text(encoding="utf-8", errors="replace").strip()
+                if re.fullmatch(r"[\d.]+", value):
+                    return value
+    except Exception:
+        pass
+    return None
 
 
 # Chrome writes these into a user-data directory while it owns the profile. Their
@@ -179,18 +312,60 @@ def lock_markers(user_data_dir: str) -> List[str]:
     return [name for name in _LOCK_MARKERS if (directory / name).exists()]
 
 
+def _norm_dir(value: str) -> str:
+    """Canonical comparison form for a directory path.
+
+    BOTH sides of every comparison must go through this. Normalising only one side (for
+    example the flag value but not the target) silently matches nothing on Windows, which
+    would quietly disable profile-lock detection.
+    """
+    return normalize_path(str(value or "")).lower().replace("\\", "/").rstrip("/")
+
+
+def _command_line_uses_profile(cmdline: List[str], target: str) -> bool:
+    """True only when ``--user-data-dir`` in this command line points at ``target``.
+
+    Matching on the flag's VALUE rather than on the path appearing anywhere in the command
+    line matters for safety: Chrome child processes sometimes carry a page URL as an
+    argument, so a bare substring test could match somebody's unrelated window. A managed
+    Chrome is ALWAYS launched with this flag, and Chrome requires it to use a non-default
+    directory, so requiring it cannot miss a real one.
+    """
+    wanted = _norm_dir(target)
+    if not wanted:
+        return False
+    for index, arg in enumerate(cmdline):
+        value = None
+        if arg.lower().startswith("--user-data-dir="):
+            value = arg.split("=", 1)[1]
+        elif arg.lower() == "--user-data-dir" and index + 1 < len(cmdline):
+            value = cmdline[index + 1]
+        if value is None:
+            continue
+        if _norm_dir(value.strip().strip('"').strip("'")) == wanted:
+            return True
+    return False
+
+
 def chrome_processes_for(user_data_dir: str) -> List[Dict[str, Any]]:
-    """Chrome processes whose command line references this user-data directory."""
+    """Chrome processes whose ``--user-data-dir`` is exactly this directory.
+
+    Used for profile-lock detection and, when AirdropOS stops a managed profile, for
+    terminating only the processes it started. A user's own Chrome, running a different
+    profile, is never matched and never touched.
+    """
     try:
         import psutil  # optional dependency
     except Exception:
         return []
-    target = normalize_path(user_data_dir).lower().replace("\\", "/")
+    target = _norm_dir(user_data_dir)
     if not target:
         return []
     found: List[Dict[str, Any]] = []
     try:
-        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        # ad_value=None: a process we may not inspect (another user's, or a protected one)
+        # becomes None instead of raising, so the scan simply skips it.
+        for proc in psutil.process_iter(["pid", "name", "cmdline"], ad_value=None):
             try:
                 name = (proc.info.get("name") or "").lower()
                 cmdline = proc.info.get("cmdline") or []
@@ -198,10 +373,9 @@ def chrome_processes_for(user_data_dir: str) -> List[Dict[str, Any]]:
                 continue
             if "chrome" not in name and "chromium" not in name:
                 continue
-            joined = " ".join(cmdline).lower().replace("\\", "/")
-            if target in joined:
+            if _command_line_uses_profile(cmdline, target):
                 found.append({"pid": proc.info.get("pid"), "name": proc.info.get("name")})
-                if len(found) >= 8:
+                if len(found) >= 16:
                     break
     except Exception:
         return found
