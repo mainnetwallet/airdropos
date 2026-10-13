@@ -796,17 +796,26 @@ def _tool_list(state: RuntimeState, rows: int, inner_w: int) -> RenderableType:
 # ----------------------------------------------------------------------
 # Activity + alerts
 # ----------------------------------------------------------------------
+def _hint(state: RuntimeState, keyword: str, hint: str) -> str:
+    """Bottom-border text of a log panel: the last confirmation if it concerns
+    this panel and is still fresh, otherwise the key hints."""
+    notice = state.notice or ""
+    return notice if keyword in notice else hint
+
+
 def _bottom_row(state: RuntimeState, width: int, height: int) -> RenderableType:
     activity = _panel(
-        f"{theme.ICON_ACTIVITY}  RECENT ACTIVITY",
+        f"{theme.ICON_ACTIVITY}  RECENT ACTIVITY ({len(state.events)})",
         _activity(state, height - 2),
         height=height,
+        subtitle=_hint(state, "ACTIVITY", "[a] copy all · [x] clear"),
     )
     alerts = _panel(
-        f"{theme.ICON_ALERTS}  WARNINGS & ERRORS",
+        f"{theme.ICON_ALERTS}  WARNINGS & ERRORS ({len(state.alerts)})",
         _alerts(state, height - 2),
         height=height,
         border_style=theme.BORDER if not state.alerts else theme.YELLOW,
+        subtitle=_hint(state, "WARNINGS", "[w] copy all · [z] clear"),
     )
     if width < 90:
         # Not enough width for both: show whichever matters right now.
@@ -941,11 +950,20 @@ def _interleave(cells: Sequence[RenderableType]) -> List[RenderableType]:
     return out
 
 
-def _panel(title: str, body: RenderableType, *, height: int, border_style: str = theme.BORDER) -> RenderableType:
+def _panel(
+    title: str,
+    body: RenderableType,
+    *,
+    height: int,
+    border_style: str = theme.BORDER,
+    subtitle: str = "",
+) -> RenderableType:
     return Panel(
         body,
         title=Text(title, style="bold " + theme.CYAN, no_wrap=True),
         title_align="left",
+        subtitle=Text(subtitle, style=theme.MUTED, no_wrap=True) if subtitle else None,
+        subtitle_align="right",
         border_style=border_style,
         box=_rounded(),
         padding=(0, 1),

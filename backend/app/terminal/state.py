@@ -99,6 +99,11 @@ class TaskCounts:
         return self.running + self.pending + self.completed + self.failed + self.other
 
 
+# How many lines each log panel keeps. Past this, the oldest line is dropped as
+# each new one arrives, so the panel always holds the newest HISTORY_LIMIT lines.
+HISTORY_LIMIT = 150
+
+
 @dataclass
 class EventLine:
     ts: float
@@ -107,6 +112,7 @@ class EventLine:
     source: str
     proc: str
     message: str
+    seq: int = 0
 
     @property
     def rank(self) -> int:
@@ -141,7 +147,15 @@ class RuntimeState:
     scheduler_known: bool = False
     tasks: TaskCounts = field(default_factory=TaskCounts)
 
-    events: Deque[EventLine] = field(default_factory=lambda: deque(maxlen=500))
+    events: Deque[EventLine] = field(default_factory=lambda: deque(maxlen=HISTORY_LIMIT))
+    # Warning/error records kept apart from the activity feed, so a burst of
+    # routine INFO lines can never push an error out of its own panel.
+    alert_events: Deque[EventLine] = field(default_factory=lambda: deque(maxlen=HISTORY_LIMIT))
+    # True once a Collector owns alert_events. Then an empty alert_events means
+    # "cleared", not "not tracked", and alerts must not be rebuilt from events.
+    alerts_tracked: bool = False
+    # Short confirmation ("Copied 150 lines") shown for a few seconds after a key.
+    notice: str = ""
     problems: List[str] = field(default_factory=list)
 
     worker_id: str = ""
@@ -160,7 +174,8 @@ class RuntimeState:
         too, so a genuinely broken deployment can never render an empty alert
         panel.
         """
-        found = [event for event in self.events if event.is_alert]
+        source = self.alert_events if self.alerts_tracked else self.events
+        found = [event for event in source if event.is_alert]
         now = time.time()
         for problem in self.problems:
             found.append(
@@ -174,7 +189,7 @@ class RuntimeState:
                 )
             )
         found.sort(key=lambda event: event.ts, reverse=True)
-        return found
+        return found[:HISTORY_LIMIT]
 
     @property
     def everything_operational(self) -> bool:
@@ -373,6 +388,24 @@ class Collector:
         from backend.app.terminal.events import EVENT_LOG
 
         self.tail = EventTail(EVENT_LOG)
+        # A fresh RuntimeState is built on every reading, so the history has to
+        # live here or each reading would show only the last couple of seconds.
+        self.activity: Deque[EventLine] = deque(maxlen=HISTORY_LIMIT)
+        self.alert_log: Deque[EventLine] = deque(maxlen=HISTORY_LIMIT)
+        self._seq = 0
+
+    # ------------------------------------------------------------------
+    def clear_activity(self) -> int:
+        """Empty the RECENT ACTIVITY buffer. Returns how many lines were dropped."""
+        dropped = len(self.activity)
+        self.activity.clear()
+        return dropped
+
+    def clear_alerts(self) -> int:
+        """Empty the WARNINGS & ERRORS buffer. Returns how many lines were dropped."""
+        dropped = len(self.alert_log)
+        self.alert_log.clear()
+        return dropped
 
     # ------------------------------------------------------------------
     def _uptime(self) -> float:
@@ -389,7 +422,14 @@ class Collector:
         state = RuntimeState(started_at=self.started_at)
         self._load_identity(state)
         for event in self.tail.poll(400):
-            state.events.append(event)
+            self._seq += 1
+            event.seq = self._seq
+            self.activity.append(event)
+            if event.is_alert:
+                self.alert_log.append(event)
+        state.events = deque(self.activity, maxlen=HISTORY_LIMIT)
+        state.alert_events = deque(self.alert_log, maxlen=HISTORY_LIMIT)
+        state.alerts_tracked = True
 
         loop = asyncio.get_running_loop()
         pending = [

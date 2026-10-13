@@ -33,7 +33,7 @@ import threading
 import time
 from typing import Optional
 
-from backend.app.terminal import events
+from backend.app.terminal import controls, events
 
 PLAIN_STATUS_SECONDS = 15.0
 PLAIN_FORMAT = "[{time}] {level:<8} {source} | {message}"
@@ -104,10 +104,8 @@ def _wait_for_stop_signal(stop: asyncio.Event, honour_eof: bool) -> None:
                 if not chunk:  # EOF
                     eof = True
                     break
-                # A keypress on a hand-started dashboard stops it. Routed through
-                # the loop: asyncio.Event is not thread-safe.
-                loop.call_soon_threadsafe(stop.set)
-                return
+                # Keypresses are the log-panel controls now (see controls.py), so
+                # they no longer stop the dashboard. Keep draining until EOF.
         except Exception:
             pass
         if eof and honour_eof:
@@ -163,13 +161,14 @@ async def _run_plain(collector, refresh: float) -> int:
     _install_signal_handlers(stop)
     _wait_for_stop_signal(stop, honour_eof=False)
 
-    seen = 0
+    last_seq = 0
     next_status = 0.0
     known_problems: set = set()
     while not stop.is_set():
         state = await collector.collect()
-        lines = list(state.events)
-        for event in lines[seen:]:
+        for event in list(state.events):
+            if event.seq <= last_seq:
+                continue
             console.print(
                 PLAIN_FORMAT.format(
                     time=event.time or "--:--:--",
@@ -178,7 +177,7 @@ async def _run_plain(collector, refresh: float) -> int:
                     message=event.message,
                 )
             )
-        seen = max(seen, len(lines))
+            last_seq = event.seq
         # Reported when they appear and when they clear, not on every tick: a
         # permanent fault should not fill the terminal once a second, and neither
         # should its resolution go unmentioned.
@@ -316,6 +315,45 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
 
         latest["state"] = RuntimeState(started_at=getattr(collector, "started_at", time.time()))
 
+    keys = controls.KeyReader()
+    keys.start()
+    notice = {"text": "", "until": 0.0}
+
+    def handle_key(key: str) -> bool:
+        """Run one control key. Returns True when something changed on screen."""
+        state = latest["state"]
+        if key == controls.COPY_ACTIVITY:
+            lines = list(collector.activity)
+            what = "RECENT ACTIVITY"
+        elif key == controls.COPY_ALERTS:
+            lines = list(state.alerts) if state is not None else []
+            lines.reverse()  # oldest first, like the activity copy
+            what = "WARNINGS & ERRORS"
+        elif key == controls.CLEAR_ACTIVITY:
+            count = collector.clear_activity()
+            notice.update(text=f"Cleared RECENT ACTIVITY ({count} lines)", until=time.monotonic() + 4)
+            latest["version"] += 1
+            if state is not None:
+                state.events.clear()
+            return True
+        elif key == controls.CLEAR_ALERTS:
+            count = collector.clear_alerts()
+            notice.update(text=f"Cleared WARNINGS & ERRORS ({count} lines)", until=time.monotonic() + 4)
+            latest["version"] += 1
+            if state is not None:
+                state.alert_events.clear()
+            return True
+        else:
+            return False
+        if not lines:
+            message = f"Nothing to copy in {what}"
+        elif controls.copy_to_clipboard(controls.format_lines(lines)):
+            message = f"Copied {len(lines)} lines from {what}"
+        else:
+            message = f"Could not reach the clipboard for {what}"
+        notice.update(text=message, until=time.monotonic() + 4)
+        return True
+
     # Once, immediately before the first frame. Nothing is printed after this.
     take_over_screen(console)
     try:
@@ -336,8 +374,18 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
             drawn_at = 0.0
             while not stop.is_set():
                 width, height = console.size
-                key = (width, height, latest["version"])
                 now = time.monotonic()
+                while True:
+                    pressed = keys.poll()
+                    if pressed is None:
+                        break
+                    if handle_key(pressed):
+                        drawn_key = None  # redraw now
+                shown_notice = notice["text"] if now < notice["until"] else ""
+                if shown_notice != latest["state"].notice:
+                    drawn_key = None
+                latest["state"].notice = shown_notice
+                key = (width, height, latest["version"])
                 # Draw when the window size or the readings changed, and at least once a
                 # second so the uptime keeps moving. Checking every 50 ms is what makes
                 # a resize show up at once instead of at the next one-second tick.
@@ -354,6 +402,7 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                     drawn_at = now
                 await _sleep(stop, FRAME_POLL_SECONDS)
     finally:
+        keys.stop()
         collector_task.cancel()
         try:
             await collector_task
