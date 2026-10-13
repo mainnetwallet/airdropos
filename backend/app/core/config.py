@@ -272,6 +272,76 @@ class Settings(BaseSettings):
     # (10.x, 172.16-31.x, 192.168.x) are refused too unless this is true.
     BROWSER_ALLOW_PRIVATE_NETWORK: bool = False
 
+    # ------------------------------------------------------------------
+    # MANAGED PERSISTENT CHROME PROFILES
+    # ------------------------------------------------------------------
+    # A profile is a real Chrome user-data directory, so cookies, storage, installed
+    # extensions and extension settings survive an AirdropOS restart. Chrome refuses to
+    # open a user-data directory that another Chrome already owns, which is what makes
+    # profile locking real rather than advisory.
+    BROWSER_PERSISTENT_PROFILES: bool = Field(
+        default=True,
+        description=(
+            "Launch Google Chrome with a dedicated persistent user-data directory per "
+            "browser profile instead of an ephemeral Playwright context. Off = every task "
+            "gets a throwaway profile (no extensions, no persistence)."
+        ),
+    )
+    BROWSER_CHROME_EXECUTABLE: str = Field(
+        default="",
+        description=(
+            "Absolute path to the Google Chrome executable. Empty = auto-detect the usual "
+            "install locations, then fall back to the Playwright-managed Chromium."
+        ),
+    )
+    BROWSER_PROFILE_ROOT: str = Field(
+        default="",
+        description=(
+            "Root directory for managed Chrome profile directories. Empty = "
+            "%LOCALAPPDATA%\\AirdropOS\\ChromeProfiles on Windows, "
+            "~/.airdropos/chrome-profiles elsewhere. A profile id is appended to it."
+        ),
+    )
+    BROWSER_HEADLESS_EXTENSIONS: bool = Field(
+        default=False,
+        description=(
+            "Allow launching a managed Chrome profile headless. Off by default because "
+            "extension support in Chrome's old headless mode was incomplete; the new "
+            "headless mode supports them, so this only controls whether we rely on it."
+        ),
+    )
+    BROWSER_ALLOW_INTERNAL_PAGES: bool = Field(
+        default=True,
+        description=(
+            "Allow the agent to open a small allowlist of chrome:// pages (chrome://extensions, "
+            "chrome://version) for extension management. Never chrome://settings, chrome://net-internals "
+            "or any page that could change security-relevant browser state."
+        ),
+    )
+    BROWSER_ALLOW_ATTACH: bool = Field(
+        default=True,
+        description=(
+            "Allow attaching to an already-running Chrome over a loopback DevTools endpoint that "
+            "the operator explicitly configured. Off = only managed profiles may be opened."
+        ),
+    )
+    BROWSER_ATTACH_HOST: str = Field(
+        default="127.0.0.1",
+        description="Default DevTools host for 'connect to existing Chrome'. Loopback only.",
+    )
+    BROWSER_DOWNLOAD_DIR: str = Field(
+        default="",
+        description="Directory downloads are saved to. Empty = <BROWSER_USER_DATA_DIR>/downloads.",
+    )
+    BROWSER_MAX_UPLOAD_BYTES: int = Field(
+        default=25 * 1024 * 1024, ge=0, le=512 * 1024 * 1024,
+        description="Largest file the agent may upload through a page file chooser.",
+    )
+    BROWSER_MAX_TABS: int = Field(
+        default=20, ge=2, le=100,
+        description="Tab ceiling per browser session, so a runaway task cannot open hundreds.",
+    )
+
     # =========================================================================
     # LIVE BROADCAST (session gateway inside the worker process)
     # =========================================================================

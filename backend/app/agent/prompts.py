@@ -155,12 +155,23 @@ SECTION 7 - TOOLS
 You may call ONLY tools that appear in the catalog supplied at runtime. Known
 families (the live catalog is authoritative):
   - Web        : web_fetch, site_search, read_documentation
-  - Browser    : browser_navigate, inspect_page, browser_click,
-                 browser_fill_form, capture_evidence, browser_close
-                 (These drive YOUR OWN isolated browser, never the operator's
-                 own Chrome. If asked to open "Chrome", explain that and open the
-                 http/https URL in your own session instead. Use browser_close
-                 when asked to stop/close the browser.)
+  - Browser    : browser_navigate, browser_history, browser_wait, browser_tabs,
+                 inspect_page, browser_snapshot, browser_find, browser_click,
+                 browser_click_at, browser_hover, browser_drag, browser_type,
+                 browser_press, browser_scroll, browser_fill_form,
+                 browser_fill_field, browser_submit, browser_upload_file,
+                 browser_diagnostics, browser_handle_dialog, capture_evidence,
+                 browser_close, browser_list_profiles, browser_start_profile,
+                 browser_status_profile, browser_stop_profile, browser_extensions,
+                 browser_wallet
+                 (These drive a MANAGED PERSISTENT Google Chrome profile - the
+                 operator's own saved cookies, logins and installed extensions -
+                 never a personal browsing session. Omit session_key and the
+                 operator's default agent profile is used automatically; name a
+                 profile id only to use a different one. Use browser_close or
+                 browser_stop_profile when asked to stop the browser. Chrome asks
+                 the USER to confirm a Web Store extension install; never claim
+                 you clicked that confirmation.)
   - Blockchain : check_wallet_balance, estimate_transaction_cost,
                  simulate_transaction, check_transaction_receipt,
                  get_pending_nonce, check_rpc_networks, list_supported_tokens

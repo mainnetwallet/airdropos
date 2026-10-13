@@ -77,6 +77,7 @@ More: [SECURITY.md](SECURITY.md) · [Wallet security](docs/WALLET_SECURITY.md)
 | [Architecture](docs/ARCHITECTURE.md) | How the parts fit together |
 | [Deployment](docs/DEPLOYMENT.md) | VPS, HTTPS, proxies |
 | [Telegram](docs/TELEGRAM_SETUP.md) · [Discord](docs/DISCORD_SETUP.md) · [X](docs/X_INTEGRATION.md) | Integration setup |
+| [Browser Profiles](docs/BROWSER_PROFILES.md) | Persistent Chrome profiles, extensions, browser tools |
 | [Live Broadcast](docs/LIVE_BROADCAST.md) | Watch and control browser sessions |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common problems |
 | [Changelog](CHANGELOG.md) | What changed |

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import time
@@ -18,6 +19,8 @@ from backend.app.live.events import redact_text, safe_url
 from backend.app.live.models import Capabilities, Conflict, Frame, NotSupported, SessionNotFound
 from backend.app.live.providers.base import SessionProvider
 from backend.app.live.sessions import SessionRecord
+
+logger = logging.getLogger(__name__)
 
 STOPPED_VISIBLE_SECONDS = 5  # how long a stopped card stays on Live Broadcast
 TASK_DONE_GRACE_SECONDS = 8  # let the last frame/event show before the browser closes
@@ -133,6 +136,8 @@ class BrowserProvider(SessionProvider):
             "url": safe_url(rec.last_url),
             "title": redact_text(rec.last_title),
             "viewport": controller.viewport(rec.key) if not rec.stopped else None,
+            "browser_mode": controller.session_mode(rec.key),
+            "profile_dir": controller.profile_dir(rec.key),
             "capabilities": self.capabilities.as_dict(),
             "control": rec.control.public() if rec.control else None,
             "waiting": (
@@ -239,31 +244,138 @@ class BrowserProvider(SessionProvider):
             existing = reg.get(key)
             if existing is not None and not existing.stopped and controller.peek_page(key) is not None:
                 raise Conflict("A session for this profile is already running.", "already_running")
-            reg.restart(key)
-            try:
-                page = await controller.get_page(key)
-                if page is None:
-                    reg.mark_error(key, "Browser automation is unavailable")
-                    raise Conflict(
-                        "Browser automation is unavailable in the worker (is Playwright/Chromium installed?).",
-                        "browser_unavailable",
-                    )
-                if profile_store.get_profile(profile.id) is None:
-                    raise Conflict("This profile was deleted while the session was starting.", "no_profile")
-                reg.ensure(key, profile_id=profile.id, profile_name=profile.name)
-                if url:
-                    result = await controller.navigate(key, url)
-                    if not result.get("ok"):
-                        raise Conflict(
-                            f"Could not open the URL ({result.get('reason', 'error')}).", "navigation_failed"
-                        )
-                    obs = result["observation"]
-                    if obs.requires_human:
-                        reg.mark_waiting(key, obs.human_reason or "Human interaction required.")
-            except Exception:
-                await self._teardown_failed_start(key)
-                raise
+            await self._start(key, profile, url)
         return await self.get_session(key)
+
+    async def _start(self, key: str, profile, url: str) -> None:
+        """Bring the browser up for a profile and navigate it if a URL was given.
+
+        Raises Conflict (never a fake success) when the browser could not actually be
+        started, so the API never tells the UI that a profile is open when it is not.
+        """
+        reg = hub.browser_sessions
+        reg.restart(key)
+        try:
+            page = await controller.get_page(key)
+            if page is None:
+                detail = controller.health().get("last_error") or "Chrome could not be started."
+                reg.mark_error(key, "Browser automation is unavailable")
+                raise Conflict(detail, "browser_unavailable")
+            if profile_store.get_profile(profile.id) is None:
+                raise Conflict("This profile was deleted while the session was starting.", "no_profile")
+            reg.ensure(key, profile_id=profile.id, profile_name=profile.name)
+            if url:
+                result = await controller.navigate(key, url)
+                if not result.get("ok"):
+                    raise Conflict(
+                        f"Could not open the URL ({result.get('reason', 'error')}): {result.get('detail', '')}",
+                        "navigation_failed",
+                    )
+                obs = result["observation"]
+                if obs.requires_human:
+                    reg.mark_waiting(key, obs.human_reason or "Human interaction required.")
+        except Conflict:
+            await self._teardown_failed_start(key)
+            raise
+        except Exception:
+            await self._teardown_failed_start(key)
+            raise
+
+    # ------------------------------------------------------------------ profile operations
+    async def open_profile(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Start or reuse a profile's browser and report the REAL outcome.
+
+        Unlike ``create`` this is idempotent: opening a profile that is already running
+        returns its status instead of a conflict, which is what an "Open Browser" button
+        needs. It never substitutes another profile.
+        """
+        profile_id = str(payload.get("profile_id") or "")
+        profile = profile_store.get_profile(profile_id) if profile_store.valid_profile_id(profile_id) else None
+        if profile is None:
+            raise Conflict("That browser profile does not exist.", "no_profile")
+        key = normalize_session_key(profile.id)
+        url = str(payload.get("url") or profile.start_url or "").strip()
+
+        async with self._create_locks.setdefault(key, asyncio.Lock()):
+            if controller.peek_page(key) is not None and controller.session_mode(key) != "none":
+                status = await self.profile_status(key)
+                return {"status": status, "reused": True}
+            reg = hub.browser_sessions
+            active = sum(1 for r in reg.records.values() if not r.stopped and r.key != key)
+            if active >= settings.LIVE_MAX_BROWSER_SESSIONS:
+                raise Conflict(
+                    f"The limit of {settings.LIVE_MAX_BROWSER_SESSIONS} running browser sessions is reached.",
+                    "session_limit",
+                )
+            reg.restart(key)
+            result = await controller.open_profile(key)
+        if not result.get("ok"):
+            hub.browser_sessions.mark_error(key, "Browser could not be started")
+            raise Conflict(result.get("detail", "The browser could not be started."),
+                           result.get("reason", "browser_unavailable"))
+        if url and not result.get("reused"):
+            nav = await controller.navigate(key, url)
+            if not nav.get("ok"):
+                result["navigation"] = {"ok": False, "detail": nav.get("detail")}
+        status = await self.profile_status(key)
+        return {"status": status, "reused": bool(result.get("reused"))}
+
+    async def reconnect_profile(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Re-establish a connection to a profile's browser (health check or restart)."""
+        profile_id = str(payload.get("profile_id") or "")
+        profile = profile_store.get_profile(profile_id) if profile_store.valid_profile_id(profile_id) else None
+        if profile is None:
+            raise Conflict("That browser profile does not exist.", "no_profile")
+        key = normalize_session_key(profile.id)
+        async with self._create_locks.setdefault(key, asyncio.Lock()):
+            hub.browser_sessions.restart(key)
+            result = await controller.reconnect_profile(key)
+        if not result.get("ok"):
+            hub.browser_sessions.mark_error(key, "Reconnect failed")
+            raise Conflict(result.get("detail", "The browser could not be reconnected."),
+                           result.get("reason", "browser_unavailable"))
+        return {"status": await self.profile_status(key)}
+
+    async def profile_status(self, key: str) -> Dict[str, Any]:
+        """The live truth about one profile's browser."""
+        await self.reconcile()
+        return await controller.profile_status(normalize_session_key(key))
+
+    async def profile_statuses(self) -> Dict[str, Any]:
+        """Status of every saved profile in ONE pass.
+
+        The Browser Profiles page polls this every few seconds. Asking the worker once
+        per profile meant N reconciles (each of which may touch the database) per poll;
+        here the reconcile happens once and the per-profile work is local.
+        """
+        await self.reconcile()
+        out: Dict[str, Any] = {}
+        for profile in profile_store.list_profiles():
+            try:
+                out[profile.id] = await controller.profile_status(profile.id)
+            except Exception as exc:  # one broken profile must not hide the others
+                logger.warning("Status for profile '%s' failed: %s", profile.id, type(exc).__name__)
+                out[profile.id] = {"ok": False, "running": False, "last_error": type(exc).__name__}
+        return out
+
+    async def close_profile(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        profile_id = str(payload.get("profile_id") or "")
+        profile = profile_store.get_profile(profile_id) if profile_store.valid_profile_id(profile_id) else None
+        if profile is None:
+            raise Conflict("That browser profile does not exist.", "no_profile")
+        key = normalize_session_key(profile.id)
+        record = hub.browser_sessions.get(key)
+        if record is not None and record.control is not None:
+            raise Conflict("An operator has manual control of this browser session.", "manual_control")
+        was_running = controller.session_mode(key) != "none"
+        hub.browser_sessions.mark_stopped(key, by_operator=True, reason=f"Stopped by {payload.get('operator', 'operator')}")
+        await controller.close_session(key)
+        self._drop_frames(key)
+        return {"closed": key, "was_running": was_running, "profile_data_kept": True}
+
+    async def extensions(self, key: str) -> Dict[str, Any]:
+        """Installed extensions read from the profile's own Chrome state."""
+        return await controller.extension_status(normalize_session_key(key))
 
     async def action(self, key: str, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         key = normalize_session_key(key)

@@ -1,18 +1,19 @@
-# AirdropOS Implementation Checklist
-
-**Status as of 2026-10-13:** the backend suite passes at **1051 tests** and the
-frontend at **18**, with `npm run lint` and `npm run build` both clean. See
-[`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
-list, [`docs/AUTONOMOUS_EXECUTION.md`](./docs/AUTONOMOUS_EXECUTION.md) for the
-autonomy policy, and [`docs/AGENT_CAPABILITIES.md`](./docs/AGENT_CAPABILITIES.md) for
-what the agent can do from chat.
-
-**The AI Agent Console executes tools.** `POST /agent/chat` selects registered tools
-and runs them through the same `ToolRegistry` the background worker uses, so
-chat-driven operations are schema-validated, permission-checked, network- and
-wallet-allowlisted, emergency-stop gated and bounded. The registry carries 44 tools.
-
-Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
+# AirdropOS Implementation Checklist
+
+**Status as of 2026-10-13 (browser system update):** the backend suite passes at
+**1203 tests** and the frontend at **32**, with `npm run lint` (0 errors) and
+`npm run build` both clean. See
+[`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
+list, [`docs/AUTONOMOUS_EXECUTION.md`](./docs/AUTONOMOUS_EXECUTION.md) for the
+autonomy policy, and [`docs/AGENT_CAPABILITIES.md`](./docs/AGENT_CAPABILITIES.md) for
+what the agent can do from chat.
+
+**The AI Agent Console executes tools.** `POST /agent/chat` selects registered tools
+and runs them through the same `ToolRegistry` the background worker uses, so
+chat-driven operations are schema-validated, permission-checked, network- and
+wallet-allowlisted, emergency-stop gated and bounded.
+
+Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 
 ## Phase 1 — Foundation
 - [x] Dedicated project directory, preserving unrelated work
@@ -133,7 +134,7 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] `test_claims.py`, `test_watchdog.py`, `test_scheduler_wiring.py`, `test_imports.py`
 - [x] **Suite is runnable and passing: 439 passed** (`.venv/Scripts/python.exe -m pytest backend/tests/ -q`)
 - [x] `README.md`, `SECURITY.md`
-- [x] 15 documents under `docs/`
+- [x] 16 documents under `docs/` (added `BROWSER_PROFILES.md`)
 - [x] `CONTINUATION.md` with honest gap list
 - [x] Frontend `npm run build` (tsc + vite) passes
 - [x] Frontend `npm run lint` passes (added the missing `frontend/.eslintrc.cjs`; eslint was installed but unconfigured, so the script had never run)
@@ -203,6 +204,135 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] `GET /agent/autonomy` and `POST /agent/autonomy/check` expose the policy and
       answer "would this run?" with the exact constraint that refused it.
 - [x] Agent Console shows the policy, its rules and its ceilings.
-- [x] Test isolation fixed: every test now runs against its own in-memory database.
-      Previously `session_scope` reached the operator's real `airdropos.db`, so test
-      runs wrote wallets, tasks and approvals into production data.
+- [x] Test isolation fixed: every test now runs against its own in-memory database.
+      Previously `session_scope` reached the operator's real `airdropos.db`, so test
+      runs wrote wallets, tasks and approvals into production data.
+
+## Phase 14 — Unified Persistent Chrome & Browser Automation (added 2026-10-13)
+
+### Persistent Chrome profiles
+- [x] `app/browser/chrome.py` — Chrome discovery (configured path, then the usual install
+      locations), profile-root resolution (`%LOCALAPPDATA%\AirdropOS\ChromeProfiles\<id>`),
+      launch-argument construction, profile-lock detection (lock files **and** a process
+      scan for a Chrome already holding the directory), and installed-extension reading
+      from the profile's own `Default/Preferences`.
+- [x] `app/browser/controller.py` launches the **installed Google Chrome** with
+      `launch_persistent_context(user_data_dir=…)`. Cookies, storage, installed
+      extensions and extension settings survive a close, a restart and an AirdropOS
+      restart, because they live in Chrome's own directory. Verified by test.
+- [x] A real person's Chrome/Chromium profile root is **refused** as a managed profile
+      directory, unconditionally. AirdropOS never launches into, or deletes, a personal
+      browsing profile.
+- [x] Chrome's own profile lock is respected: a locked directory is reported as a lock
+      conflict, not silently worked around, and Chrome's "Opening in existing browser
+      session" refusal is mapped to the same honest outcome.
+- [x] Three real modes are distinguished and reported separately: `managed_persistent`,
+      `attached` (existing Chrome over loopback CDP) and `ephemeral` (the previous
+      throwaway context, kept as a fallback and never mislabelled).
+- [x] `save_state()` no longer duplicates cookies for a persistent profile; Chrome has
+      already written them. The encrypted `state.enc` snapshot is kept for the ephemeral
+      fallback only.
+
+### Browser Profiles page (existing `/browser-profiles` route, upgraded in place)
+- [x] Create/edit form with the two labelled modes, Chrome type, executable path,
+      persistent profile directory (with the default shown), headless toggle,
+      optional unpacked developer extensions, attach host/port, and startup URL.
+      Environment variables such as `%LOCALAPPDATA%` are resolved **on the backend**.
+- [x] Every card shows backend-derived state: browser running/stopped, connection mode,
+      tab count, current tab title, installed-extension count, last used, default-agent
+      star, configuration problems, last error and last recovery. "Status unknown" is
+      shown when the worker is unreachable — never "stopped".
+- [x] Actions: Open Browser, Stop Browser, Reconnect, Set/Unset agent default,
+      Extensions, Edit, Clear snapshot, Delete configuration, Delete Chrome data.
+- [x] `GET /browser/profiles` additionally reports whether Chrome was found and where,
+      the profile root, and whether persistent profiles are enabled. The whole listing
+      is **one** worker call (`GET /browser/profiles` on the gateway, one reconcile),
+      not one per profile, because the page polls it every 8 seconds.
+- [x] Deleting a profile's **configuration** never deletes its Chrome profile data.
+      Deleting the data is a separate `DELETE /browser/profiles/{id}/data` that requires
+      the profile id to be sent back, fails closed when the worker is unreachable, and is
+      refused outright for an attached browser AirdropOS does not own.
+
+### Default agent profile
+- [x] `default_agent_profile` is persisted in the same `profiles.json` document, so the
+      choice survives a restart. A stale id resolves to nothing rather than to a
+  substitute profile.
+- [x] `session_key` is **optional** on every browser tool. Omitted, it resolves to the
+      default agent profile; supplied, it always wins. No tool substitutes a different
+      profile behind the caller's back.
+
+### Extensions
+- [x] `browser_extensions` lists what is really installed (read from the profile's own
+      `Preferences`, so component extensions are excluded), checks one by name or id,
+      opens an extension's own page, and opens `chrome://extensions` for the user.
+- [x] Web Store installation is **not** automated. The tool opens an explicitly supplied
+      official listing, then parks the session as `NEEDS_USER_ACTION` with the exact
+      click the user must make, and `action=check` verifies the result afterwards.
+      Non-`chromewebstore.google.com` URLs are refused; AirdropOS never guesses a
+      listing URL or downloads an extension package.
+- [x] Unpacked developer extensions are loaded with `--disable-extensions-except` /
+      `--load-extension`, and the tool reports that Chrome does **not** record them as
+      installed (verified by test) instead of pretending they persist.
+- [~] An extension **popup** rendered in Chrome's own window is not part of the page DOM
+      and is not reachable by any web automation. Only the extension's own pages are.
+      Reported honestly in `extension_status.capabilities` and on the UI.
+- [~] No wallet-specific signing or transaction flow through an extension. `browser_wallet`
+      detects installed wallet extensions (by published store id **and** manifest name, with
+      the match labelled as a hint), reads the EIP-1193 provider's `eth_chainId` and
+      `eth_accounts`, and reports connection-prompt signals. It never signs, never submits
+      and never claims a receipt, and it states that a page can fake `window.ethereum`.
+
+### Browser tools (27 registered, all permissioned and in the planner catalog)
+- [x] Navigation: `browser_navigate`, `browser_history` (back/forward/reload, with an
+      explicit `no_history`), `browser_wait` (load state, element, text, URL glob).
+- [x] Tabs: `browser_tabs` (list / open / switch by id, index, URL or next-previous /
+      close) with stable tab ids and a tab ceiling.
+- [x] Mouse: `browser_click` (text **or** any of ten locator strategies, right button,
+      double click, force, `expect_text` / `expect_url` verification), `browser_click_at`,
+      `browser_hover`, `browser_drag`.
+- [x] Keyboard: `browser_type` (the typed value is never returned or logged),
+      `browser_press` (combinations such as `Control+A`).
+- [x] Scrolling: `browser_scroll` (direction, pixels, to top/bottom, a named container,
+      and the before/after metrics so infinite scroll can stop when nothing more loads).
+- [x] Forms: `browser_fill_form`, `browser_fill_field` (text/textarea/select/checkbox/
+      radio, password values never read back), `browser_submit` (submit + verify),
+      `browser_upload_file` (restricted to the AirdropOS data directory and a size limit).
+- [x] Inspection: `inspect_page`, `browser_snapshot` (bounded role/name/state list plus
+      frames), `browser_find` (confirm an element exists before acting on it).
+- [x] Evidence and diagnostics: `capture_evidence` (full page or viewport),
+      `browser_diagnostics` (console, page errors, failed requests, dialogs, downloads),
+      `browser_handle_dialog` (dialogs are recorded and dismissed so a page never hangs).
+- [x] Profile lifecycle: `browser_list_profiles`, `browser_start_profile`,
+      `browser_status_profile`, `browser_stop_profile`, `browser_close`.
+- [x] New permissions `browser.profile` and `browser.extension` are granted in
+      `bootstrap_tools`, so they can be withheld per deployment without touching source.
+- [x] Tool names avoid the substring `file_` so the existing "no tool implies shell,
+      SQL or filesystem access" regression guard still holds for all 27 of them.
+
+### Tests
+- [x] `test_browser_profiles_chrome.py` — profile configuration, default agent profile
+      persistence, path validation, personal-profile refusal, extension reading,
+      internal-page allowlist, loopback-only attach endpoint.
+- [x] `test_browser_live_chrome.py` — **real Chrome**, controlled local site, isolated
+      throwaway profiles: launch, navigate, click, fill, select, checkbox, iframe,
+      scrolling, waits, dialogs, console/failed-request capture, tab create/switch/close,
+      history, profile reuse across a close/relaunch, profile isolation between profiles,
+      profile lock, internal-page enforcement, unpacked-extension loading.
+- [x] `test_browser_tools_registry.py` — registration, permissions, planner/chat catalog
+      visibility, operator stop / manual control gates, upload path restrictions,
+      Web Store refusal, extension check against real `Preferences` content.
+- [x] `test_browser_profiles_api.py` — every REST endpoint with a real authenticated
+      principal and a stubbed worker, including the 503 when the worker is unreachable
+      and the delete-data confirmation.
+- [x] `frontend/src/pages/BrowserProfiles.test.tsx` — 14 tests asserting the page renders
+      exactly what the backend returned and never an optimistic "running".
+
+### Known gaps (browser)
+- [~] In attach mode Playwright cannot intercept requests in the default context of a CDP
+      browser, so the destination guard covers navigations only. Reported in
+      `profile_status.route_guard` and `limitations`, not hidden.
+- [ ] A wallet-extension transaction flow (connect → sign → submit → receipt) is not
+      implemented. Detection and page reading are; no signing or broadcasting happens
+      through an extension, and nothing fabricates a signature or receipt.
+- [ ] No visual/screenshot-driven element resolution beyond `browser_click_at` for
+      interfaces with no usable DOM. There is no claim of human-level visual automation.

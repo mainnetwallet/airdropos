@@ -6,6 +6,44 @@ Status as of 2026-10-13. Everything below is committed and pushed to `origin/mai
 
 ---
 
+## Browser system gotchas (learned 2026-10-13 while building persistent Chrome)
+
+These cost real debugging time. Keep them in mind before changing pp/browser/:
+
+1. **An installed Chrome does NOT exit when Playwright closes its persistent context.**
+   It stays alive in background mode and keeps the user-data directory locked, so
+   "stop then immediately open again" failed with a profile-lock conflict. Fixed in
+   BrowserController._release_chrome: wait, then terminate ONLY the processes whose
+   command line names that exact managed directory. One Chrome instance is 8+ processes
+   (renderers, GPU, utilities all inherit --user-data-dir).
+
+2. **--load-extension is session-scoped.** Chrome loads the unpacked extension but
+   never writes it into Default/Extensions or extensions.settings. So it cannot be
+   detected as installed after a restart. Only Web Store installs persist.
+
+3. **Playwright cannot intercept requests in the default context of a CDP browser.**
+   Attach mode therefore has navigation-only destination guarding. Reported in
+   profile_status.route_guard, never hidden.
+
+4. **page.inner_text("body") returns "" on chrome:// pages.** The WebUI renders into
+   an open shadow root. Playwright CSS selectors pierce it, so use locators there.
+
+5. **Playwright's connection belongs to the loop that created it.** Creating a new event
+   loop per call in tests gives "The future belongs to a different loop". Also,
+   syncio.Lock binds to the first loop that awaits it, so controller.stop() clears
+   _key_locks and the gateway tests must use ONE context-managed Starlette
+   TestClient (a non-context-managed one runs each request on its own loop).
+
+6. **Session cookies do not persist across a Chrome restart; cookies with expires do.**
+   Use an explicit expiry when testing persistence.
+
+7. **A tool name containing profile_ trips the existing "no tool implies filesystem
+   access" guard** (substring ile_). The four profile tools are therefore named
+   rowser_list_profiles / rowser_start_profile / rowser_status_profile /
+   rowser_stop_profile. Renaming them back would fail that regression test.
+
+---
+
 ## Where things stand
 
 | | |

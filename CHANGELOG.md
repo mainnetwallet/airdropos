@@ -5,6 +5,51 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Browser automation (unified persistent Chrome, extensions, full control)
+- **Managed persistent Google Chrome.** A browser profile can now be a real Chrome
+  user-data directory, so cookies, storage, installed extensions and extension settings
+  survive a close, a browser restart and an AirdropOS restart, and the agent reuses the
+  same identity on every later task. Verified end to end against the installed Chrome.
+  `BROWSER_PERSISTENT_PROFILES=false` restores the previous ephemeral behaviour.
+- **`app/browser/chrome.py`** (new): Chrome discovery, profile-root resolution, launch
+  arguments, profile-lock detection (lock files and a process scan) and installed-extension
+  reading from the profile's own `Default/Preferences`.
+- **Profile lock is respected.** A directory another Chrome owns is reported as a lock
+  conflict, not worked around. Closing a managed profile waits for Chrome to exit and, if
+  an installed Chrome lingers in background mode, terminates only the processes naming
+  that exact directory, so the profile can be reopened immediately.
+- **A personal browser profile can never be adopted or deleted**: `%LOCALAPPDATA%\Google\
+  Chrome\User Data` and its equivalents are refused as a managed profile directory and
+  refused again by the data-deletion endpoint.
+- **Default agent profile.** `session_key` became optional on every browser tool; omitted,
+  it resolves to the operator's default agent profile, which is persisted and survives a
+  restart. A stale id resolves to nothing rather than to a substitute.
+- **Browser Profiles page** (`/browser-profiles`, upgraded in place) shows the backend's
+  real state — running/stopped, connection mode, tabs, current page, installed-extension
+  count, last used, configuration problems, last error, last recovery — and adds Open
+  Browser, Stop Browser, Reconnect, Set/Unset agent default, an extensions viewer, a
+  separately-confirmed Chrome-data deletion, and both browser modes (managed persistent
+  Chrome / connect to an existing Chrome) in the create form.
+- **Extension management.** `browser_extensions` lists what is really installed, checks
+  one by name or id, opens an extension's own page, and opens `chrome://extensions`.
+  Installing from the Web Store is **not** automated: the tool opens an official listing
+  and parks the session so the user can accept Chrome's own confirmation, then verifies.
+- **`browser_wallet`** (new) reports installed wallet extensions and what the page's
+  EIP-1193 provider claims (chain id, public addresses, connection-prompt signals). It never
+  signs, never submits and never claims a receipt, and it says a page can fake the provider.
+- **28 browser tools** (from 6): navigation + history + waits, tabs, ten locator strategies,
+  coordinates, hover, drag, typing, key combinations, scrolling with before/after metrics,
+  forms (fill/select/checkbox/radio/submit), restricted uploads, bounded snapshots and
+  finds, screenshots, console/page-error/request/dialog/download diagnostics, and the
+  profile lifecycle. New permissions `browser.profile` and `browser.extension`.
+- **Connect to an existing Chrome** over a loopback-only DevTools endpoint the operator
+  configured explicitly. Non-loopback hosts are refused; disconnecting leaves the operator's
+  browser open; the interception limitation of a CDP default context is reported, not hidden.
+- **Security.** Uploads restricted to the AirdropOS data directory and a size cap; typed
+  values never returned or logged; `chrome://` reduced to an `extensions`/`version`
+  allowlist; deleting a profile's configuration never deletes its Chrome data, and wiping
+  that data needs the profile id back and fails closed while the worker is unreachable.
+
 ### Security (Part 3)
 - Production startup guard: refuses default/placeholder `SECRET_KEY`, the public dev `WALLET_VAULT_MASTER_KEY`, `AUTH_ENABLED=false`, missing `OPERATOR_PASSWORD_HASH` and the default DB password. `ENVIRONMENT` is normalised so `Production`/`prod` cannot disable the checks. Vault key must be exactly 64 hex characters (config and `KeyVault`). `.env.example` no longer ships the dev vault key.
 - Browser: WebSocket handshakes are now guarded (context creation fails closed without `route_web_socket`; Playwright floor raised to 1.48); IPv4-compatible, site-local, 6to4 and Teredo IPv6 addresses are blocked.

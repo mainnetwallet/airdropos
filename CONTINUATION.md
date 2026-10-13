@@ -6,6 +6,39 @@
 
 ---
 
+## 0. STATUS UPDATE — Unified persistent Chrome & browser automation (2026-10-13)
+
+This document is the historical creation-phase record. Everything below it still describes
+how the project started. This section is the **current** status for the browser system and is
+the part to trust for anything about browsers.
+
+**Verified now** (commands and results in IMPLEMENTATION_CHECKLIST.md, Phase 14):
+- Backend suite **1202 passed / 0 failed**; frontend **32 passed**, 
+pm run lint clean,
+  
+pm run build clean.
+- Browser profiles are **managed persistent Google Chrome profiles**: a real Chrome
+  user-data directory per profile, so cookies, storage, installed extensions and extension
+  settings survive a close, a Chrome restart and an AirdropOS restart. Verified by
+  	est_browser_live_chrome.py against the installed Chrome.
+- The **default agent profile** is persisted and used whenever a browser tool call does not
+  name a profile.
+- **28 browser tools** are registered, permissioned and offered to the planner and the chat
+  loop. session_key is optional on all of them.
+- Deleting a profile's **configuration** never deletes its Chrome data; wiping the data is a
+  separate, confirmed, fail-closed operation.
+- Extension **detection** and opening an extension's own page work. Web Store **installation
+  is not automated** and is reported as requiring the user's own confirmation click.
+
+**Still not implemented, and not claimed to be:**
+- Signing or submitting a transaction through a wallet extension. rowser_wallet only
+  detects wallet extensions and reads what the page's provider claims.
+- Reading an extension popup rendered in Chrome's own window (no web automation can).
+- Sub-resource request interception while attached to an existing Chrome over CDP.
+- Headless Chrome with extensions is off by default (BROWSER_HEADLESS_EXTENSIONS).
+
+---
+
 ## 1. VERIFICATION STATEMENT (Specification Part 42.15)
 
 **No tests, builds, compilation, linting, type checking, or automated verification were executed

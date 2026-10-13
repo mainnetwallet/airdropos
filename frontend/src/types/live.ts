@@ -99,6 +99,31 @@ export type InputEvent =
   | { type: 'key'; key: string }
   | { type: 'text'; text: string }
 
+export interface InstalledExtension {
+  id: string
+  name: string
+  version: string
+  enabled: boolean
+  from_webstore: boolean
+  description: string
+  homepage: string
+  manifest_version: number
+  permissions: string[]
+}
+
+export interface BrowserTab {
+  tab_id: string
+  index: number
+  url: string
+  raw_scheme: string
+  active: boolean
+  closed: boolean
+  title: string
+}
+
+/** How a profile's browser was obtained. All of these are real, reported states. */
+export type BrowserConnection = 'managed_persistent' | 'ephemeral' | 'attached' | 'not_running' | null
+
 export interface BrowserProfileInfo {
   id: string
   name: string
@@ -111,8 +136,34 @@ export interface BrowserProfileInfo {
   created_at: string
   updated_at: string
   has_saved_state: boolean
+  // Chrome profile configuration (backend-resolved)
+  browser_type: 'chrome' | 'chromium'
+  launch_mode: 'managed' | 'attach'
+  executable_path: string
+  resolved_executable: string
+  user_data_dir: string
+  resolved_user_data_dir: string
+  headless: boolean
+  debugger_host: string
+  debugger_port: number
+  unpacked_extensions: string
+  is_default_agent: boolean
+  last_used_at: string
+  last_opened_at: string
+  last_error: string
+  last_recovery: string
+  configuration_problems: string[]
   // 'unknown' = the worker could not be reached, so the real state cannot be confirmed
   session_status: SessionStatus | 'unknown' | null
+  browser_running: boolean
+  connection: BrowserConnection
+  tabs: BrowserTab[]
+  tab_count: number | null
+  active_url: string
+  active_title: string
+  extensions: InstalledExtension[]
+  extension_count: number | null
+  limitations: string[]
 }
 
 export interface BrowserProfileInput {
@@ -123,4 +174,29 @@ export interface BrowserProfileInput {
   locale: string
   timezone_id: string
   start_url: string
+  browser_type: 'chrome' | 'chromium'
+  launch_mode: 'managed' | 'attach'
+  executable_path: string
+  user_data_dir: string
+  headless: boolean | null
+  debugger_host: string
+  debugger_port: number
+  unpacked_extensions: string
+}
+
+export interface ChromeInfo {
+  found: boolean
+  path: string
+  source: string
+  version: string
+  detail: string
+}
+
+export interface BrowserProfilesResponse {
+  profiles: BrowserProfileInfo[]
+  default_agent_profile: string | null
+  worker_reachable: boolean
+  chrome: ChromeInfo
+  profile_root: string
+  persistent_profiles_enabled: boolean
 }

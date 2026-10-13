@@ -24,8 +24,10 @@ import type {
 import type {
   BrowserProfileInfo,
   BrowserProfileInput,
+  BrowserProfilesResponse,
   ControlGrant,
   InputEvent,
+  InstalledExtension,
   LiveEventsResponse,
   LiveOverview,
   LiveSession,
@@ -385,7 +387,9 @@ Object.assign(api, {
     }),
 
   // --- Browser profiles ---------------------------------------------------
-  browserProfiles: () => request<{ profiles: BrowserProfileInfo[] }>('/browser/profiles'),
+  // Every call here returns backend-derived state. The page never invents a
+  // "running" or "installed" state of its own.
+  browserProfiles: () => request<BrowserProfilesResponse>('/browser/profiles'),
   createBrowserProfile: (body: BrowserProfileInput) =>
     request<BrowserProfileInfo>('/browser/profiles', { method: 'POST', body: JSON.stringify(body) }),
   updateBrowserProfile: (id: string, body: Partial<BrowserProfileInput>) =>
@@ -393,8 +397,48 @@ Object.assign(api, {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
+  /** Start (or reuse) the real browser. Rejects unless the worker confirms it is running. */
+  openBrowserProfile: (id: string, url?: string) =>
+    request<{ profile: BrowserProfileInfo; reused: boolean }>(
+      `/browser/profiles/${encodeURIComponent(id)}/open`,
+      { method: 'POST', body: JSON.stringify({ url: url ?? '' }) },
+    ),
+  reconnectBrowserProfile: (id: string) =>
+    request<{ profile: BrowserProfileInfo }>(
+      `/browser/profiles/${encodeURIComponent(id)}/reconnect`,
+      { method: 'POST' },
+    ),
+  /** Stops the browser. The Chrome profile data on disk is never touched. */
+  closeBrowserProfile: (id: string) =>
+    request<{ closed: string; was_running: boolean; profile_data_kept: boolean }>(
+      `/browser/profiles/${encodeURIComponent(id)}/close`,
+      { method: 'POST' },
+    ),
+  setDefaultBrowserProfile: (profileId: string | null) =>
+    request<{ default_agent_profile: string | null }>('/browser/profiles/default', {
+      method: 'POST',
+      body: JSON.stringify({ profile_id: profileId }),
+    }),
+  browserProfileExtensions: (id: string) =>
+    request<{
+      installed: InstalledExtension[]
+      installed_count: number
+      unpacked_loaded_this_session: string[]
+      capabilities: Record<string, unknown>
+      note?: string
+    }>(`/browser/profiles/${encodeURIComponent(id)}/extensions`),
+  /** Removes the profile CONFIGURATION only; the Chrome data directory is kept. */
   deleteBrowserProfile: (id: string) =>
-    request<{ deleted: string }>(`/browser/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    request<{ deleted: string; chrome_data_kept_at: string }>(
+      `/browser/profiles/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
+  /** Irreversible: permanently deletes the Chrome profile data. `confirm` must equal the id. */
+  deleteBrowserProfileData: (id: string) =>
+    request<{ deleted: boolean; path: string; bytes_freed?: number }>(
+      `/browser/profiles/${encodeURIComponent(id)}/data`,
+      { method: 'DELETE', body: JSON.stringify({ confirm: id }) },
+    ),
   clearBrowserProfileState: (id: string) =>
     request<{ cleared: string }>(`/browser/profiles/${encodeURIComponent(id)}/state`, { method: 'DELETE' }),
 })
@@ -411,10 +455,22 @@ export type LiveApi = {
   liveRenewControl: (i: string, k: string, token: string) => Promise<Record<string, unknown>>
   liveReleaseControl: (i: string, k: string, token: string) => Promise<{ released: boolean; counts?: Record<string, number> }>
   liveInput: (i: string, k: string, token: string, seq: number, e: InputEvent) => Promise<Record<string, unknown>>
-  browserProfiles: () => Promise<{ profiles: BrowserProfileInfo[] }>
+  browserProfiles: () => Promise<BrowserProfilesResponse>
   createBrowserProfile: (b: BrowserProfileInput) => Promise<BrowserProfileInfo>
   updateBrowserProfile: (id: string, b: Partial<BrowserProfileInput>) => Promise<BrowserProfileInfo>
-  deleteBrowserProfile: (id: string) => Promise<{ deleted: string }>
+  openBrowserProfile: (id: string, url?: string) => Promise<{ profile: BrowserProfileInfo; reused: boolean }>
+  reconnectBrowserProfile: (id: string) => Promise<{ profile: BrowserProfileInfo }>
+  closeBrowserProfile: (id: string) => Promise<{ closed: string; was_running: boolean; profile_data_kept: boolean }>
+  setDefaultBrowserProfile: (id: string | null) => Promise<{ default_agent_profile: string | null }>
+  browserProfileExtensions: (id: string) => Promise<{
+    installed: InstalledExtension[]
+    installed_count: number
+    unpacked_loaded_this_session: string[]
+    capabilities: Record<string, unknown>
+    note?: string
+  }>
+  deleteBrowserProfile: (id: string) => Promise<{ deleted: string; chrome_data_kept_at: string }>
+  deleteBrowserProfileData: (id: string) => Promise<{ deleted: boolean; path: string; bytes_freed?: number }>
   clearBrowserProfileState: (id: string) => Promise<{ cleared: string }>
 }
 export const liveApi = api as typeof api & LiveApi

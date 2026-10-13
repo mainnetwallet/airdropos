@@ -37,6 +37,46 @@ AirdropOS operates autonomously on financial and web environments. Because it co
 - Anti-bot and CAPTCHA detection triggers a `NEEDS_USER_ACTION` state rather than attempting illicit evasion.
 - No arbitrary JavaScript injection from external sites is executed.
 
+### 2.5.0 Managed Persistent Chrome Profiles
+A browser profile may be a **real Google Chrome user-data directory** so that cookies,
+logins, installed extensions and extension settings survive an AirdropOS restart. That
+makes the profile a credential store, so:
+
+- **A personal browser profile can never be adopted.** `%LOCALAPPDATA%\Google\Chrome\User Data`
+  (and the macOS/Linux equivalents, and any sub-profile inside them) is refused as a managed
+  profile directory, unconditionally, and `delete_profile_data` refuses it again. AirdropOS
+  never launches into, reads or deletes a person's own browser data.
+- **Chrome's profile lock is respected.** A directory another Chrome owns is reported as a
+  lock conflict rather than worked around, so two controllers cannot end up driving the same
+  profile.
+- **Only AirdropOS-started processes are terminated.** Closing a managed profile waits for
+  Chrome to exit and, if it lingers (an installed Chrome stays alive in background mode),
+  terminates only the processes whose command line names *that exact* managed directory.
+  In "connect to existing Chrome" mode AirdropOS disconnects and never closes the operator's
+  browser, and never launches a competing Chrome against a directory already in use.
+- **Deleting a profile's configuration never deletes its Chrome data.** Wiping the data is a
+  separate endpoint that requires the profile id to be sent back, fails closed while the
+  worker is unreachable, and is refused for an attached browser AirdropOS does not own.
+- **Uploads are path-restricted.** A file may only be attached from inside the AirdropOS data
+  directory, within `BROWSER_MAX_UPLOAD_BYTES`. Nothing else on the host is readable through
+  the browser tools.
+- **Typed values are never returned.** A password or token typed by the agent is filled but
+  never echoed back to the model, the event log or the UI; form activity records field NAMES
+  only. Cookies are never returned by any tool — Chrome keeps them in its own encrypted
+  profile, and the agent cannot read them out of it.
+- **Extension installation is never automated.** Chrome's "Add to Chrome" confirmation and
+  permission prompts are the user's to accept. The tool opens an official Chrome Web Store
+  listing and parks the session for the user; it does not script, skip or pre-approve that
+  click, and it refuses any URL that is not an official store listing.
+- **`chrome://` access is a tiny allowlist** (`chrome://extensions`, `chrome://version`).
+  `chrome://settings`, `chrome://policy`, `chrome://net-internals` and everything else that
+  could weaken browser security are refused, and the agent cannot create a new `chrome://`
+  entry point for itself.
+- **Remote debugging is loopback-only.** Attaching to an existing Chrome requires an explicit
+  operator-configured port and is refused for any non-loopback host, because Chrome's DevTools
+  port is unauthenticated remote control. Nothing is published to a public interface.
+
+
 ### 2.5.1 Live Broadcast & Manual Control
 Manual browser control is opt-in per session: view-only by default, an exclusive server-issued lock per session, input bound to (operator, session, lock token, sequence), agent tools refuse to act while an operator holds the lock or the session is paused/stopped/waiting, and every acquire/release is audited. The worker gateway is internal (shared secret, loopback or private network only). Saved browser cookies are encrypted at rest. Browser navigation is guarded against SSRF per request (hostname resolution, redirects, sub-requests); DNS rebinding is narrowed but only an egress firewall closes it. Details: `docs/LIVE_BROADCAST.md`.
 

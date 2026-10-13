@@ -59,6 +59,11 @@ def bootstrap_tools() -> None:
         "browser.read",
         "browser.navigate",
         "browser.interact",
+        # Starting/stopping/inspecting a saved Chrome profile, and reading or opening
+        # extension surfaces. Separate from browser.interact so a deployment can hand out
+        # page automation without handing out "open this profile's browser".
+        "browser.profile",
+        "browser.extension",
         "notify.send",
         "report.generate",
         "social.read",

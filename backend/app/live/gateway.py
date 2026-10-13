@@ -230,9 +230,72 @@ def build_app() -> FastAPI:
         except Exception as exc:
             raise _guard(exc)
 
+    # ------------------------------------------------------------------ browser profiles
+    # Profile lifecycle lives with the browsers, in this worker. The API never talks to
+    # Chrome directly; it asks here and returns exactly what the worker observed.
+    @app.get("/browser/profiles", dependencies=deps)
+    async def all_browser_profiles() -> Dict[str, Any]:
+        """Every profile's live state in one call (the page polls this)."""
+        try:
+            return {"statuses": await _provider("browser").profile_statuses()}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
+    @app.post("/browser/profiles/open", dependencies=deps)
+    async def open_browser_profile(request: Request) -> Dict[str, Any]:
+        _refuse_while_stopped("start a browser")
+        body = await _json_body(request)
+        try:
+            return await _provider("browser").open_profile(body)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
+    @app.post("/browser/profiles/reconnect", dependencies=deps)
+    async def reconnect_browser_profile(request: Request) -> Dict[str, Any]:
+        _refuse_while_stopped("reconnect a browser")
+        body = await _json_body(request)
+        try:
+            return await _provider("browser").reconnect_profile(body)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
+    @app.post("/browser/profiles/close", dependencies=deps)
+    async def close_browser_profile(request: Request) -> Dict[str, Any]:
+        _refuse_while_stopped("stop a browser")
+        body = await _json_body(request)
+        try:
+            return await _provider("browser").close_profile(body)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
+    @app.get("/browser/profiles/{profile_id}/status", dependencies=deps)
+    async def browser_profile_status(profile_id: str) -> Dict[str, Any]:
+        try:
+            return {"status": await _provider("browser").profile_status(profile_id)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
+    @app.get("/browser/profiles/{profile_id}/extensions", dependencies=deps)
+    async def browser_profile_extensions(profile_id: str) -> Dict[str, Any]:
+        try:
+            return {"extensions": await _provider("browser").extensions(profile_id)}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
     @app.get("/events", dependencies=deps)
-    async def events(
-        after: Optional[int] = None,
+    async def events(        after: Optional[int] = None,
         epoch: Optional[str] = None,
         session: Optional[str] = None,
         limit: int = Query(default=200, ge=1, le=500),
