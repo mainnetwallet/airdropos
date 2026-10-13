@@ -1082,6 +1082,70 @@ class FillFieldTool(BaseTool):
         return ToolResult.success(data={**result, **_session_context(params)})
 
 
+class ReadValueTool(BaseTool):
+    name = "browser_read_value"
+    version = "1.0.0"
+    description = (
+        "Read the CURRENT value of one input, textarea, select or checkbox from the live page DOM, "
+        "optionally comparing it with an expected value by exact string equality. Returns "
+        "status VERIFIED, MISMATCH or UNVERIFIED. UNVERIFIED means the value could not be read "
+        "(not found, not an input, or a password/hidden field whose value is never returned); "
+        "autocomplete suggestions and screenshots are never used as proof. Read-only: it never "
+        "types, clicks or submits."
+    )
+    required_permissions = ["browser.read"]
+    side_effect = SideEffect.EXTERNAL_READ
+    timeout_seconds = 45
+    is_idempotent = True
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "strategy": {"type": "string", "enum": list(interaction.STRATEGIES)},
+            "target": {"type": "string", "maxLength": 300, "description": "What to look for."},
+            "expected": {"type": "string", "maxLength": 4000,
+                         "description": "Optional. Compare the live value with this, exactly."},
+            "index": {"type": "integer", "minimum": 0, "maximum": 50},
+            "exact": {"type": "boolean"},
+            "timeout_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS},
+            "session_key": {"type": "string", "maxLength": 64},
+        },
+        "required": ["strategy", "target"],
+    }
+
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        blocked = _gate(params)
+        if blocked:
+            return blocked
+        key = _key(params)
+        page = await controller.get_page(key)
+        if page is None:
+            return _no_browser(params)
+        timeout = min(int(params.get("timeout_ms") or DEFAULT_ACTION_TIMEOUT_MS), MAX_WAIT_MS)
+        try:
+            if "expected" in params and params["expected"] is not None:
+                result = await interaction.verify_input_value(
+                    page, strategy=params["strategy"], value=params["target"],
+                    expected=str(params["expected"]), index=int(params.get("index") or 0),
+                    exact=bool(params.get("exact")), timeout_ms=timeout,
+                )
+            else:
+                result = await interaction.read_input_value(
+                    page, strategy=params["strategy"], value=params["target"],
+                    index=int(params.get("index") or 0), exact=bool(params.get("exact")),
+                    timeout_ms=timeout,
+                )
+                result["status"] = "READ" if result.get("readable") else "UNVERIFIED"
+        except Exception as exc:
+            return _interaction_error(exc)
+        # A read is a real, successful tool call even when its answer is UNVERIFIED or MISMATCH;
+        # the status field is what the caller must act on.
+        return ToolResult.success(
+            data={**result, **_session_context(params)},
+            evidence={"authoritative": result.get("status") in ("VERIFIED", "MISMATCH", "READ"),
+                      "kind": "live_dom_value"},
+        )
+
+
 class SubmitFormTool(BaseTool):
     name = "browser_submit"
     version = "1.0.0"
@@ -1912,6 +1976,7 @@ BROWSER_TOOLS: Tuple[BaseTool, ...] = (
     ScrollTool(),
     FillFormTool(),
     FillFieldTool(),
+    ReadValueTool(),
     SubmitFormTool(),
     UploadFileTool(),
     TabsTool(),

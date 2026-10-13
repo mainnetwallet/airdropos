@@ -54,7 +54,7 @@ def test_every_browser_capability_is_registered():
         "browser_navigate", "browser_history", "browser_wait", "browser_tabs",
         "browser_snapshot", "browser_find", "browser_click", "browser_click_at",
         "browser_hover", "browser_drag", "browser_type", "browser_press",
-        "browser_scroll", "browser_fill_form", "browser_fill_field", "browser_submit",
+        "browser_scroll", "browser_fill_form", "browser_fill_field", "browser_read_value", "browser_submit",
         "browser_upload_file", "browser_diagnostics", "browser_handle_dialog",
         "browser_list_profiles", "browser_start_profile", "browser_status_profile",
         "browser_stop_profile", "browser_extensions", "browser_close",

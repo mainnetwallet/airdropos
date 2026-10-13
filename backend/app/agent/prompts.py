@@ -159,7 +159,7 @@ families (the live catalog is authoritative):
                  inspect_page, browser_snapshot, browser_find, browser_click,
                  browser_click_at, browser_hover, browser_drag, browser_type,
                  browser_press, browser_scroll, browser_fill_form,
-                 browser_fill_field, browser_submit, browser_upload_file,
+                 browser_fill_field, browser_read_value, browser_submit, browser_upload_file,
                  browser_diagnostics, browser_handle_dialog, capture_evidence,
                  browser_close, browser_list_profiles, browser_start_profile,
                  browser_status_profile, browser_stop_profile, browser_extensions,

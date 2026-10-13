@@ -55,13 +55,20 @@ class LocatorNotFound(Exception):
         self.available = available or []
 
 
-def is_sensitive_input(element) -> bool:
-    """A field whose value must never be read back, logged or returned."""
+async def is_sensitive_input(element) -> bool:
+    """A field whose value must never be read back, logged or returned.
+
+    ``element`` is a Playwright Locator/ElementHandle, whose ``get_attribute`` is a coroutine.
+    This is deliberately async. It fails CLOSED: if the type cannot be determined the field
+    is treated as sensitive, so a lookup failure can never expose a password.
+    """
     try:
-        input_type = (element.get_attribute("type") or "text").lower()
-    except Exception:
-        return False
-    return input_type in _SENSITIVE_INPUT_TYPES
+        input_type = ((await element.get_attribute("type")) or "text").lower()
+        secret = await element.get_attribute("data-secret")
+    except Exception as exc:
+        logger.debug("Could not read input type (%s); treating the field as sensitive", type(exc).__name__)
+        return True
+    return input_type in _SENSITIVE_INPUT_TYPES or secret is not None
 
 
 def frames_in_scope(page) -> List[Any]:
@@ -591,6 +598,71 @@ async def fill_field(
             "control": input_type or tag or "text"}
 
 
+async def read_input_value(page, *, strategy: str, value: str, index: int = 0,
+                           exact: bool = False, timeout_ms: int = 6000) -> Dict[str, Any]:
+    """Read the CURRENT value of one input from the live DOM (``el.value`` / ``checked``).
+
+    Never submits, types or clicks. A sensitive field (password / hidden / data-secret) reports
+    that it is sensitive and returns no value. If the element cannot be found or is not a
+    value-bearing control, ``readable`` is False so callers cannot mistake it for a result.
+    """
+    try:
+        locator, matched = await resolve(page, strategy=strategy, value=value, index=index,
+                                         exact=exact, timeout_ms=timeout_ms)
+    except LocatorNotFound as exc:
+        return {"ok": False, "readable": False, "reason": str(exc)[:300], "matched": 0}
+    sensitive = await is_sensitive_input(locator)
+    if sensitive:
+        return {"ok": True, "readable": False, "sensitive_field": True, "matched": matched,
+                "reason": "Sensitive field: its value is never read back."}
+    try:
+        info = await locator.evaluate(
+            """(el) => {
+                const tag = (el.tagName || '').toLowerCase();
+                const type = (el.getAttribute('type') || '').toLowerCase();
+                if (tag === 'select') {
+                    return {control: 'select', value: el.value,
+                            label: el.selectedOptions[0] ? el.selectedOptions[0].label : ''};
+                }
+                if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
+                    return {control: type, value: el.checked ? 'checked' : '', checked: !!el.checked};
+                }
+                if (tag === 'input' || tag === 'textarea') {
+                    return {control: type || tag, value: String(el.value)};
+                }
+                if (el.isContentEditable) {
+                    return {control: 'contenteditable', value: el.innerText};
+                }
+                return null;
+            }"""
+        )
+    except Exception as exc:
+        return {"ok": False, "readable": False, "matched": matched,
+                "reason": f"Could not read the live value: {type(exc).__name__}"}
+    if not isinstance(info, dict):
+        return {"ok": False, "readable": False, "matched": matched,
+                "reason": "The matched element is not an input, textarea, select or editable field."}
+    return {"ok": True, "readable": True, "sensitive_field": False, "matched": matched, **info}
+
+
+async def verify_input_value(page, *, strategy: str, value: str, expected: str, index: int = 0,
+                             exact: bool = False, timeout_ms: int = 6000) -> Dict[str, Any]:
+    """Compare a field's live DOM value with ``expected`` by EXACT string equality.
+
+    status is VERIFIED (equal), MISMATCH (readable but different) or UNVERIFIED (the value could
+    not be read: not found, sensitive, not an input). Autocomplete suggestions and screenshots
+    are never consulted, only the element's own value.
+    """
+    read = await read_input_value(page, strategy=strategy, value=value, index=index,
+                                  exact=exact, timeout_ms=timeout_ms)
+    if not read.get("readable"):
+        return {**read, "ok": False, "status": "UNVERIFIED"}
+    actual = str(read.get("value", ""))
+    status = "VERIFIED" if actual == str(expected) else "MISMATCH"
+    return {**read, "ok": status == "VERIFIED", "status": status, "expected_length": len(str(expected)),
+            "actual_length": len(actual)}
+
+
 def _select_label(option) -> Any:
     if isinstance(option, (list, tuple)):
         return [str(o)[:120] for o in option[:5]]
@@ -917,6 +989,8 @@ __all__ = [
     "frames_in_scope",
     "hover",
     "is_sensitive_input",
+    "read_input_value",
+    "verify_input_value",
     "press",
     "read_form_state",
     "resolve",
