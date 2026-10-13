@@ -156,6 +156,8 @@ class RuntimeState:
     alerts_tracked: bool = False
     # Short confirmation ("Copied 150 lines") shown for a few seconds after a key.
     notice: str = ""
+    # Why the keyboard controls are off (empty when they work).
+    keys_error: str = ""
     # RECENT ACTIVITY scroll: lines back from the newest (0 = follow the live end).
     activity_scroll: int = 0
     # Rows the activity panel showed last frame; the renderer sets it so the

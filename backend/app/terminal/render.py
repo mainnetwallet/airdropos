@@ -800,7 +800,11 @@ def _hint(state: RuntimeState, keyword: str, hint: str) -> str:
     """Bottom-border text of a log panel: the last confirmation if it concerns
     this panel and is still fresh, otherwise the key hints."""
     notice = state.notice or ""
-    return notice if keyword in notice else hint
+    if keyword in notice:
+        return notice
+    if state.keys_error and keyword == "ACTIVITY":
+        return f"keys off: {state.keys_error}"
+    return hint
 
 
 def _activity_hint(state: RuntimeState, rows: int) -> str:

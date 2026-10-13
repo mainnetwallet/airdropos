@@ -364,13 +364,26 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                 state.alert_events.clear()
             return True
         else:
+            if len(key) == 1 and key.isprintable():
+                notice.update(
+                    text=f"Key '{key}' unused. RECENT ACTIVITY: [a] copy [x] clear. WARNINGS: [w] [z]",
+                    until=time.monotonic() + 4,
+                )
+                return True
             return False
+        text = controls.format_lines(lines)
+        slug = "activity" if key == controls.COPY_ACTIVITY else "warnings"
         if not lines:
             message = f"Nothing to copy in {what}"
-        elif controls.copy_to_clipboard(controls.format_lines(lines)):
-            message = f"Copied {len(lines)} lines from {what}"
         else:
-            message = f"Could not reach the clipboard for {what}"
+            how = controls.copy_to_clipboard(text)
+            saved = controls.save_copy(slug, text)
+            if how == "native":
+                message = f"Copied {len(lines)} lines from {what}"
+            elif how == "osc52":
+                message = f"Sent {len(lines)} lines from {what} to the terminal; also in {saved or 'no file'}"
+            else:
+                message = f"Clipboard failed for {what}; saved {len(lines)} lines to {saved or 'nowhere'}"
         notice.update(text=message, until=time.monotonic() + 4)
         return True
 
@@ -405,6 +418,7 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
                 if shown_notice != latest["state"].notice:
                     drawn_key = None
                 latest["state"].notice = shown_notice
+                latest["state"].keys_error = keys.error
                 # Hold the view still while new lines arrive, if scrolled back.
                 newest = getattr(collector, "_seq", 0)
                 if scroll["offset"] and newest > scroll["seq"]:

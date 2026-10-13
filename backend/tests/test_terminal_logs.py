@@ -142,3 +142,35 @@ def test_event_tail_cleans_old_lines_with_escape_codes(tmp_path):
                                 "proc": "frontend", "message": "\x1b[1mLocal\x1b[22m: http://localhost:5173/"}) + "\n")
     [event] = EventTail(path).poll()
     assert event.message == "Local: http://localhost:5173/"
+
+
+def test_copy_reports_how_it_was_done(monkeypatch):
+    monkeypatch.setattr(controls.os, "name", "posix")
+    monkeypatch.setattr(controls, "_copy_command", lambda text: True)
+    assert controls.copy_to_clipboard("x") == "native"
+    monkeypatch.setattr(controls, "_copy_command", lambda text: False)
+    monkeypatch.setattr(controls, "_copy_osc52", lambda text: True)
+    assert controls.copy_to_clipboard("x") == "osc52"  # sent, but not confirmed
+    monkeypatch.setattr(controls, "_copy_osc52", lambda text: False)
+    assert controls.copy_to_clipboard("x") == ""
+
+
+def test_copied_text_is_also_saved_to_a_file(tmp_path, monkeypatch):
+    from backend.app.terminal import events
+
+    monkeypatch.setattr(events, "LOG_DIR", tmp_path / "logs")
+    saved = controls.save_copy("activity", "line one\nline two")
+    assert saved
+    assert (tmp_path / "logs" / "copy-activity.txt").read_text(encoding="utf-8") == "line one\nline two\n"
+
+
+def test_key_reader_records_why_it_failed(monkeypatch):
+    reader = controls.KeyReader()
+
+    def boom():
+        raise OSError("no console")
+
+    monkeypatch.setattr(reader, "_run_posix", boom)
+    monkeypatch.setattr(reader, "_run_windows", boom)
+    reader._run()
+    assert "no console" in reader.error

@@ -117,13 +117,50 @@ def _copy_osc52(text: str) -> bool:
         return False
 
 
-def copy_to_clipboard(text: str) -> bool:
+def _copy_windows_clip(text: str) -> bool:
+    """clip.exe, fed UTF-16 with a BOM so non-ASCII text survives."""
     try:
-        if os.name == "nt":
-            return _copy_windows(text) or _copy_osc52(text)
-        return _copy_command(text) or _copy_osc52(text)
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(["clip"], input=("\ufeff" + text).encode("utf-16-le"), check=True,
+                       timeout=5, creationflags=flags,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
     except Exception:
         return False
+
+
+def copy_to_clipboard(text: str) -> str:
+    """Put ``text`` on the clipboard. Returns how it was done, or "" if it failed.
+
+    ``"native"`` means the operating system confirmed it. ``"osc52"`` means an
+    escape sequence was sent to the terminal, which cannot confirm anything: some
+    terminals ignore it, so it is reported differently and never as a sure copy.
+    """
+    try:
+        if os.name == "nt":
+            if _copy_windows(text) or _copy_windows_clip(text):
+                return "native"
+        elif _copy_command(text):
+            return "native"
+        return "osc52" if _copy_osc52(text) else ""
+    except Exception:
+        return ""
+
+
+def save_copy(name: str, text: str) -> str:
+    """Write the copied text to ``logs/copy-<name>.txt``. Returns the path or ""."""
+    try:
+        from backend.app.terminal import events
+
+        events.log_dir()
+        path = events.LOG_DIR / f"copy-{name}.txt"
+        path.write_text(text + "\n", encoding="utf-8")
+        try:
+            return str(path.relative_to(events.LOG_DIR.parent))
+        except ValueError:
+            return str(path)
+    except Exception:
+        return ""
 
 
 # ----------------------------------------------------------------------
@@ -143,6 +180,8 @@ class KeyReader:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._restore: Optional[Callable[[], None]] = None
+        self.error = ""  # why keys are unavailable, if the reader could not run
+        self.received = 0  # key presses seen so far
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="dashboard-keys", daemon=True)
@@ -168,8 +207,8 @@ class KeyReader:
                 self._run_windows()
             else:
                 self._run_posix()
-        except Exception:
-            pass
+        except Exception as exc:
+            self.error = f"{type(exc).__name__}: {exc}"[:60]
 
     def _run_windows(self) -> None:
         import msvcrt
@@ -182,6 +221,7 @@ class KeyReader:
                     if name:
                         self.keys.put(name)
                     continue
+                self.received += 1
                 self.keys.put(char.lower())
             else:
                 self._stop.wait(0.03)
