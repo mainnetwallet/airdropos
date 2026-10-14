@@ -61,7 +61,24 @@ export default function SessionActions({
 }) {
   const a = useSessionActions(session)
   const caps = session.capabilities
-  if (session.status === 'stopped') return null
+  if (session.status === 'stopped') {
+    // A stopped Telegram session still blocks the agent until an operator resumes it.
+    if (session.integration !== 'telegram' || !caps.pause_resume) return null
+    return (
+      <div className={clsx('flex flex-wrap items-center gap-2', className)}>
+        <button
+          type="button"
+          disabled={!canControl || a.resume.isPending}
+          onClick={() => a.resume.mutate()}
+          className={clsx(BASE, 'bg-emerald-600 text-white hover:bg-emerald-700')}
+        >
+          {a.resume.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
+          Resume
+        </button>
+        {a.message && <p className="w-full text-xs text-amber-600">{a.message}</p>}
+      </div>
+    )
+  }
   const busy = a.pause.isPending || a.resume.isPending || a.stop.isPending
   const isParked = session.status === 'paused' || session.status === 'waiting_for_user'
 

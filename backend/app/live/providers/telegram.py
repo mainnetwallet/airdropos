@@ -45,13 +45,9 @@ class TelegramProvider(SessionProvider):
         if not tg.ever_used:
             return []  # nothing real to show until the agent has used the account
         if tg.stopped:
-            # Show "Stopped" briefly, then hide the card. The stopped flag itself stays set, so the
-            # agent remains blocked from using the account until the session is resumed/worker restarted.
-            now = time.time()
-            if self._stopped_seen is None:
-                self._stopped_seen = now
-            if now - max(self._stopped_seen, tg.last_action_at or 0) > STOPPED_VISIBLE_SECONDS:
-                return []
+            # Keep the stopped card visible. The stopped flag blocks the agent until an operator
+            # resumes it, so hiding the card would leave no way to resume (only a worker restart).
+            self._stopped_seen = self._stopped_seen or time.time()
         else:
             self._stopped_seen = None
         if tg.stopped:
