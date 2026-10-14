@@ -156,22 +156,57 @@ Screening is now recursive and bounded (`MAX_SCREEN_DEPTH`, `MAX_SCREEN_ITEMS`),
 `[REDACTED: matched a secret pattern]` rather than being dropped, so the record still
 shows something was there.
 
+Screening also covers the **keys** of a mapping, not only its values, and the root level
+is bounded by `MAX_SCREEN_ITEMS` like every nested level. Both were open: keys were
+coerced straight to `str(...)`, and only nested containers were capped, so a flat dict
+with thousands of keys was screened - and stored - in full.
+
+`integration_ref` is screened too. It only ever carries a browser profile reference such
+as `browser:default`, which is not a credential - but it is free text taken from tool
+output, and whether a value is sensitive is a property of the tool that produced it
+today, not a guarantee about tomorrow.
+
 `resource_refs` accepts an **allowlist** of reference keys only (`url`, `chat_id`,
 `session_key`, `tx_hash`, …). A `session_cookie` has no key and is refused, so the
 context cannot become a place credentials accumulate.
 
 ### Closing a requirement
 
-A requirement is closed only when the confirmed observation actually targets it:
+The rule has been wrong twice, and both times in the direction of closing things it
+should not have.
 
-* every **identifier** it names — a `@handle`, an address, a URL, a domain, a quantity —
-  must appear in what was observed and submitted, and
-* enough of its ordinary words must overlap for it to be the same kind of thing.
+**First: any shared 4-character word.** That closed *Join Telegram channel
+@examplechannel* when the agent joined *@otherchannel* - `join`, `telegram` and `channel`
+all matched.
 
-The previous rule was "share any 4-character word", which closed *Join Telegram channel
-@examplechannel* when the agent joined *@otherchannel* — `join`, `telegram` and `channel`
-all matched. A false completion is worse than an unfinished one, so ambiguity resolves to
-"not proven" and the requirement stays outstanding.
+**Second: identifiers matched against a union of every text.** The action description is
+what the planner *intended*; the tool parameters are what was actually *submitted*.
+Unioning them let a correctly-worded step satisfy a requirement by describing the right
+target while acting on the wrong one:
+
+```
+requirement   Join Telegram channel @examplechannel
+description   Join Telegram channel @examplechannel      <- intent
+parameters    {"chat": "@otherchannel"}                  <- what happened
+```
+
+The union contains `@examplechannel`, so the requirement closed and the agent believed it
+had joined a channel it never touched. **The description is no longer part of the proof
+at all.** Proof is the submitted parameters plus what the external system returned.
+
+A requirement now closes only when, against that proof:
+
+* every **identifier** it names - a `@handle`, an address, a URL, a domain - is present;
+  **and**
+* every **quantity** it names is met: same unit, amount at least as large.
+
+Quantities are compared numerically rather than string-matched, because *hold 100 tokens*
+is satisfied by holding 150 and emphatically not by holding 50. With neither identifiers
+nor quantities to go on, the rule falls back to ordinary wording and demands real
+overlap.
+
+Anything ambiguous stays outstanding. A false completion is worse than an unfinished one:
+the operator is told work is done that was never done.
 
 `unaddressed_requirements()` applies the same rule and deliberately errs the other way:
 a requirement is reported as unaddressed unless the plan demonstrably names its target.
@@ -229,6 +264,9 @@ campaign. It inherits none of the first task's history.
   concurrent tasks, cascade on delete, attempted ≠ confirmed, repeat recognition,
   requirement lifecycle, secret refusal, persistence across a fresh session, the resume
   marker, the memory hierarchy, and the three memory-scope bypass paths.
+* `backend/tests/test_intent_is_not_proof.py` - intent is not evidence. A correctly
+  worded step aimed at the right channel must not satisfy a requirement when the call
+  was actually made against a different one, and a description alone proves nothing.
 * `backend/tests/test_campaign_context.py` — shared campaign facts, no inherited history,
   account/wallet separation, staleness, official-vs-community provenance, terminal
   campaigns.

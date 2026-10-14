@@ -1,7 +1,7 @@
 # AirdropOS Implementation Checklist
 
 **Status as of 2026-10-14 (review fixes):** the backend suite passes at
-**377 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
+**385 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
 and the frontend at **26**, with `npm run lint` (0 errors) and
 `npm run build` both clean. See
 [`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
@@ -255,11 +255,18 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       human-intervention reasons and authorization-refusal details were stored verbatim.
       Screening is now recursive and bounded, and the same screened copy is written to
       every path. `test_context_secret_exposure.py` fails against the previous code.
-- [x] **Requirement completion requires a matching target.** Closing a requirement needed
-      only one shared 4-character word, so joining `@otherchannel` closed *Join Telegram
-      channel @examplechannel*. A requirement now closes only when every identifier it
-      names — handle, address, URL, domain, quantity — appears in what was observed and
-      submitted, plus a word-overlap threshold. Ambiguity leaves it outstanding.
+- [x] **Requirement completion requires proof, not intent.** Closing a requirement
+      first needed only one shared 4-character word (joining `@otherchannel` closed
+      *Join Telegram channel @examplechannel*), and the identifier fix then still
+      unioned the action **description** with the submitted parameters - so a
+      correctly-worded step satisfied a requirement while acting on a different
+      channel. The description is now excluded from the proof entirely. A
+      requirement closes only when every identifier it names is in the submitted
+      parameters or the returned state, **and** every quantity is met numerically
+      (same unit, at least as large). Ambiguity leaves it outstanding.
+- [x] Screening also covers mapping **keys**, bounds the **root** container, and
+      covers `integration_ref` (a browser profile today, but it is free text from
+      tool output).
 - [x] Memory scope validation lives in `remember`, not only `remember_scoped`, and
       `extra=` is restricted to `{scope, task_id, campaign_id}` so it cannot write
       unscreened `content`/`source`. A record naming both a task and a campaign is

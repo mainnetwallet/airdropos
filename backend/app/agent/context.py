@@ -157,19 +157,65 @@ _IDENTIFIER_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\b0x[a-fA-F0-9]{8,}\b"),                   # addresses and transaction hashes
     re.compile(r"https?://[^\s,;)\]\"']+"),                 # URLs
     re.compile(r"\bt\.me/[A-Za-z0-9_/+-]+", re.IGNORECASE),  # Telegram invite links
-    re.compile(
-        r"\b\d[\d,._]*\s*(?:usd|usdt|usdc|eth|btc|token|tokens|%|percent|days?|hours?|min|minutes)\b",
-        re.IGNORECASE,
-    ),
     re.compile(r"\b[\w-]+\.[\w-]+\.[\w-]{2,}\b"),           # sub.domain.tld
 )
+
+# Quantities are handled separately from identities, because "hold 100 tokens" is
+# satisfied by holding 150. An exact string match would never close it; matching on the
+# unit alone would close it at 50. The number has to be compared, not string-matched.
+_QUANTITY_RE = re.compile(
+    r"\b(\d[\d,._]*)\s*"
+    r"(usd|usdt|usdc|eth|btc|token|tokens|%|percent|days?|hours?|min|minutes|weeks?)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_quantities(text: str) -> List[Tuple[float, str]]:
+    """Every "amount unit" in `text`, as a comparable (number, unit) pair.
+
+    Separating the number from the unit is what lets a threshold be checked honestly:
+    "hold at least 100 tokens" becomes `(100.0, "token")`, which a proof reading "150
+    token" satisfies and a proof reading "50 token" does not.
+    """
+    found: List[Tuple[float, str]] = []
+    for raw_number, unit in _QUANTITY_RE.findall(str(text or "").lower()):
+        cleaned = raw_number.replace(",", "").replace("_", "")
+        if "." in cleaned:
+            head, _, tail = cleaned.rpartition(".")
+            # "100.000" is locale-ambiguous; treat a trailing group of three as a
+            # thousands separator, which is how such figures are written in practice.
+            if len(tail) == 3 and head.isdigit():
+                cleaned = head + tail
+        try:
+            value = float(cleaned)
+        except ValueError:
+            continue
+        found.append((value, unit[:-1] if unit.endswith("s") else unit))
+    return found
+
+
+def _quantities_met(required: List[Tuple[float, str]], proved: List[Tuple[float, str]]) -> bool:
+    """Is every required amount met by something the proof actually shows?
+
+    Same unit, and an amount at least as large. A requirement naming a unit the proof
+    never mentions is not met, however large the proof's other numbers are.
+    """
+    for amount, unit in required:
+        if not any(
+            proved_unit == unit and proved_amount >= amount
+            for proved_amount, proved_unit in proved
+        ):
+            return False
+    return True
 
 
 def _extract_identifiers(text: str) -> List[str]:
     """Every concrete target named in `text`, normalised for comparison.
 
-    Trailing punctuation is stripped and the result lowercased, so `(@examplechannel)`
-    and `@examplechannel` are the same target while `@otherchannel` is not.
+    Trailing punctuation is
+    stripped and the result lowercased, so `(@examplechannel)` and `@examplechannel` are
+    the same target while `@otherchannel` is not. Quantities are excluded here and
+    compared numerically by `_quantities_met`.
     """
     found: List[str] = []
     lowered = str(text or "").lower()
@@ -225,6 +271,18 @@ def _screen_value(value: Any, *, limit: int, depth: int = 0) -> Any:
     except SecretLeakError:
         return REDACTION_MARKER
     return rendered[:limit]
+
+
+def _screen_mapping_key(key: Any) -> str:
+    """Bound and secret-screen a mapping key as well as its value.
+
+    Keys were previously coerced straight to `str(...)` and truncated. That is harmless
+    for ordinary field names, but a key is attacker-influenced text from an untrusted
+    payload, and the secret patterns are not shy about labels: a key reading
+    `api_key: sk-live-...` would have been persisted verbatim.
+    """
+    text = _screen_value(str(key), limit=80, depth=MAX_SCREEN_DEPTH + 1)
+    return text if isinstance(text, str) else str(key)[:80]
 
 
 def _clip(value: Any, limit: int) -> Any:
@@ -458,6 +516,11 @@ class TaskContextService:
         the external system looks like (what the bot said, what the page shows), the second
         is what the tool returned. Recording only the latter is what makes an attempt look
         like a fact.
+
+        `integration_ref` is screened too. Today it only ever carries a browser profile
+        reference such as `browser:default`, which is not a credential - but it is free
+        text taken from tool output, and whether a value is sensitive is a property of the
+        tool that produced it today, not a guarantee about tomorrow.
         """
         if outcome not in OBSERVATION_OUTCOMES:
             # An unknown outcome must not silently become "fine". Unknown -> unverified.
@@ -491,7 +554,7 @@ class TaskContextService:
             evidence_authoritative=bool(evidence.get("authoritative")),
             observed_state=safe_state,
             result_digest=safe_result,
-            integration_ref=(integration_ref or None) and str(integration_ref)[:255],
+            integration_ref=(integration_ref or None) and self._screened_text(str(integration_ref), limit=255),
             is_idempotent=bool(is_idempotent),
             error=safe_error,
         )
@@ -511,16 +574,14 @@ class TaskContextService:
         await self.db.flush()
 
         if outcome == OUTCOME_CONFIRMED and evidence.get("authoritative"):
-            # The evidence for "this requirement is done" is the action description plus
-            # what was actually observed and submitted. Matching on the description alone
-            # would miss the target when it lives in the arguments, and would wrongly
-            # match a description that names the wrong one.
+            # Proof is what was SUBMITTED and what came back. The action description is
+            # deliberately excluded: it is the planner's intent, and including it lets a
+            # well-worded step satisfy a requirement it never actually performed.
             await self._satisfy_matching_requirements(
                 task,
                 observation,
                 " ".join(
                     [
-                        str(action),
                         json.dumps(safe_state, default=str),
                         json.dumps(safe_result, default=str),
                         json.dumps(parameters or {}, default=str),
@@ -1007,13 +1068,21 @@ class TaskContextService:
         redacted exactly as a top-level one is. A value matching a secret pattern becomes
         a redaction marker rather than being dropped, so the record still says "there was
         something here" without storing it.
+
+        The root level is bounded by `MAX_SCREEN_ITEMS` too. It was not: only nested
+        containers were capped, so a flat dict with ten thousand keys was screened - and
+        stored - in full.
         """
         if not isinstance(payload, dict):
             return {"value": _screen_value(payload, limit=limit)}
-        return {
-            str(key)[:80]: _screen_value(value, limit=limit)
-            for key, value in payload.items()
-        }
+        screened: Dict[str, Any] = {}
+        for key, value in list(payload.items())[:MAX_SCREEN_ITEMS]:
+            screened[_screen_mapping_key(key)] = _screen_value(value, limit=limit)
+        if len(payload) > MAX_SCREEN_ITEMS:
+            screened["__truncated__"] = (
+                f"[TRUNCATED: {len(payload) - MAX_SCREEN_ITEMS} further key(s) not stored]"
+            )
+        return screened
 
     @staticmethod
     def _screened_text(value: Optional[str], limit: int = 2000) -> Optional[str]:
@@ -1047,53 +1116,68 @@ class TaskContextService:
         await self.db.flush()
 
     async def _satisfy_matching_requirements(
-        self, task: Task, observation: TaskObservation, evidence_text: str
+        self, task: Task, observation: TaskObservation, proof_text: str
     ) -> None:
         """Close only the requirements this confirmed observation actually satisfies.
 
-        The previous rule was "share any 4-character word with the action". That closed
-        *Join Telegram channel @examplechannel* when the agent joined *@otherchannel*,
-        because `join`, `telegram` and `channel` all matched. A false completion state
-        is worse than an unfinished one: the operator is told work is done that was never
-        done against the right target.
+        Two rules have applied here, and both were wrong.
 
-        So a requirement is closed only when:
+        **Any shared 4-character word.** That closed *Join Telegram channel
+        @examplechannel* when the agent joined *@otherchannel*, because `join`,
+        `telegram` and `channel` all matched.
 
-        1. every **identifier** it names - a `@handle`, an address, a URL, a domain, a
-           quantity - appears in what was actually observed, and
-        2. it shares enough of its ordinary words with the observed evidence to be about
-           the same thing.
+        **Identifiers present in a union of every text source.** The action description is
+        what the planner *intended*; the tool parameters are what was actually
+        *submitted*. Unioning them let a correctly-worded step satisfy a requirement by
+        describing the right target while acting on the wrong one:
 
-        When a requirement names identifiers and the evidence does not carry them, the
-        requirement stays outstanding. Ambiguity resolves to "not proven".
+            requirement       Join Telegram channel @examplechannel
+            description       Join Telegram channel @examplechannel   <- intent
+            parameters        {"chat": "@otherchannel"}               <- what happened
+
+        So `proof_text` carries **only** what can prove something happened: the submitted
+        parameters and what the external system returned. The description is never part
+        of it.
+
+        Given that, a requirement closes when:
+
+        * it names identifiers and **all** of them appear in the proof - the identifiers
+          are what distinguish one channel from another, so they decide it; or
+        * it names none, and enough of its ordinary words overlap to be the same thing.
+
+        Anything else stays outstanding. Ambiguity resolves to "not proven".
         """
         outstanding = await self.requirements(task, only_outstanding=True)
         if not outstanding:
             return
 
-        haystack = evidence_text.lower()
+        haystack = proof_text.lower()
         haystack_ids = set(_extract_identifiers(haystack))
-        action_words = set(re.findall(r"[a-z0-9]{4,}", haystack))
+        proof_words = set(re.findall(r"[a-z0-9]{4,}", haystack))
+        proof_quantities = _extract_quantities(haystack)
 
         for requirement in outstanding:
             text = requirement.text.lower()
             terms = set(re.findall(r"[a-z0-9]{4,}", text))
             identifiers = set(_extract_identifiers(text))
+            quantities = _extract_quantities(text)
 
-            # (1) Every named target must be present in the evidence. One miss is enough.
-            if identifiers and not identifiers.issubset(haystack_ids):
-                continue
-
-            # (2) The requirement must be about the same kind of thing. A single shared
-            # word is far too weak; require the overlap to be the bulk of the wording,
-            # or - for a short requirement - every significant word of it.
-            if not terms:
-                continue
-            shared = terms & action_words
-            if not shared:
-                continue
-            if len(shared) * 2 < len(terms) and len(shared) < 3:
-                continue
+            if identifiers or quantities:
+                # The target is the discriminator. Every named handle/address/URL must be
+                # in the proof, and every named amount must actually be met by it. The
+                # surrounding wording is decoration around a concrete requirement.
+                if not identifiers.issubset(haystack_ids):
+                    continue
+                if not _quantities_met(quantities, proof_quantities):
+                    continue
+            else:
+                # No target to match on, so fall back to wording - and demand real
+                # overlap, because a single shared word proves nothing.
+                if not terms:
+                    continue
+                shared = terms & proof_words
+                if not shared or (len(shared) * 2 < len(terms) and len(shared) < 3):
+                    continue
 
             requirement.status = REQUIREMENT_SATISFIED
             requirement.satisfied_by_observation_id = observation.id

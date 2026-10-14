@@ -345,17 +345,50 @@ class TestDiscoveredRequirements:
                 "hold 100 tokens"
             ]
 
-            observation = await service.record_observation(
-                task, action="hold 100 tokens", outcome=OUTCOME_CONFIRMED,
+            # A balance read that reports no amount proves nothing about a threshold,
+            # so it must NOT close it. The proof has to carry the quantity.
+            await service.record_observation(
+                task, action="read the token balance", outcome=OUTCOME_CONFIRMED,
                 tool="get_token_balance", parameters={"symbol": "TKN"},
                 evidence=_evidence("record_read"),
+            )
+            await db.commit()
+            assert [
+                r.text for r in await service.requirements(task, only_outstanding=True)
+            ] == ["hold 100 tokens"], "a reading with no amount proves no threshold"
+
+            # A reading that shows enough does.
+            await service.record_observation(
+                task, action="read the token balance again", outcome=OUTCOME_CONFIRMED,
+                tool="get_token_balance", parameters={"symbol": "TKN"},
+                evidence=_evidence("record_read"),
+                observed_state={"balance": "150 tokens"},
             )
             await db.commit()
 
             assert await service.requirements(task, only_outstanding=True) == []
             refreshed = await db.get(TaskRequirement, requirement.id)
             assert refreshed.status == REQUIREMENT_SATISFIED
-            assert refreshed.satisfied_by_observation_id == observation.id
+            assert refreshed.satisfied_by_observation_id is not None
+
+    async def test_a_shortfall_does_not_meet_a_threshold(self, factory):
+        """Holding 50 does not satisfy "hold 100 tokens"."""
+        task_id = await _new_task(factory, "Not enough tokens")
+        async with factory() as db:
+            task = await db.get(Task, task_id)
+            service = TaskContextService(db)
+            await service.record_requirement(task, "hold 100 tokens")
+            await db.commit()
+            await service.record_observation(
+                task, action="read the token balance", outcome=OUTCOME_CONFIRMED,
+                tool="get_token_balance", parameters={"symbol": "TKN"},
+                evidence=_evidence("record_read"),
+                observed_state={"balance": "50 tokens"},
+            )
+            await db.commit()
+            outstanding = await service.requirements(task, only_outstanding=True)
+
+        assert [r.text for r in outstanding] == ["hold 100 tokens"]
 
     async def test_an_unproven_action_closes_no_requirement(self, factory):
         task_id = await _new_task(factory, "Nothing proven")

@@ -187,6 +187,73 @@ class TestRequirementAndErrorTextIsScreened:
         _assert_clean(str(context.human_intervention), "task_contexts.human_intervention")
 
 
+class TestScreeningIsBoundedAtEveryLevel:
+    """The recursive walker bounded nested containers; the root level did not."""
+
+    @pytest.mark.asyncio
+    async def test_a_huge_flat_dict_is_truncated_at_the_root(self, factory):
+        from backend.app.agent.context import MAX_SCREEN_ITEMS
+
+        task_id = await _task(factory, 'Root bound')
+        async with factory() as db:
+            task = await _row(db, task_id)
+            service = TaskContextService(db)
+            huge = {f'field_{i}': f'value {i}' for i in range(MAX_SCREEN_ITEMS * 3)}
+            await service.record_observation(
+                task, action='read a huge payload', outcome='confirmed',
+                tool='web_fetch', parameters={},
+                evidence={'authoritative': True, 'kind': 'page_observation'},
+                observed_state=huge,
+            )
+            await db.commit()
+            observations = await service.observations(task)
+
+        stored = observations[0].observed_state
+        assert len(stored) <= MAX_SCREEN_ITEMS + 1, (
+            'the root dict must be bounded like every nested container'
+        )
+        assert any('TRUNCATED' in str(v) for v in stored.values())
+
+    @pytest.mark.asyncio
+    async def test_a_secret_in_a_mapping_key_is_redacted(self, factory):
+        """Keys are attacker-influenced text too, and the patterns match labels."""
+        task_id = await _task(factory, 'Key screening')
+        async with factory() as db:
+            task = await _row(db, task_id)
+            service = TaskContextService(db)
+            await service.record_observation(
+                task, action='inspect a payload', outcome='confirmed',
+                tool='web_fetch', parameters={},
+                evidence={'authoritative': True, 'kind': 'page_observation'},
+                observed_state={f'api_key: {API_KEY}': 'harmless', 'normal_field': 'fine'},
+            )
+            await db.commit()
+            observations = await service.observations(task)
+            context = await service.get(task)
+
+        blob = str(observations[0].observed_state) + str(context.external_state)
+        assert 'sk-live-0123456789abcdefghij' not in blob
+        assert 'REDACTED' in blob
+        assert 'normal_field' in blob, 'an ordinary key must be left alone'
+
+    @pytest.mark.asyncio
+    async def test_integration_ref_is_screened(self, factory):
+        """It only carries a browser profile today; screen it regardless."""
+        task_id = await _task(factory, 'Integration ref')
+        async with factory() as db:
+            task = await _row(db, task_id)
+            service = TaskContextService(db)
+            await service.record_observation(
+                task, action='open a browser', outcome='confirmed',
+                tool='browser_navigate', parameters={},
+                evidence={'authoritative': True, 'kind': 'page_observation'},
+                integration_ref=f'browser:{API_KEY}',
+            )
+            await db.commit()
+            observations = await service.observations(task)
+
+        assert 'sk-live-0123456789abcdefghij' not in str(observations[0].integration_ref)
+
 class TestRequirementSatisfactionNeedsMatchingTargets:
     """The weak word-overlap matching can mark the WRONG requirement as satisfied.
 
