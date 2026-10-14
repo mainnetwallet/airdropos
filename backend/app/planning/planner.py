@@ -1077,19 +1077,23 @@ Produce EXACTLY this JSON shape:
 def _json(obj: Any) -> str:
     import json
 
+    # Prompt input: serialised in full. Cutting JSON at a character count would also hand
+    # the model syntactically broken data. Stored copies are bounded by their own callers.
     try:
-        return json.dumps(obj, default=str)[:4000]
+        return json.dumps(obj, default=str)
     except Exception:
-        return str(obj)[:2000]
+        return str(obj)
 
 
-def _section(heading: str, items: Sequence[str], *, limit: int = 20) -> str:
+def _section(heading: str, items: Sequence[str], *, limit: Optional[int] = None) -> str:
     """A titled, bounded block for the replan prompt.
 
     Rendered as literal text rather than JSON so an empty section disappears entirely
     instead of showing an empty array the model may read as "nothing was discovered".
     """
-    kept = [str(item).strip() for item in items if str(item or "").strip()][:limit]
+    kept = [str(item).strip() for item in items if str(item or "").strip()]
+    if limit is not None:
+        kept = kept[:limit]
     if not kept:
         return ""
     lines = "\n".join(f"- {item}" for item in kept)

@@ -135,7 +135,7 @@ export interface AgentInfo {
   base_url: string
   model_id: string
   temperature: number
-  max_tokens: number
+  max_tokens: number | null
   timeout_seconds: number
   max_retries: number
   api_key_configured: boolean

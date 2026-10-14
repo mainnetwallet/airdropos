@@ -45,7 +45,6 @@ logger = logging.getLogger(__name__)
 MAX_TOOL_ROUNDS = 6
 MAX_TOOL_CALLS_PER_TURN = 12
 TURN_TIME_BUDGET_SECONDS = 150.0
-MAX_TOOL_RESULT_CHARS = 6000
 
 # Side effects that may never be taken on a single ambiguous sentence. The model is
 # asked for an approval request instead; the deterministic policy is what enforces it.
@@ -113,16 +112,10 @@ class ChatTurnResult:
         }
 
 
-def _clip(text: str, limit: int = MAX_TOOL_RESULT_CHARS) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n... [truncated, {len(text) - limit} more characters]"
-
-
 def _render_tool_result(record: ToolCallRecord) -> str:
     """What the model sees next: the real result, or the real failure."""
     if record.status == "success":
-        return f"TOOL {record.tool} -> SUCCESS\n{_clip(json.dumps(record.data, default=str))}"
+        return f"TOOL {record.tool} -> SUCCESS\n{json.dumps(record.data, default=str)}"
     if record.status == "needs_user_action":
         return (
             f"TOOL {record.tool} -> NEEDS_USER_ACTION\n"

@@ -5,6 +5,27 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed (no application-imposed LLM token limits or call-count cap)
+- **`LLM_MAX_TOKENS` no longer defaults to 4096.** Unset (blank in `.env`) means no
+  output limit: `max_tokens` is omitted from normal, JSON-mode and streaming requests
+  (never sent as null) and the provider's own limit applies. Setting a value still works.
+  All three request kinds are built by one `FixedLLMClient._build_payload`. The prose
+  extraction call no longer hardcodes `max_tokens=1200`. The health probe keeps
+  `max_tokens=1`, since it is a connectivity ping, not a task request.
+- **Prompt text is no longer cut by character count:** planner JSON context (`_json`,
+  previously cut at 4000 chars, which also produced invalid JSON), replan section items
+  (previously first 20), chat tool results fed back to the model (6000), the tool
+  catalogue descriptions (200/90), the extraction task hint (800/500), untrusted prose
+  passed to extraction (6000) and the self-improvement log context (4000). Injection
+  screening, secret redaction, DB-field bounds, the web-fetch tool's own 12000 default
+  and `ResolvedContext.digest` (now unbounded unless `max_chars` is passed) are unaffected.
+- **`MAX_PROSE_EXTRACTIONS_PER_RUN` defaults to unset (was 6)**, so no default cap on LLM
+  calls for prose extraction; an explicit value (0 disables) is still honoured. Runs stay
+  bounded by `MAX_EXECUTION_LOOP_ITERATIONS`, replan limits, chat-turn round limits,
+  cancellation, timeouts and finite retries.
+- Dashboard shows "No app limit" for an unset output limit.
+- Tests: 25 in `backend/tests/test_llm_limits.py`.
+
 ### Fixed (unsettled results, review of 77d4d1b)
 - **A balance reported by a failed or pending call could still verify a holding.** With
   `{"status": "failed", "balance": "150 tokens"}`, *hold 100 tokens* was satisfied: only

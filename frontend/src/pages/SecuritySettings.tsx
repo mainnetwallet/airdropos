@@ -229,7 +229,7 @@ export default function SecuritySettings() {
               { label: 'API key', value: agent.api_key_masked || '(not configured)', mono: true },
               { label: 'Policy', value: agent.policy },
               { label: 'Temperature', value: String(agent.temperature) },
-              { label: 'Max tokens', value: String(agent.max_tokens) },
+              { label: 'Max tokens', value: agent.max_tokens == null ? 'No app limit' : String(agent.max_tokens) },
               { label: 'Timeout', value: `${agent.timeout_seconds}s` },
               { label: 'Retries', value: String(agent.max_retries) },
             ].map((field) => (

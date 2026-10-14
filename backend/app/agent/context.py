@@ -601,8 +601,8 @@ class ResolvedContext:
     def outstanding_requirements(self) -> List[TaskRequirement]:
         return [r for r in self.requirements if r.status == REQUIREMENT_DISCOVERED]
 
-    def digest(self, *, max_chars: int = 6000) -> str:
-        """A bounded, source-labelled summary for a prompt.
+    def digest(self, *, max_chars: Optional[int] = None) -> str:
+        """A compact, source-labelled summary for a prompt (cut only if `max_chars` is given).
 
         Only what a decision actually needs: what is outstanding, what is proven, what
         the last observation found, and the relevant external references. Never the whole
@@ -659,7 +659,7 @@ class ResolvedContext:
             )
 
         text = "\n".join(parts)
-        return text[:max_chars]
+        return text if max_chars is None else text[:max_chars]
 
 
 class TaskContextService:

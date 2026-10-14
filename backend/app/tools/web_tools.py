@@ -76,13 +76,13 @@ INJECTION_MARKERS = [
 ]
 
 
-def sanitize_external_text(text: str, max_chars: int = 12000) -> Dict[str, Any]:
+def sanitize_external_text(text: str, max_chars: Optional[int] = 12000) -> Dict[str, Any]:
     """Neutralize prompt-injection content in externally fetched text.
 
     We do not attempt to be clever. Suspicious passages are annotated so the
     LLM sees them as hostile data, not as instructions.
     """
-    truncated = text[:max_chars]
+    truncated = text if max_chars is None else text[:max_chars]
     findings: List[str] = []
     sanitized_lines = []
     for line in truncated.splitlines():
@@ -97,7 +97,7 @@ def sanitize_external_text(text: str, max_chars: int = 12000) -> Dict[str, Any]:
         "text": "\n".join(sanitized_lines),
         "injection_markers_found": findings,
         "is_flagged": bool(findings),
-        "truncated": len(text) > max_chars,
+        "truncated": max_chars is not None and len(text) > max_chars,
     }
 
 

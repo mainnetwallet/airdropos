@@ -432,11 +432,11 @@ def _format_catalog(catalog: List[Dict[str, Any]]) -> str:
                 piece += "" if key in required else "?"
                 detail = (spec.get("description") or "").strip().replace("\n", " ")
                 if detail:
-                    piece += f" ({detail[:90]})"
+                    piece += f" ({detail})"
                 args.append(piece)
-            lines.append(f"- {name}({'; '.join(args)}): {description[:200]}")
+            lines.append(f"- {name}({'; '.join(args)}): {description}")
         else:
-            lines.append(f"- {name}(): {description[:200]}")
+            lines.append(f"- {name}(): {description}")
     return "\n".join(lines)
 
 

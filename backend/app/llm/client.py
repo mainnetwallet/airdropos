@@ -107,7 +107,9 @@ class FixedLLMClient:
         # Locked at construction. Any attempt to alter it raises LLMPolicyError.
         self._model_id: str = settings.LLM_MODEL_ID
         self._temperature = settings.LLM_TEMPERATURE
-        self._max_tokens = settings.LLM_MAX_TOKENS
+        # None means "no application-imposed output limit": the parameter is then omitted
+        # from every request and the provider's own limit applies.
+        self._max_tokens: Optional[int] = settings.LLM_MAX_TOKENS
         self._timeout = settings.LLM_TIMEOUT_SECONDS
         self._max_retries = settings.LLM_MAX_RETRIES
 
@@ -128,6 +130,42 @@ class FixedLLMClient:
                 "Model switching is forbidden. AirdropOS uses exactly one fixed model. "
                 f"Requested '{requested_model}' but the locked model is '{self._model_id}'."
             )
+
+    def _output_limit(self, override: Optional[int] = None) -> Optional[int]:
+        """The output-token limit for one request, or None when none is configured."""
+        return self._max_tokens if override is None else override
+
+    def _build_payload(
+        self,
+        messages: List[Message],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        json_mode: bool = False,
+        stop: Optional[List[str]] = None,
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        """The one place a chat-completion request body is assembled.
+
+        Normal, JSON-mode and streaming requests all go through here so they cannot
+        drift apart. ``max_tokens`` is included only when a limit was explicitly
+        configured (or passed by the caller); it is never sent as null.
+        """
+        payload: Dict[str, Any] = {
+            "model": self._model_id,
+            "messages": [m.to_payload() for m in messages],
+            "temperature": self._temperature if temperature is None else temperature,
+        }
+        limit = self._output_limit(max_tokens)
+        if limit is not None:
+            payload["max_tokens"] = limit
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if stop:
+            payload["stop"] = stop
+        if stream:
+            payload["stream"] = True
+        return payload
 
     def describe(self) -> Dict[str, Any]:
         """Safe descriptor for the dashboard. Never exposes the API key."""
@@ -164,16 +202,13 @@ class FixedLLMClient:
         stop: Optional[List[str]] = None,
     ) -> LLMResponse:
         """Execute a chat completion against the single fixed model."""
-        payload: Dict[str, Any] = {
-            "model": self._model_id,
-            "messages": [m.to_payload() for m in messages],
-            "temperature": self._temperature if temperature is None else temperature,
-            "max_tokens": self._max_tokens if max_tokens is None else max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if stop:
-            payload["stop"] = stop
+        payload = self._build_payload(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            stop=stop,
+        )
 
         raw = await self._post("/chat/completions", payload)
 
@@ -274,16 +309,15 @@ class FixedLLMClient:
         )
 
     async def stream(
-        self, messages: List[Message], temperature: Optional[float] = None
+        self,
+        messages: List[Message],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
         """Stream tokens from the single fixed model for chat UIs."""
-        payload = {
-            "model": self._model_id,
-            "messages": [m.to_payload() for m in messages],
-            "temperature": self._temperature if temperature is None else temperature,
-            "max_tokens": self._max_tokens,
-            "stream": True,
-        }
+        payload = self._build_payload(
+            messages, temperature=temperature, max_tokens=max_tokens, stream=True
+        )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

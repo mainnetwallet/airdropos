@@ -473,7 +473,8 @@ class TestDiscoveryDrivenReplanning:
         async with factory() as db:
             controller_budget = settings.MAX_DISCOVERY_REPLANS_PER_RUN
         assert 0 <= controller_budget <= 12
-        assert settings.MAX_PROSE_EXTRACTIONS_PER_RUN >= 0
+        # No default LLM-call cap on prose extraction; an operator may still set one.
+        assert settings.MAX_PROSE_EXTRACTIONS_PER_RUN is None or settings.MAX_PROSE_EXTRACTIONS_PER_RUN >= 0
 
     @pytest.mark.asyncio
     async def test_discoveries_do_not_consume_the_recovery_replan_budget(self, factory):

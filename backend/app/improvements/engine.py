@@ -77,7 +77,7 @@ class SelfImprovementEngine:
 {problem}
 
 Relevant log context (non-sensitive):
-{logs_summary[:4000] or "(none provided)"}
+{logs_summary or "(none provided)"}
 
 Additional context:
 {context or {}}

@@ -1011,7 +1011,7 @@ class AgentController:
         extracted = await extract_from_result(
             tool_result.data or {},
             budget=self.discovery_budget,
-            context_hint=f"{task.title or ''} {step.description}"[:500],
+            context_hint=f"{task.title or ''} {step.description}",
         )
 
         observation = await self.context.record_observation(

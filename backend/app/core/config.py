@@ -115,7 +115,15 @@ class Settings(BaseSettings):
         description="The SINGLE authoritative model ID used for all AI operations",
     )
     LLM_TEMPERATURE: float = Field(default=0.2)
-    LLM_MAX_TOKENS: int = Field(default=4096)
+    LLM_MAX_TOKENS: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional OUTPUT-token limit. Unset (the default) means AirdropOS imposes no "
+            "limit and omits max_tokens from every request, leaving the provider's own "
+            "limit in force. Set it only if your provider requires one."
+        ),
+    )
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
     LLM_MAX_RETRIES: int = Field(default=3)
 
@@ -181,14 +189,14 @@ class Settings(BaseSettings):
             "that a legitimate workflow is not rejected outright."
         ),
     )
-    MAX_PROSE_EXTRACTIONS_PER_RUN: int = Field(
-        default=6,
+    MAX_PROSE_EXTRACTIONS_PER_RUN: Optional[int] = Field(
+        default=None,
         ge=0,
-        le=40,
         description=(
-            "How many times one task run may ask the model to summarise requirements out "
-            "of untrusted external prose (bot messages, page text). Each use is an LLM "
-            "call on the single fixed model, so it is bounded per run. Zero disables "
+            "Optional operator-set ceiling on how many times one task run may ask the "
+            "model to summarise requirements out of untrusted external prose. Unset (the "
+            "default) means no application-imposed LLM-call cap; runs stay bounded by "
+            "MAX_EXECUTION_LOOP_ITERATIONS, cancellation and timeouts. Zero disables "
             "prose extraction entirely; structured requirements are still read."
         ),
     )
@@ -415,6 +423,25 @@ class Settings(BaseSettings):
     MONITORING_INTERVAL_MINUTES: int = 15
     CLAIM_CHECK_INTERVAL_MINUTES: int = 30
     DAILY_REPORT_HOUR_UTC: int = 8
+
+    @field_validator("MAX_PROSE_EXTRACTIONS_PER_RUN", mode="before")
+    @classmethod
+    def _blank_prose_cap_means_unset(cls, value: Any) -> Any:
+        if isinstance(value, str) and value.strip().lower() in ("", "none", "null"):
+            return None
+        return value
+
+    @field_validator("LLM_MAX_TOKENS", mode="before")
+    @classmethod
+    def _blank_llm_max_tokens_means_unset(cls, value: Any) -> Any:
+        """`LLM_MAX_TOKENS=` (blank) or 0 means no limit, not a parse error."""
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip().lower() in ("", "0", "none", "null"):
+            return None
+        if value == 0:
+            return None
+        return value
 
     @field_validator("ENVIRONMENT")
     @classmethod
