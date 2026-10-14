@@ -1116,19 +1116,18 @@ class TaskContextService:
             .limit(1)
         )
 
-    async def observations(self, task: Task, *, limit: int = 200) -> List[ObservationRecord]:
-        rows = list(
-            (
-                await self.db.execute(
-                    select(TaskObservation)
-                    .where(TaskObservation.task_id == task.id)
-                    .order_by(TaskObservation.id.desc())
-                    .limit(limit)
-                )
-            )
-            .scalars()
-            .all()
+    async def observations(
+        self, task: Task, *, limit: Optional[int] = 200
+    ) -> List[ObservationRecord]:
+        """Most recent observations, oldest first. `limit=None` returns the whole history."""
+        stmt = (
+            select(TaskObservation)
+            .where(TaskObservation.task_id == task.id)
+            .order_by(TaskObservation.id.desc())
         )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        rows = list((await self.db.execute(stmt)).scalars().all())
         rows.reverse()
         return [
             ObservationRecord(

@@ -181,7 +181,7 @@ class WebFetchTool(BaseTool):
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "Absolute http(s) URL", "maxLength": 2048},
-            "max_chars": {"type": "integer", "description": "Truncation limit", "minimum": 500, "maximum": 50000},
+            "max_chars": {"type": "integer", "description": "Optional truncation limit. Omit to return the full page text.", "minimum": 500},
         },
         "required": ["url"],
     }
@@ -198,7 +198,7 @@ class WebFetchTool(BaseTool):
 
         html = html or ""
         text = _html_to_text(html)
-        sanitized = sanitize_external_text(text, params.get("max_chars", 12000))
+        sanitized = sanitize_external_text(text, params.get("max_chars"))
 
         return ToolResult.success(
             data={

@@ -181,7 +181,7 @@ def extract_structured(data: Dict[str, Any]) -> ExtractedState:
         for item in items:
             text = item.get("text") if isinstance(item, dict) else item
             if isinstance(text, str) and text.strip():
-                state.requirements.append(text.strip()[:500])
+                state.requirements.append(text.strip()[:1000])  # TaskRequirement.text is String(1000)
 
     # Buttons are stated requirements too: an available "Join Group" button means the
     # join is outstanding, and recording it is what lets a later replan act on it.
@@ -237,6 +237,11 @@ def _iter_buttons(data: Dict[str, Any]) -> List[Dict[str, Any]]:
 # ======================================================================
 # Layer 2: bounded extraction from prose
 # ======================================================================
+# Recursion-safety guard only for the prose walk (the structured scans keep SCAN_DEPTH).
+# Far deeper than any real tool result, far below Python's recursion limit.
+PROSE_SCAN_DEPTH = 100
+
+
 def collect_prose(data: Dict[str, Any], *, limit: Optional[int] = None) -> str:
     """Gather the readable text a tool returned, sanitised as untrusted content.
 
@@ -246,7 +251,7 @@ def collect_prose(data: Dict[str, Any], *, limit: Optional[int] = None) -> str:
     parts: List[str] = []
 
     def walk(node: Any, depth: int = 0) -> None:
-        if depth > SCAN_DEPTH:
+        if depth > PROSE_SCAN_DEPTH:
             return
         if isinstance(node, str):
             if len(node.strip()) >= 12:
@@ -256,7 +261,7 @@ def collect_prose(data: Dict[str, Any], *, limit: Optional[int] = None) -> str:
                 if key in node:
                     walk(node[key], depth + 1)
         elif isinstance(node, list):
-            for value in node[:40]:
+            for value in node:
                 walk(value, depth + 1)
 
     walk(data)

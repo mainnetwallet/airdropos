@@ -24,7 +24,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
   bounded by `MAX_EXECUTION_LOOP_ITERATIONS`, replan limits, chat-turn round limits,
   cancellation, timeouts and finite retries.
 - Dashboard shows "No app limit" for an unset output limit.
-- Tests: 25 in `backend/tests/test_llm_limits.py`.
+- Follow-up audit: `web_fetch` returns the full page text unless the caller passes
+  `max_chars` (the 12000 default and the 50000 schema maximum are gone; injection
+  screening still runs over everything). `collect_prose` reads every list item and nests
+  to 100 levels (recursion guard only). Plan-step fields parsed from model output
+  (`description`, `prerequisites`, `verification_method`, `expected_evidence`) are no longer
+  cut: they are stored in JSONB. Structured requirements keep up to 1000 chars (the
+  `TaskRequirement.text` column width). The "already proven" list handed to replanning
+  now reads the whole observation history, not just the latest 200, so an older proof
+  cannot drop out and be repeated. Retained: DB-column bounds, `llm_reasoning[:4000]`
+  (a diagnostic copy), `ResolvedContext.digest` recency selection (unused by prompts),
+  button/unmet-requirement scans stored in bounded observation JSON.
+- Tests: 30 in `backend/tests/test_llm_limits.py`.
 
 ### Fixed (unsettled results, review of 77d4d1b)
 - **A balance reported by a failed or pending call could still verify a holding.** With

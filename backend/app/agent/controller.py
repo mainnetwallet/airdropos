@@ -1101,7 +1101,7 @@ class AgentController:
 
         confirmed = [
             {"action": o.action, "outcome": o.outcome}
-            for o in await self.context.observations(task, limit=200)
+            for o in await self.context.observations(task, limit=None)
             if o.proved_completion
         ]
 
@@ -1185,7 +1185,7 @@ class AgentController:
         """
         outstanding = await self.context.requirements(task, only_outstanding=True)
         proven = [
-            o for o in await self.context.observations(task, limit=200) if o.proved_completion
+            o for o in await self.context.observations(task, limit=None) if o.proved_completion
         ]
         parts = [
             f"Step {step.index} of {len(plan.steps)} ({step.kind.value}) is the earliest "
