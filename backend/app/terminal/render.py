@@ -242,6 +242,19 @@ def _middle_pref(state: RuntimeState, width: int) -> int:
 # ----------------------------------------------------------------------
 # Header
 # ----------------------------------------------------------------------
+def _rule(width: int) -> Text:
+    """A gradient rule that occupies exactly one terminal row.
+
+    ``theme.gradient_rule(width)`` emits exactly ``width`` cells. In a console that is
+    exactly ``width`` wide, rich folds that onto a second row - it breaks after
+    ``width - 1`` cells and leaves the final cell on a line of its own. The layout
+    budget counts a rule as one row, so a rule built at the full width silently cost
+    two, and the dashboard came out two rows taller than the window and scrolled on
+    every redraw. One cell short of the width is the longest rule that stays on one row.
+    """
+    return Text.from_markup(theme.gradient_rule(max(1, int(width) - 1)))
+
+
 def _header_block(state: RuntimeState, width: int, height: int) -> Tuple[RenderableType, int]:
     if height >= 26 and width >= 70:
         return _header(state, width), 4
@@ -294,7 +307,7 @@ def _header(state: RuntimeState, width: int) -> RenderableType:
     columns.add_column(width=facts_w, no_wrap=True)
     columns.add_row(mark, Align.right(facts))
 
-    return Group(columns, Text.from_markup(theme.gradient_rule(width)))
+    return Group(columns, _rule(width))
 
 
 def _mini_header(state: RuntimeState, width: int) -> RenderableType:
@@ -885,20 +898,28 @@ def _bottom_row(state: RuntimeState, width: int, height: int, top: int = 0) -> R
         subtitle=alr_text,
     )
     border_row = top + height - 1
+    # A renderable exactly `width` cells wide is NOT drawn `width` cells wide: rich
+    # breaks after `width - 1` and leaves the final cell on a line of its own (the same
+    # behaviour that made a full-width rule cost two rows). A panel row laid out to the
+    # full width therefore comes out one cell narrower than its own geometry says, and
+    # any click target derived from that geometry lands one cell to the right of the
+    # drawn button. Laying the row out in the width rich actually draws keeps the
+    # border, the subtitle and the recorded target in agreement.
+    drawable = max(1, width - 1)
     if width < 90:
         # Not enough width for both: show whichever matters right now.
         if state.alerts:
-            _register_buttons(state, alr_spots, x0=0, panel_w=width, y=border_row, text=alr_text)
+            _register_buttons(state, alr_spots, x0=0, panel_w=drawable, y=border_row, text=alr_text)
             return alerts
-        _register_buttons(state, act_spots, x0=0, panel_w=width, y=border_row, text=act_text)
+        _register_buttons(state, act_spots, x0=0, panel_w=drawable, y=border_row, text=act_text)
         return activity
     columns = Table.grid(expand=True, padding=0)
     if width >= MEDIUM:
-        left_w = width - _side_width(width)
+        left_w = drawable - _side_width(width)
         columns.add_column(width=left_w, no_wrap=True)
         columns.add_column(ratio=1)
         _register_buttons(state, act_spots, x0=0, panel_w=left_w, y=border_row, text=act_text)
-        _register_buttons(state, alr_spots, x0=left_w, panel_w=width - left_w, y=border_row, text=alr_text)
+        _register_buttons(state, alr_spots, x0=left_w, panel_w=drawable - left_w, y=border_row, text=alr_text)
     else:
         # Ratio columns: the split is Rich's to decide, so no click targets here.
         columns.add_column(ratio=2)
@@ -982,7 +1003,7 @@ def _alerts(state: RuntimeState, rows: int) -> RenderableType:
 def _footer_block(state: RuntimeState, width: int, height: int) -> Tuple[RenderableType, int]:
     line = _footer_line(state, width)
     if height >= 30:
-        return Group(Text.from_markup(theme.gradient_rule(width)), line), 2
+        return Group(_rule(width), line), 2
     return line, 1
 
 

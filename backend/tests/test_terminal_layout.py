@@ -14,7 +14,7 @@ import time
 import pytest
 from rich.console import Console
 
-from backend.app.terminal import render
+from backend.app.terminal import render, theme
 from backend.app.terminal.catalog import ToolCategory, ToolInventory
 from backend.app.terminal.state import (
     RUNNING,
@@ -144,6 +144,47 @@ def test_subtitle_keeps_its_word_gaps_when_the_header_is_narrow():
 def test_tiny_terminal_still_renders_without_error():
     lines = render_lines(make_state(), 30, 6)
     assert len(lines) == 6
+
+
+# ----------------------------------------------------------------------
+# A renderable exactly as wide as the console is drawn one cell narrower
+# ----------------------------------------------------------------------
+# Rich breaks a line after `width - 1` cells and leaves the final cell on a line of
+# its own. Anything sized to the full width therefore costs two rows instead of one,
+# and anything whose geometry is computed from that width comes out one cell short.
+# The dashboard draws at `width - 1`; these tests pin that, because the two bugs they
+# catch were both invisible from the layout tests alone: the dashboard rendered two
+# rows too tall, and every recorded click target sat one cell right of its button.
+
+
+def test_a_rule_at_the_full_width_would_wrap_onto_a_second_row():
+    """The rule is the reason the frame used to be two rows too tall."""
+    from rich.text import Text
+
+    def rows(rule, width):
+        console = Console(
+            width=width, height=10, file=io.StringIO(), force_terminal=True,
+            color_system=None, highlight=False, soft_wrap=False,
+        )
+        with console.capture() as capture:
+            console.print(rule, end="")
+        text = capture.get()
+        return len((text[:-1] if text.endswith("\n") else text).split("\n"))
+
+    for width in (200, 160, 120, 96, 80, 60):
+        full = Text.from_markup(theme.gradient_rule(width))
+        assert rows(full, width) == 2, f"{width}: a full-width rule should wrap"
+        # What the dashboard actually uses:
+        assert rows(render._rule(width), width) == 1, f"{width}: the rule must be one row"
+
+
+@pytest.mark.parametrize("width,height", [(200, 60), (160, 38), (96, 26), (60, 30)])
+def test_every_row_is_the_same_width_so_the_borders_line_up(width, height):
+    """Ragged row widths are how a squeezed panel tears its own border apart."""
+    lines = render_lines(make_state(), width, height)
+    assert len({len(line) for line in lines}) == 1, (
+        f"{width}x{height}: rows have widths {sorted({len(line) for line in lines})}"
+    )
 
 
 def test_unloaded_inventory_does_not_crash_at_any_size():
