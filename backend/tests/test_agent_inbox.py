@@ -10,10 +10,7 @@ These lock down the behaviour the feature exists for:
 * an intentionally stopped task is not restarted by an informational reply.
 
 External services are replaced with deterministic doubles. Nothing here contacts Telegram, a
-chain, a browser or an LLM. The reply interpreter is replaced by a scripted double by default
-(see `interpreter` below): these tests are about verification, resumption and isolation, so the
-model's reading of a reply is held fixed. Reply interpretation itself is covered in
-`test_inbox_reply_interpretation.py`.
+chain, a browser or an LLM.
 """
 
 from __future__ import annotations
@@ -31,13 +28,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from backend.app.database.session import get_db
-from backend.app.inbox import replies as replies_module
 from backend.app.inbox import verification as verification_module
-from backend.app.inbox.interpretation import (
-    InterpretationResult,
-    ReplyDecision,
-    ReplyInterpretation,
-)
 from backend.app.inbox.replies import ReplyRouter
 from backend.app.inbox.service import (
     OPERATOR_PAUSE,
@@ -175,34 +166,6 @@ async def _park(factory, task_id: str, *, owner: str = OPERATOR_A, **overrides):
         result = await park_for_intervention(db, task, owner_email=owner, **kwargs)
         await db.commit()
         return result
-
-
-class ScriptedInterpreter:
-    """Stands in for the LLM reply interpreter. Records every call it receives."""
-
-    def __init__(self) -> None:
-        self.calls: List[Dict[str, Any]] = []
-        self.result: Any = InterpretationResult.success(
-            ReplyInterpretation(
-                decision=ReplyDecision.BLOCKER_REQUIRES_VERIFICATION,
-                explanation="Scripted default: the operator reports a step they performed.",
-            )
-        )
-
-    async def __call__(self, db, **kwargs):
-        self.calls.append(kwargs)
-        outcome = self.result(kwargs) if callable(self.result) else self.result
-        if isinstance(outcome, Exception):
-            raise outcome
-        return outcome
-
-
-@pytest.fixture(autouse=True)
-def interpreter(monkeypatch):
-    """Hold the model's reading of every reply fixed unless a test scripts it."""
-    scripted = ScriptedInterpreter()
-    monkeypatch.setattr(replies_module, "interpret_reply", scripted)
-    return scripted
 
 
 @pytest.fixture

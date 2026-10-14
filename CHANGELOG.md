@@ -5,32 +5,6 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-### Changed (Agent Inbox: LLM-driven reply interpretation and task resumption)
-- **A reply to a parked task is now read by the fixed LLM.** `app/inbox/interpretation.py`
-  builds a task-scoped, secret-redacted context (objective, status, the open intervention
-  request, the saved checkpoint, recent conversation, operator information already recorded,
-  and the latest reply) and asks the single fixed client for a strict-schema decision:
-  `SUFFICIENT_INFORMATION`, `NEEDS_CLARIFICATION`, `BLOCKER_REQUIRES_VERIFICATION`,
-  `EXPLICIT_APPROVAL_REQUIRED`, `CANCEL_REQUESTED` or `UNRELATED_OR_INSUFFICIENT_REPLY`. No
-  second model, router or fallback is introduced. Unknown keys and values are rejected.
-- **The model proposes; code disposes.** A model verdict never resumes a task by itself: the
-  registered verifier still runs, `_resumable` still enforces the Emergency Stop, retry
-  budget and uncertain side effects, and the compare-and-set transition still prevents two
-  workers. A model can neither approve a sensitive action nor cancel a task; cancellation and
-  explicit authorisation still require the deterministic phrases (English and Bengali).
-- **A claim about an external system is no longer proof.** Previously a long-enough reply
-  could resume a task whose Telegram/browser/login check could not be run. For session,
-  login and challenge blockers an unavailable check now parks the task and asks.
-- **Useful short answers resume the task.** "পলিগন নেটওয়ার্ক" or "the second wallet" supplies
-  the missing information, is saved against the task before it resumes, and reaches the
-  planner on the next run; completed work and the checkpoint are preserved.
-- **Failures are safe.** A model error, timeout, malformed or non-conforming answer leaves the
-  task parked with a useful Inbox message. The operator's message is committed before the
-  model is called. A repeated or simultaneous duplicate client token makes no second model
-  call and no second resume.
-- Tests: `tests/test_inbox_reply_interpretation.py`. `tests/test_agent_inbox.py` now runs with a
-  scripted interpreter by default; its assertions are unchanged.
-
 ### Changed (LLM-driven compaction, planned-from context, no chat history character cap)
 - **Context compaction is now LLM-driven.** `app/llm/compaction.py` asks the configured
   fixed `LLM_MODEL_ID` for a strict-JSON, section-labelled summary of the reduceable

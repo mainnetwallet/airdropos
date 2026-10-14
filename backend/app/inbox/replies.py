@@ -21,22 +21,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox import events
-from backend.app.inbox.interpretation import (
-    InterpretationResult,
-    ReplyDecision,
-    ReplyInterpretation,
-    interpret_reply,
-)
 from backend.app.inbox.service import (
-    BROWSER_SESSION_UNAVAILABLE,
-    HUMAN_VERIFICATION,
-    MISSING_AUTHENTICATION,
     REQUIRES_EXPLICIT_AUTHORIZATION,
-    TELEGRAM_SESSION_UNAVAILABLE,
     ConversationService,
     InterventionService,
     normalise_reply,
@@ -167,22 +156,6 @@ def operator_information(body: str) -> Optional[str]:
     return None
 
 
-# Blockers that are a STATE of an external system (a login, a session, a challenge). The operator
-# saying "I did it" is a claim about that system, never proof. When the system cannot be
-# inspected, such a reply is not enough to resume, whatever the model made of it.
-_STATE_BLOCKERS = frozenset(
-    {
-        TELEGRAM_SESSION_UNAVAILABLE,
-        BROWSER_SESSION_UNAVAILABLE,
-        HUMAN_VERIFICATION,
-        MISSING_AUTHENTICATION,
-    }
-)
-
-# The model may name anything; only this much of its wording is ever shown back to the operator.
-_MAX_SHOWN_QUESTION = 400
-
-
 @dataclass
 class ReplyOutcome:
     """What the API returns for one reply."""
@@ -219,14 +192,11 @@ class ReplyOutcome:
 class ReplyRouter:
     """Handles one user reply against one conversation."""
 
-    def __init__(self, db: AsyncSession, interpreter=None) -> None:
+    def __init__(self, db: AsyncSession) -> None:
         self.db = db
         self.conversations = ConversationService(db)
         self.interventions = InterventionService(db)
         self.tasks = TaskManager(db)
-        # Injectable so tests can substitute a deterministic model. Production uses the one
-        # fixed LLM through `interpret_reply`.
-        self._interpreter = interpreter or interpret_reply
 
     # ------------------------------------------------------------------
     async def handle(
@@ -259,42 +229,14 @@ class ReplyRouter:
         request = await self.interventions.active_for_conversation(conversation.id)
 
         # --- 5. Persist the reply before anything can change the task. -----------
-        task_id_text, conversation_pk, task_status = task.task_id, conversation.id, task.status
-        conversation_id_text = str(conversation_pk)
-        try:
-            # A savepoint, so losing a race on the unique (conversation, token) index undoes
-            # only this insert and leaves the rest of the session usable.
-            async with self.db.begin_nested():
-                message = await self.conversations.append_message(
-                    conversation,
-                    role="user",
-                    content=body,
-                    kind="USER",
-                    intervention_request_id=request.request_id if request is not None else None,
-                    client_token=client_token,
-                )
-        except IntegrityError:
-            if not client_token:
-                raise
-            # The unique (conversation, token) index only fires when this token was already
-            # accepted, so this is a duplicate whether or not the winning row is visible to this
-            # session yet (it is not, until the other request commits). Never a server error,
-            # and never a second model call or a second resume.
-            original = await self.conversations.find_by_client_token(conversation_pk, client_token)
-            logger.info("Concurrent duplicate reply ignored for conversation %s", conversation_id_text)
-            return ReplyOutcome(
-                status="RECORDED",
-                task_id=task_id_text,
-                conversation_id=conversation_id_text,
-                message_id=str(original.id) if original is not None else "",
-                request_id=original.intervention_request_id if original is not None else None,
-                task_status=task_status,
-                resumed=False,
-                detail="This message was already received.",
-            )
-        # Durable BEFORE the model is consulted. Interpretation can take seconds and can fail;
-        # neither may cost the operator their message.
-        await self.db.commit()
+        message = await self.conversations.append_message(
+            conversation,
+            role="user",
+            content=body,
+            kind="USER",
+            intervention_request_id=request.request_id if request is not None else None,
+            client_token=client_token,
+        )
 
         outcome = await self._route(
             conversation=conversation,
@@ -359,124 +301,9 @@ class ReplyRouter:
 
         # --- Operator pause / approval / ambiguity: explicit intent required. ----
         if request.reason_code in REQUIRES_EXPLICIT_AUTHORIZATION:
-            return await self._handle_authorisation(
-                conversation, task, owner_email, body, base, request, message=message
-            )
+            return await self._handle_authorisation(conversation, task, owner_email, body, base, request)
 
-        # --- Everything else: let the fixed LLM read the reply, then dispose in code. --
-        try:
-            interpretation = await self._interpreter(
-                self.db,
-                task=task,
-                conversation=conversation,
-                request=request,
-                reply=body,
-                current_message_id=message.id,
-            )
-        except Exception as exc:  # the saved message and the parked task must survive anything
-            logger.warning("Reply interpreter raised for %s: %s", task.task_id, type(exc).__name__)
-            interpretation = InterpretationResult.failure(
-                "The interpreter failed unexpectedly.", "INTERPRETER_ERROR"
-            )
-
-        # The model call can take seconds. Re-read the task so everything below (the resumable
-        # check, the stored note) works from the current row, not from what it was before.
-        try:
-            await self.db.refresh(task)
-        except Exception as exc:
-            logger.warning("Could not refresh task %s after interpretation: %s", task.task_id, exc)
-
-        if not interpretation.ok:
-            # The message is already saved and the task is untouched. The one thing that can
-            # still proceed without the model is an operator who explicitly said "resume":
-            # that needs no interpretation, and it is still gated by the real verification.
-            if _matches(_AUTHORISE_PATTERNS, normalise_reply(body)):
-                return await self._verify_and_dispose(
-                    conversation, task, owner_email, body, base, request,
-                    clarification=clarification, interpretation=None,
-                )
-            return await self._reply_agent(
-                conversation, task, base,
-                "I could not interpret your reply just now, so I have not changed anything. "
-                f"{interpretation.error or ''}\n\n"
-                f"Your message is saved and task {task.task_id} is still waiting for you "
-                f"(outstanding: {request.problem_summary}).\n"
-                "Please send it again in a moment. If you have already fixed the problem, you "
-                "can also reply with an explicit instruction such as \"resume this task\" and "
-                "I will check the real state first.",
-                status="NEEDS_MORE_INFO",
-                detail=interpretation.category,
-            )
-
-        return await self._verify_and_dispose(
-            conversation, task, owner_email, body, base, request,
-            clarification=clarification, interpretation=interpretation.interpretation,
-        )
-
-    # ------------------------------------------------------------------
-    async def _verify_and_dispose(
-        self,
-        conversation: AgentConversation,
-        task: Task,
-        owner_email: str,
-        body: str,
-        base: Dict[str, Any],
-        request,
-        *,
-        clarification: Optional[str],
-        interpretation: Optional[ReplyInterpretation],
-    ) -> ReplyOutcome:
-        """Turn a model proposal into an action, or into a question. Code decides, not the model.
-
-        `interpretation` is None only on the explicit-instruction path where the model was
-        unavailable; every other caller passes a validated decision.
-        """
-        decision = interpretation.decision if interpretation is not None else None
-
-        # --- The model may suggest these; it can never perform them. ------------
-        if decision == ReplyDecision.CANCEL_REQUESTED:
-            # Cancelling is final for the task. A model reading is not enough: the operator
-            # must say it in words the deterministic matcher accepts (negations included).
-            return await self._reply_agent(
-                conversation, task, base,
-                "It sounds like you may want to cancel this task. I have not cancelled it. "
-                "If you do, reply \"cancel this task\" (or the Bengali equivalent) and I will; "
-                "otherwise tell me what you would like me to do.",
-                status="NEEDS_MORE_INFO",
-            )
-
-        if decision == ReplyDecision.EXPLICIT_APPROVAL_REQUIRED:
-            return await self._reply_agent(
-                conversation, task, base,
-                "That reads as an approval or a decision on a sensitive action. A chat reply is "
-                "not an approval, and I will not treat it as one. Spending, signing, wallet and "
-                "transaction decisions go through the explicit authorisation controls, and the "
-                "task stays parked until then.\n\n"
-                f"Outstanding: {request.problem_summary}",
-                status="NEEDS_MORE_INFO",
-            )
-
-        if decision == ReplyDecision.NEEDS_CLARIFICATION or (
-            decision == ReplyDecision.SUFFICIENT_INFORMATION
-            and not interpretation.extracted_information
-        ):
-            # A "sufficient" verdict with nothing extracted is not information. Treat it as a
-            # request for it rather than resuming on the model's say-so.
-            return await self._reply_agent(
-                conversation, task, base,
-                self._follow_up_text(task, request, interpretation),
-                status="NEEDS_MORE_INFO",
-            )
-
-        # --- Record what the operator actually supplied BEFORE anything can resume. ----
-        information: Optional[str] = None
-        if decision == ReplyDecision.SUFFICIENT_INFORMATION:
-            information = interpretation.clarification_text()
-            if information and not (clarification and clarification.lower() in information.lower()):
-                self._store_clarification(task, f"Operator-provided information: {information}")
-                await self.db.flush()
-
-        # --- Check the real condition where it can be checked. ---------------------
+        # --- Machine-verifiable blocker: check the real condition. --------------
         await events.publish(
             events.EV_VERIFICATION_STARTED,
             task_id=task.task_id,
@@ -492,72 +319,47 @@ class ReplyRouter:
             verified=result.ok,
         )
 
-        if result.ok:
-            return await self._resume(
-                conversation, task, owner_email, base, request, result,
-                clarification=clarification, info_provided=bool(information),
-            )
-
-        # Cannot be checked from here. For information that is genuinely the operator's to
-        # give (a choice, a resource, a URL) they are the source of truth. For the state of
-        # an external system (a login, a session, a challenge) their word is a claim, and a
-        # claim never replaces the check.
-        if not result.checkable and request.reason_code not in _STATE_BLOCKERS:
-            if information or (interpretation is None and operator_information(body)):
-                note = information or operator_information(body)
-                if interpretation is None:
-                    self._store_clarification(task, f"Operator-provided information: {note}")
-                    await self.db.flush()
-                satisfied = VerificationResult.satisfied(
+        # The condition cannot be checked from here (no live session, no automatic verifier).
+        # The operator is then the only source of truth: if they handed over real information,
+        # record it as theirs (never as machine-verified) and let the planner use it on the
+        # worker. A bare "re-check" or a number still gets the specific question below.
+        if not result.ok and not result.checkable:
+            info = operator_information(body)
+            if info is not None:
+                self._store_clarification(task, f"Operator-provided information: {info}")
+                await self.db.flush()
+                result = VerificationResult.satisfied(
                     method="operator_provided_information",
                     outcome="Information supplied by the operator in the Agent Inbox "
                     "(not machine-verified; the plan will be revised to use it).",
-                    information=note,
+                    information=info,
                 )
                 return await self._resume(
-                    conversation, task, owner_email, base, request, satisfied,
-                    clarification=clarification, info_provided=True,
+                    conversation, task, owner_email, base, request, result,
+                    info_provided=True,
                 )
 
-        question = result.question or (
-            "I re-checked and the blocking condition is still in place. "
-            "Could you tell me what you did and what you saw?"
-        )
-        prefix = ""
-        if clarification:
-            prefix = f"I have recorded your instruction to use {clarification} instead.\n\n"
-        elif information:
-            prefix = "I have saved the information you gave me for this task.\n\n"
-        return await self._reply_agent(
-            conversation, task, base,
-            f"{prefix}I checked and this task is still blocked.\n\n"
-            f"Check performed: {result.method}\nResult: {result.outcome}\n\n{question}",
-            status="NEEDS_MORE_INFO",
-            verification=_verification_view(result),
-        )
-
-    @staticmethod
-    def _follow_up_text(task: Task, request, interpretation: Optional[ReplyInterpretation]) -> str:
-        """A specific follow-up question, built from the model's but bounded by code."""
-        from backend.app.llm.compaction import redact_secrets
-
-        question = ""
-        missing: list = []
-        if interpretation is not None:
-            question = " ".join((interpretation.follow_up_question or "").split())
-            missing = list(interpretation.missing_information)
-        question = redact_secrets(question)[:_MAX_SHOWN_QUESTION]
-        if not question:
-            question = (
-                "Could you tell me specifically what the task is missing? "
-                f"Outstanding: {request.problem_summary}"
+        if not result.ok:
+            question = result.question or (
+                "I re-checked and the blocking condition is still in place. "
+                "Could you tell me what you did and what you saw?"
             )
-        lines = [f"Thanks, but that is not enough for me to continue task {task.task_id}."]
-        if missing:
-            lines.append("Still missing: " + "; ".join(redact_secrets(m)[:120] for m in missing[:5]) + ".")
-        lines.append(question)
-        lines.append("The task stays parked until I have it.")
-        return "\n\n".join(lines)
+            noted = (
+                f"I have recorded your instruction to use {clarification} instead.\n\n"
+                if clarification
+                else ""
+            )
+            return await self._reply_agent(
+                conversation, task, base,
+                f"{noted}I checked and this task is still blocked.\n\n"
+                f"Check performed: {result.method}\nResult: {result.outcome}\n\n{question}",
+                status="NEEDS_MORE_INFO",
+                verification=_verification_view(result),
+            )
+
+        return await self._resume(
+            conversation, task, owner_email, base, request, result, clarification=clarification
+        )
 
     # ------------------------------------------------------------------
     async def _cancel(
@@ -628,49 +430,16 @@ class ReplyRouter:
         body: str,
         base: Dict[str, Any],
         request,
-        *,
-        message: Optional[ConversationMessage] = None,
     ) -> ReplyOutcome:
-        """Operator pauses, approvals and ambiguities need an explicit instruction.
-
-        The model is consulted here only to understand and record what the operator said. It has
-        no say in whether the task resumes: an informational reply, however useful, never
-        counts as authorisation.
-        """
+        """Operator pauses, approvals and ambiguities need an explicit instruction."""
         if not _matches(_AUTHORISE_PATTERNS, normalise_reply(body)):
-            saved = ""
-            question = ""
-            try:
-                interpretation = await self._interpreter(
-                    self.db,
-                    task=task,
-                    conversation=conversation,
-                    request=request,
-                    reply=body,
-                    current_message_id=message.id if message is not None else None,
-                )
-            except Exception as exc:  # an interpreter must not break the safe default
-                logger.warning("Interpreter failed on an authorisation reply: %s", type(exc).__name__)
-                interpretation = InterpretationResult.failure("interpreter error", "ERROR")
-            if interpretation.ok and interpretation.interpretation is not None:
-                decided = interpretation.interpretation
-                if (
-                    decided.decision == ReplyDecision.SUFFICIENT_INFORMATION
-                    and decided.extracted_information
-                ):
-                    note = decided.clarification_text()
-                    self._store_clarification(task, f"Operator-provided information: {note}")
-                    await self.db.flush()
-                    saved = "I have saved the information you gave me for this task.\n\n"
-                elif decided.decision == ReplyDecision.NEEDS_CLARIFICATION and decided.follow_up_question:
-                    question = "\n\n" + self._follow_up_text(task, request, decided)
             return await self._reply_agent(
                 conversation, task, base,
-                f"{saved}I will not continue this task on an informational message alone.\n\n"
+                f"I will not continue this task on an informational message alone.\n\n"
                 f"Outstanding: {request.problem_summary}\n"
                 "If you have resolved it, reply with an explicit instruction such as "
                 "\"resume this task\" and I will continue. If you meant to change the task "
-                f"instead, tell me what to change.{question}",
+                "instead, tell me what to change.",
                 status="NEEDS_MORE_INFO",
             )
 
