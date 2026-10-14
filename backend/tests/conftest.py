@@ -90,3 +90,23 @@ async def _isolated_database(monkeypatch):
     )
     yield engine
     await engine.dispose()
+
+@pytest.fixture(autouse=True)
+def _reply_interpretation_never_reaches_a_real_llm(monkeypatch):
+    """A test must never make a real LLM call from the Agent Inbox.
+
+    Reply interpretation talks to the one fixed LLM. Unless a test installs its own double,
+    that call fails immediately and deterministically, which is exactly what the router
+    must survive: the task stays parked. Tests that need a model answer replace
+    `backend.app.inbox.interpretation.llm` themselves.
+    """
+    from backend.app.inbox import interpretation
+    from backend.app.llm.client import LLMError
+
+    class _DisabledLLM:
+        async def complete_json(self, messages, **kwargs):
+            raise LLMError(
+                "The LLM is disabled in tests.", category="TEST_DISABLED", retryable=False
+            )
+
+    monkeypatch.setattr(interpretation, "llm", _DisabledLLM())

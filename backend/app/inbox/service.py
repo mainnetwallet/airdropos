@@ -89,6 +89,17 @@ REQUIRES_EXPLICIT_AUTHORIZATION = frozenset(
     }
 )
 
+# The subset of the above that is a *deliberate human decision*: an operator pause or an
+# approval. No reply that merely supplies information, however well an LLM understands it,
+# can clear one of these -- only the explicit authorisation flow can.
+APPROVAL_GATED = frozenset({OPERATOR_PAUSE, HUMAN_APPROVAL})
+
+# Reasons whose blocker is missing *information* rather than a session, credential or human
+# control. When no automatic check exists, an operator's substantive answer may clear these.
+# Session / authentication / CAPTCHA reasons are deliberately absent: "I logged in" is a claim,
+# not proof, and only a real check may satisfy them.
+INFORMATION_RESOLVABLE = frozenset({AMBIGUOUS_INSTRUCTION, MISSING_CONFIGURATION, UNKNOWN_REASON})
+
 # Substrings in the real failure text that identify each reason. Checked in this order, so the
 # more specific patterns come first.
 _REASON_SIGNATURES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (

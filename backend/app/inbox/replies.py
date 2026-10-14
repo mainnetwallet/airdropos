@@ -5,11 +5,15 @@ The order of operations here is deliberate:
 1. resolve the conversation server-side and prove ownership;
 2. resolve the task *from that conversation*, never from a client-supplied task id;
 3. confirm the intervention request is still open;
-4. persist the reply (idempotently, before anything else happens);
-5. verify the blocking condition for real;
-6. only then requeue the task.
+4. persist the reply (idempotently, and committed, before anything else happens);
+5. have the fixed LLM *interpret* the reply against the task, the blocker and the checkpoint;
+6. validate that proposal with deterministic code and verify the blocking condition for real;
+7. only then requeue the task.
 
-Every branch that does not reach step 6 says why, in the same conversation, and leaves the
+The LLM proposes, this module disposes. A model decision is never authorisation and never
+verification: it cannot clear an operator pause or approval, it cannot cancel a task, and a
+"sufficient information" verdict still has to pass whatever real check exists for the blocker.
+Every branch that does not reach step 7 says why, in the same conversation, and leaves the
 task parked. A reply in one conversation can never move another task.
 """
 
@@ -19,12 +23,23 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox import events
+from backend.app.inbox.interpretation import (
+    InterpretationError,
+    ReplyDecision,
+    ReplyInterpretation,
+    ReplyInterpreter,
+    build_context,
+    contains_secret,
+)
 from backend.app.inbox.service import (
+    APPROVAL_GATED,
+    INFORMATION_RESOLVABLE,
     REQUIRES_EXPLICIT_AUTHORIZATION,
     ConversationService,
     InterventionService,
@@ -126,36 +141,6 @@ def _is_cancellation(text: str) -> bool:
     return _matches(_CANCEL_PATTERNS, text)
 
 
-# Concrete things an operator can hand over that no automatic check can confirm: a wallet or
-# contract address, a link, a code. A reply containing one of these is information, not chatter.
-_INFO_TOKEN = re.compile(
-    r"0x[0-9a-fA-F]{40}\b"          # EVM address
-    r"|https?://\S+"                # link
-    r"|\b[1-9A-HJ-NP-Za-km-z]{32,44}\b"  # base58-style address (Solana etc.)
-)
-# Replies that only ask for another look. They carry no information and must not resume a task.
-_RECHECK_ONLY = re.compile(
-    r"^(?:please\s+)?(?:re-?check|check(?:\s+again)?|try\s+again|retry|ok(?:ay)?|done|yes|hi|hello|\d{1,4})[\s.!?]*$"
-)
-_MIN_WORDS_FOR_INFO = 5
-
-
-def operator_information(body: str) -> Optional[str]:
-    """The operator's reply, if it actually hands the agent something to work with.
-
-    Used only when the blocking condition cannot be checked by machine. There the operator is
-    the only source of truth, so a substantive reply is recorded as their information and fed
-    to the planner. Short acknowledgements and bare re-check requests are not: they would
-    resume a task with nothing new and send it straight back into the same block.
-    """
-    text = " ".join((body or "").split())
-    if not text or _RECHECK_ONLY.match(text.lower()):
-        return None
-    if _INFO_TOKEN.search(text) or len(text.split()) >= _MIN_WORDS_FOR_INFO:
-        return text[:280]
-    return None
-
-
 @dataclass
 class ReplyOutcome:
     """What the API returns for one reply."""
@@ -170,6 +155,7 @@ class ReplyOutcome:
     agent_message_id: Optional[str] = None
     detail: Optional[str] = None
     verification: Optional[Dict[str, Any]] = None
+    interpretation: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload = {
@@ -186,6 +172,8 @@ class ReplyOutcome:
             payload["detail"] = self.detail
         if self.verification:
             payload["verification"] = self.verification
+        if self.interpretation:
+            payload["interpretation"] = self.interpretation
         return payload
 
 
@@ -197,6 +185,9 @@ class ReplyRouter:
         self.conversations = ConversationService(db)
         self.interventions = InterventionService(db)
         self.tasks = TaskManager(db)
+        # The instruction record written for the reply being handled, if any, so a richer
+        # interpreted record can replace it instead of sitting beside it.
+        self._turn_record: Optional[Dict[str, Any]] = None
 
     # ------------------------------------------------------------------
     async def handle(
@@ -211,32 +202,41 @@ class ReplyRouter:
         body = (text or "").strip()
 
         # --- 4. Idempotency: a duplicate submit returns the original result. -----
+        # Checked before anything expensive: a repeated token never reaches the LLM.
         if client_token:
             previous = await self.conversations.find_by_client_token(conversation.id, client_token)
             if previous is not None:
-                logger.info("Duplicate reply ignored for conversation %s", conversation.id)
-                return ReplyOutcome(
-                    status="RECORDED",
-                    task_id=task.task_id,
-                    conversation_id=str(conversation.id),
-                    message_id=str(previous.id),
-                    request_id=previous.intervention_request_id,
-                    task_status=task.status,
-                    resumed=False,
-                    detail="This message was already received.",
-                )
+                return self._duplicate_outcome(conversation, task, previous)
 
         request = await self.interventions.active_for_conversation(conversation.id)
 
         # --- 5. Persist the reply before anything can change the task. -----------
-        message = await self.conversations.append_message(
-            conversation,
-            role="user",
-            content=body,
-            kind="USER",
-            intervention_request_id=request.request_id if request is not None else None,
-            client_token=client_token,
-        )
+        # A savepoint, so two simultaneous submits of the same token lose cleanly to the
+        # unique constraint instead of both going on to call the model.
+        try:
+            async with self.db.begin_nested():
+                message = await self.conversations.append_message(
+                    conversation,
+                    role="user",
+                    content=body,
+                    kind="USER",
+                    intervention_request_id=request.request_id if request is not None else None,
+                    client_token=client_token,
+                )
+        except IntegrityError:
+            # The savepoint rollback expires everything it touched, including `conversation`;
+            # reload it before reading any attribute (async sessions cannot lazy-load).
+            await self.db.refresh(conversation)
+            previous = await self.conversations.find_by_client_token(
+                conversation.id, client_token or ""
+            )
+            if previous is None:
+                raise
+            return self._duplicate_outcome(conversation, task, previous)
+
+        # Committed here, not left to the endpoint: interpretation can take a while and can
+        # fail in ways that raise. The operator's message must survive either.
+        await self.db.commit()
 
         outcome = await self._route(
             conversation=conversation,
@@ -255,6 +255,21 @@ class ReplyRouter:
             summary="Operator replied",
         )
         return outcome
+
+    def _duplicate_outcome(
+        self, conversation: AgentConversation, task: Task, previous: ConversationMessage
+    ) -> ReplyOutcome:
+        logger.info("Duplicate reply ignored for conversation %s", conversation.id)
+        return ReplyOutcome(
+            status="RECORDED",
+            task_id=task.task_id,
+            conversation_id=str(conversation.id),
+            message_id=str(previous.id),
+            request_id=previous.intervention_request_id,
+            task_status=task.status,
+            resumed=False,
+            detail="This message was already received.",
+        )
 
     # ------------------------------------------------------------------
     async def _route(
@@ -278,8 +293,9 @@ class ReplyRouter:
         # fixed. Record it against the task first so it survives whichever branch follows --
         # losing an operator instruction because a request happened to be open would be a bug.
         clarification = self._extract_clarification(body)
+        self._turn_record: Optional[Dict[str, Any]] = None
         if clarification is not None:
-            self._store_clarification(task, clarification)
+            self._turn_record = self._store_clarification(task, clarification)
             await self.db.flush()
 
         # --- A stopped task never resumes, whatever the reply says. -------------
@@ -291,19 +307,228 @@ class ReplyRouter:
                 status="RECORDED",
             )
 
+        normalised = normalise_reply(body)
+
         # --- Explicit cancellation, scoped to this task only. -------------------
-        if _is_cancellation(normalise_reply(body)):
+        # Deterministic on purpose: the model may suggest a cancellation, it may not make one.
+        if _is_cancellation(normalised):
             return await self._cancel(conversation, task, owner_email, base)
 
         # --- A note with no open blocker: record it, change nothing. ------------
         if request is None:
             return await self._record_without_blocker(conversation, task, clarification, base)
 
-        # --- Operator pause / approval / ambiguity: explicit intent required. ----
-        if request.reason_code in REQUIRES_EXPLICIT_AUTHORIZATION:
-            return await self._handle_authorisation(conversation, task, owner_email, body, base, request)
+        explicit = _matches(_AUTHORISE_PATTERNS, normalised)
 
-        # --- Machine-verifiable blocker: check the real condition. --------------
+        # --- An explicit instruction is honoured by the existing deterministic flow. ---
+        # The model is still asked, best effort, so an answer given alongside "resume this
+        # task" ("use the second account, and resume") is not thrown away.
+        if explicit:
+            interpretation = await self._try_interpret(conversation, task, request, body, message)
+            if interpretation is not None and interpretation.kind is not ReplyDecision.CANCEL_REQUESTED:
+                if interpretation.kind is ReplyDecision.SUFFICIENT_INFORMATION:
+                    await self._persist_information(task, interpretation, clarification, message)
+            if request.reason_code in REQUIRES_EXPLICIT_AUTHORIZATION:
+                return await self._handle_authorisation(
+                    conversation, task, owner_email, body, base, request
+                )
+            return await self._verify_then_resume(
+                conversation, task, owner_email, base, request,
+                clarification=clarification,
+                interpretation=interpretation,
+            )
+
+        # --- Everything else is interpreted by the fixed LLM. -------------------
+        interpretation, failure = await self._interpret(conversation, task, request, body, message)
+        if interpretation is None:
+            return await self._park_after_failed_interpretation(
+                conversation, task, base, request, failure
+            )
+
+        return await self._dispose(
+            conversation, task, owner_email, base, request, message,
+            interpretation, clarification,
+        )
+
+    # ------------------------------------------------------------------
+    # Interpretation
+    # ------------------------------------------------------------------
+    async def _interpret(
+        self, conversation, task, request, body: str, message: ConversationMessage
+    ) -> tuple[Optional[ReplyInterpretation], Optional[str]]:
+        """Ask the fixed LLM what the reply achieves. Never raises."""
+        try:
+            context = await build_context(
+                self.db, task=task, request=request, conversation=conversation,
+                reply=body, current_message_id=message.id,
+            )
+            interpretation = await ReplyInterpreter().interpret(context, body)
+        except InterpretationError as exc:
+            logger.warning("Reply on %s was not interpreted: %s", task.task_id, exc.category)
+            return None, exc.category
+        except Exception as exc:  # defensive: interpretation must never take the reply down
+            logger.exception("Unexpected failure interpreting a reply on %s", task.task_id)
+            return None, type(exc).__name__
+        logger.info(
+            "Reply on %s interpreted as %s", task.task_id, interpretation.decision
+        )
+        return interpretation, None
+
+    async def _try_interpret(
+        self, conversation, task, request, body: str, message: ConversationMessage
+    ) -> Optional[ReplyInterpretation]:
+        interpretation, _ = await self._interpret(conversation, task, request, body, message)
+        return interpretation
+
+    async def _persist_information(
+        self,
+        task: Task,
+        interpretation: ReplyInterpretation,
+        clarification: Optional[str],
+        message: ConversationMessage,
+    ) -> None:
+        """Save the operator's answer where the worker's planner will read it.
+
+        This is the same `operator_instructions` list the controller already folds into its
+        next planning cycle, so no new channel into the worker is created. It is written
+        *before* any requeue: a worker that claims the task must already find it.
+        """
+        parts: List[str] = []
+        if clarification:
+            parts.append(f"use {clarification} instead")
+        for item in interpretation.extracted_information:
+            if item.lower() not in " ".join(parts).lower():
+                parts.append(item)
+        text = "Operator answer from the Agent Inbox: " + "; ".join(parts)
+
+        # The regex pass may already have stored this turn's "use X instead"; the richer
+        # record replaces it so one reply is one instruction, not two.
+        records = [r for r in (task.operator_instructions or []) if r is not self._turn_record]
+        records.append(
+            {
+                "instruction": text[:300],
+                "at": datetime.now(timezone.utc).isoformat(),
+                "source": "llm_interpreted_reply",
+                "message_id": str(message.id),
+            }
+        )
+        task.operator_instructions = records
+        self._turn_record = records[-1]
+        await self.db.flush()
+
+    async def _park_after_failed_interpretation(
+        self, conversation, task, base, request, failure: Optional[str]
+    ) -> ReplyOutcome:
+        if failure == "SECRET_IN_REPLY":
+            text = (
+                "Your message looks like it contains a secret (a key, seed phrase or token). "
+                "I did not send it to the language model and I have not acted on it. Please "
+                "never share secrets here; tell me what you need in plain words instead."
+            )
+        else:
+            text = (
+                "I saved your message, but I could not interpret it just now "
+                f"({failure or 'unknown error'}), so I have not changed the task and it stays "
+                "parked.\n\n"
+                f"Outstanding: {request.problem_summary}\n"
+                "Please send your reply again in a moment. If you have already fixed the "
+                "problem, you can also reply with an explicit instruction such as "
+                "\"resume this task\" and I will check it and continue."
+            )
+        return await self._reply_agent(
+            conversation, task, base, text, status="NEEDS_MORE_INFO",
+            detail=f"interpretation_failed:{failure}",
+        )
+
+    # ------------------------------------------------------------------
+    # Disposition of an interpreted reply
+    # ------------------------------------------------------------------
+    async def _dispose(
+        self,
+        conversation: AgentConversation,
+        task: Task,
+        owner_email: str,
+        base: Dict[str, Any],
+        request,
+        message: ConversationMessage,
+        interpretation: ReplyInterpretation,
+        clarification: Optional[str],
+    ) -> ReplyOutcome:
+        decision = interpretation.kind
+        view = interpretation.to_view()
+
+        # A pause or an approval is a human decision. Information never clears one, whatever
+        # the model concluded; the operator must use the explicit authorisation flow.
+        if request.reason_code in APPROVAL_GATED:
+            if decision is ReplyDecision.SUFFICIENT_INFORMATION:
+                await self._persist_information(task, interpretation, clarification, message)
+            if decision is ReplyDecision.CANCEL_REQUESTED:
+                return await self._confirm_cancellation(conversation, task, base, view)
+            saved = (
+                "I have saved the information you gave and will use it when this task runs.\n\n"
+                if decision is ReplyDecision.SUFFICIENT_INFORMATION
+                else ""
+            )
+            return await self._reply_agent(
+                conversation, task, base,
+                f"{saved}I will not continue this task on an informational message alone.\n\n"
+                f"Outstanding: {request.problem_summary}\n"
+                "This needs your explicit authorisation. When you are ready, reply with an "
+                "explicit instruction such as \"resume this task\" (or \"এখন চালাও\"). If you "
+                "meant to change the task instead, tell me what to change.",
+                status="NEEDS_MORE_INFO",
+                interpretation=view,
+            )
+
+        if decision is ReplyDecision.CANCEL_REQUESTED:
+            return await self._confirm_cancellation(conversation, task, base, view)
+
+        if decision is ReplyDecision.EXPLICIT_APPROVAL_REQUIRED:
+            return await self._reply_agent(
+                conversation, task, base,
+                "What you wrote involves an authorisation (a transaction, a spend, a signature "
+                "or lifting a stop). A chat message cannot grant that, so I have not changed "
+                "the task.\n\n"
+                f"Outstanding: {request.problem_summary}\n"
+                "Please approve it through the approval flow, then reply with an explicit "
+                "instruction such as \"resume this task\".",
+                status="NEEDS_MORE_INFO",
+                interpretation=view,
+            )
+
+        if decision in (
+            ReplyDecision.NEEDS_CLARIFICATION,
+            ReplyDecision.UNRELATED_OR_INSUFFICIENT_REPLY,
+        ):
+            return await self._ask_follow_up(conversation, task, base, request, interpretation, view)
+
+        # SUFFICIENT_INFORMATION or BLOCKER_REQUIRES_VERIFICATION: deterministic checks decide.
+        sufficient = decision is ReplyDecision.SUFFICIENT_INFORMATION
+        if sufficient:
+            await self._persist_information(task, interpretation, clarification, message)
+
+        return await self._verify_then_resume(
+            conversation, task, owner_email, base, request,
+            clarification=None if sufficient else clarification,
+            interpretation=interpretation,
+            info_saved=sufficient,
+        )
+
+    async def _verify_then_resume(
+        self,
+        conversation: AgentConversation,
+        task: Task,
+        owner_email: str,
+        base: Dict[str, Any],
+        request,
+        *,
+        clarification: Optional[str],
+        interpretation: Optional[ReplyInterpretation],
+        info_saved: bool = False,
+    ) -> ReplyOutcome:
+        """Run the real check for this blocker; resume only if it allows."""
+        view = interpretation.to_view() if interpretation is not None else None
+
         await events.publish(
             events.EV_VERIFICATION_STARTED,
             task_id=task.task_id,
@@ -319,46 +544,79 @@ class ReplyRouter:
             verified=result.ok,
         )
 
-        # The condition cannot be checked from here (no live session, no automatic verifier).
-        # The operator is then the only source of truth: if they handed over real information,
-        # record it as theirs (never as machine-verified) and let the planner use it on the
-        # worker. A bare "re-check" or a number still gets the specific question below.
-        if not result.ok and not result.checkable:
-            info = operator_information(body)
-            if info is not None:
-                self._store_clarification(task, f"Operator-provided information: {info}")
-                await self.db.flush()
-                result = VerificationResult.satisfied(
-                    method="operator_provided_information",
-                    outcome="Information supplied by the operator in the Agent Inbox "
-                    "(not machine-verified; the plan will be revised to use it).",
-                    information=info,
-                )
-                return await self._resume(
-                    conversation, task, owner_email, base, request, result,
-                    info_provided=True,
-                )
-
-        if not result.ok:
-            question = result.question or (
-                "I re-checked and the blocking condition is still in place. "
-                "Could you tell me what you did and what you saw?"
-            )
-            noted = (
-                f"I have recorded your instruction to use {clarification} instead.\n\n"
-                if clarification
-                else ""
-            )
-            return await self._reply_agent(
-                conversation, task, base,
-                f"{noted}I checked and this task is still blocked.\n\n"
-                f"Check performed: {result.method}\nResult: {result.outcome}\n\n{question}",
-                status="NEEDS_MORE_INFO",
-                verification=_verification_view(result),
+        if result.ok:
+            return await self._resume(
+                conversation, task, owner_email, base, request, result,
+                clarification=clarification, info_provided=info_saved, interpretation=view,
             )
 
-        return await self._resume(
-            conversation, task, owner_email, base, request, result, clarification=clarification
+        # No machine check exists for this blocker. For a blocker that is *missing
+        # information*, the operator's answer is the only source of truth: it is recorded as
+        # theirs (never as machine-verified) and the planner is told to use it. A session,
+        # credential or CAPTCHA blocker never takes this route: "I logged in" is a claim.
+        if (
+            not result.checkable
+            and info_saved
+            and request.reason_code in INFORMATION_RESOLVABLE
+        ):
+            accepted = VerificationResult.satisfied(
+                method="operator_provided_information",
+                outcome="Information supplied by the operator in the Agent Inbox "
+                "(not machine-verified; the plan will be revised to use it).",
+            )
+            return await self._resume(
+                conversation, task, owner_email, base, request, accepted,
+                info_provided=True, interpretation=view,
+            )
+
+        question = result.question or (
+            "I re-checked and the blocking condition is still in place. "
+            "Could you tell me what you did and what you saw?"
+        )
+        noted = ""
+        if info_saved:
+            noted = "I have saved the information you gave and will use it once the task can run.\n\n"
+        elif clarification:
+            noted = f"I have recorded your instruction to use {clarification} instead.\n\n"
+        return await self._reply_agent(
+            conversation, task, base,
+            f"{noted}I checked and this task is still blocked.\n\n"
+            f"Check performed: {result.method}\nResult: {result.outcome}\n\n{question}",
+            status="NEEDS_MORE_INFO",
+            verification=_verification_view(result),
+            interpretation=view,
+        )
+
+    async def _ask_follow_up(
+        self, conversation, task, base, request, interpretation: ReplyInterpretation, view
+    ) -> ReplyOutcome:
+        """Ask for exactly what is missing and leave the task parked."""
+        questions = interpretation.missing_information
+        if questions:
+            ask = "To continue I still need:\n" + "\n".join(f"- {q}" for q in questions)
+        else:
+            ask = (
+                "I could not tell how that answers what the task is waiting for. "
+                f"Could you tell me specifically how to resolve: {request.problem_summary}"
+            )
+        return await self._reply_agent(
+            conversation, task, base,
+            f"Thanks. {interpretation.explanation}\n\n{ask}\n\n"
+            "The task is still parked; I have not changed it.",
+            status="NEEDS_MORE_INFO",
+            interpretation=view,
+        )
+
+    async def _confirm_cancellation(self, conversation, task, base, view) -> ReplyOutcome:
+        """The model may suggest cancelling; only the operator's explicit words cancel."""
+        return await self._reply_agent(
+            conversation, task, base,
+            "It sounds like you want to stop this task. Cancelling cannot be undone, so I "
+            "have not done it.\n\n"
+            "If you do want it cancelled, reply \"cancel this task\" (or \"টাস্কটি বাতিল করো\"). "
+            "Otherwise tell me how you want to proceed.",
+            status="NEEDS_MORE_INFO",
+            interpretation=view,
         )
 
     # ------------------------------------------------------------------
@@ -464,22 +722,22 @@ class ReplyRouter:
         *,
         clarification: Optional[str] = None,
         info_provided: bool = False,
+        interpretation: Optional[Dict[str, Any]] = None,
     ) -> ReplyOutcome:
         """Requeue the SAME task from its last safe state. Never from scratch."""
         eligible, why = await self._resumable(task)
         if not eligible:
-            await self.interventions.mark_resolved(
-                request,
-                resolved_by=owner_email,
-                outcome=f"Condition verified but the task was not resumed: {why}",
-                verification_method=result.method,
-            )
+            # The request stays OPEN. Closing it here (as this branch used to) left the task
+            # parked with nothing to reply to, so once the cause was cleared -- an engaged
+            # Emergency Stop being lifted, say -- the operator had no way to resume it.
             return await self._reply_agent(
                 conversation, task, base,
-                f"I verified the condition, but I cannot safely resume this task: {why}",
+                f"I cannot safely resume this task yet: {why}. Nothing was changed and your request "
+                "is still open; reply again once that is sorted out.",
                 status="NEEDS_MORE_INFO",
                 detail=why,
                 verification=_verification_view(result),
+                interpretation=interpretation,
             )
 
         try:
@@ -500,6 +758,7 @@ class ReplyRouter:
                 f"The condition is verified but requeueing failed: {exc}",
                 status="NEEDS_MORE_INFO",
                 verification=_verification_view(result),
+                interpretation=interpretation,
             )
 
         if not moved:
@@ -537,12 +796,13 @@ class ReplyRouter:
             if clarification
             else ""
         )
+        verified = result.method != "operator_provided_information"
         if info_provided:
             noted = (
                 "Thanks, I have saved the information you sent and will use it when I revise "
                 "the plan on the next run.\n\n"
             )
-        label = "Recorded" if info_provided else "Verified"
+        label = "Verified" if verified else "Recorded"
         return await self._reply_agent(
             conversation, task, base,
             f"{noted}{label}: {result.outcome}\n\n"
@@ -552,6 +812,7 @@ class ReplyRouter:
             status="RESUMED",
             resumed=True,
             verification=_verification_view(result),
+            interpretation=interpretation,
         )
 
     async def _resumable(self, task: Task) -> tuple[bool, str]:
@@ -614,6 +875,7 @@ class ReplyRouter:
         resumed: bool = False,
         detail: Optional[str] = None,
         verification: Optional[Dict[str, Any]] = None,
+        interpretation: Optional[Dict[str, Any]] = None,
     ) -> ReplyOutcome:
         message = await self.conversations.append_message(
             conversation, role="assistant", content=content, kind="AGENT",
@@ -636,6 +898,7 @@ class ReplyRouter:
             agent_message_id=str(message.id),
             detail=detail,
             verification=verification,
+            interpretation=interpretation,
         )
 
     # ------------------------------------------------------------------

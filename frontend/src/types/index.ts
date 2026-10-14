@@ -502,6 +502,20 @@ export interface InboxReplyResult {
     outcome: string
     detail: Record<string, unknown>
   }
+  /** How the language model read the reply. It proposes only; the backend decides. */
+  interpretation?: {
+    decision:
+      | 'SUFFICIENT_INFORMATION'
+      | 'NEEDS_CLARIFICATION'
+      | 'BLOCKER_REQUIRES_VERIFICATION'
+      | 'EXPLICIT_APPROVAL_REQUIRED'
+      | 'CANCEL_REQUESTED'
+      | 'UNRELATED_OR_INSUFFICIENT_REPLY'
+    explanation: string
+    extracted_information: string[]
+    missing_information: string[]
+    recommended_next_step: string
+  }
 }
 
 export interface WorkerLogLine {

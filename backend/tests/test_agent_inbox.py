@@ -54,6 +54,7 @@ from backend.app.models import (
 from backend.app.security.auth import Scope, generate_token, hash_password, hash_token
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
+from backend.tests.fake_llm import FakeInterpretationLLM, decision
 
 OPERATOR_A = "operator-a@test.local"
 OPERATOR_B = "operator-b@test.local"
@@ -166,6 +167,21 @@ async def _park(factory, task_id: str, *, owner: str = OPERATOR_A, **overrides):
         result = await park_for_intervention(db, task, owner_email=owner, **kwargs)
         await db.commit()
         return result
+
+
+@pytest.fixture(autouse=True)
+def _reply_llm_reports_a_claimed_fix(monkeypatch):
+    """The model these tests assume: it reads an ordinary reply as "I fixed the blocker".
+
+    Reply interpretation now goes through the fixed LLM, so a working one is part of the
+    harness. This double always answers BLOCKER_REQUIRES_VERIFICATION, which is a *claim*:
+    whether the task resumes is still decided entirely by the verifier each test installs.
+    """
+    from backend.app.inbox import interpretation
+
+    fake = FakeInterpretationLLM(decision("BLOCKER_REQUIRES_VERIFICATION"))
+    monkeypatch.setattr(interpretation, "llm", fake)
+    return fake
 
 
 @pytest.fixture
