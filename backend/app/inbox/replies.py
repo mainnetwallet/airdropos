@@ -126,6 +126,36 @@ def _is_cancellation(text: str) -> bool:
     return _matches(_CANCEL_PATTERNS, text)
 
 
+# Concrete things an operator can hand over that no automatic check can confirm: a wallet or
+# contract address, a link, a code. A reply containing one of these is information, not chatter.
+_INFO_TOKEN = re.compile(
+    r"0x[0-9a-fA-F]{40}\b"          # EVM address
+    r"|https?://\S+"                # link
+    r"|\b[1-9A-HJ-NP-Za-km-z]{32,44}\b"  # base58-style address (Solana etc.)
+)
+# Replies that only ask for another look. They carry no information and must not resume a task.
+_RECHECK_ONLY = re.compile(
+    r"^(?:please\s+)?(?:re-?check|check(?:\s+again)?|try\s+again|retry|ok(?:ay)?|done|yes|hi|hello|\d{1,4})[\s.!?]*$"
+)
+_MIN_WORDS_FOR_INFO = 5
+
+
+def operator_information(body: str) -> Optional[str]:
+    """The operator's reply, if it actually hands the agent something to work with.
+
+    Used only when the blocking condition cannot be checked by machine. There the operator is
+    the only source of truth, so a substantive reply is recorded as their information and fed
+    to the planner. Short acknowledgements and bare re-check requests are not: they would
+    resume a task with nothing new and send it straight back into the same block.
+    """
+    text = " ".join((body or "").split())
+    if not text or _RECHECK_ONLY.match(text.lower()):
+        return None
+    if _INFO_TOKEN.search(text) or len(text.split()) >= _MIN_WORDS_FOR_INFO:
+        return text[:280]
+    return None
+
+
 @dataclass
 class ReplyOutcome:
     """What the API returns for one reply."""
@@ -289,6 +319,26 @@ class ReplyRouter:
             verified=result.ok,
         )
 
+        # The condition cannot be checked from here (no live session, no automatic verifier).
+        # The operator is then the only source of truth: if they handed over real information,
+        # record it as theirs (never as machine-verified) and let the planner use it on the
+        # worker. A bare "re-check" or a number still gets the specific question below.
+        if not result.ok and not result.checkable:
+            info = operator_information(body)
+            if info is not None:
+                self._store_clarification(task, f"Operator-provided information: {info}")
+                await self.db.flush()
+                result = VerificationResult.satisfied(
+                    method="operator_provided_information",
+                    outcome="Information supplied by the operator in the Agent Inbox "
+                    "(not machine-verified; the plan will be revised to use it).",
+                    information=info,
+                )
+                return await self._resume(
+                    conversation, task, owner_email, base, request, result,
+                    info_provided=True,
+                )
+
         if not result.ok:
             question = result.question or (
                 "I re-checked and the blocking condition is still in place. "
@@ -413,6 +463,7 @@ class ReplyRouter:
         result: VerificationResult,
         *,
         clarification: Optional[str] = None,
+        info_provided: bool = False,
     ) -> ReplyOutcome:
         """Requeue the SAME task from its last safe state. Never from scratch."""
         eligible, why = await self._resumable(task)
@@ -486,9 +537,15 @@ class ReplyRouter:
             if clarification
             else ""
         )
+        if info_provided:
+            noted = (
+                "Thanks, I have saved the information you sent and will use it when I revise "
+                "the plan on the next run.\n\n"
+            )
+        label = "Recorded" if info_provided else "Verified"
         return await self._reply_agent(
             conversation, task, base,
-            f"{noted}Verified: {result.outcome}\n\n"
+            f"{noted}{label}: {result.outcome}\n\n"
             f"Task {task.task_id} is queued to resume from its last saved state."
             f"{checkpoint_note}\n"
             "I will report what actually happens here as it runs.",
