@@ -97,20 +97,28 @@ class Message:
 
 
 class LLMResponse:
-    """Normalized response from the single fixed model."""
+    """Normalized response from the single fixed model.
 
-    __slots__ = ("content", "model", "usage", "finish_reason", "raw")
+    `model` and `requested_model` are deliberately separate. `requested_model`
+    is what AirdropOS asked for, and it is fixed. `model` is what the provider
+    said it served, and is None when the provider said nothing at all. Collapsing
+    the two would make a routing endpoint indistinguishable from a compliant one.
+    """
+
+    __slots__ = ("content", "model", "requested_model", "usage", "finish_reason", "raw")
 
     def __init__(
         self,
         content: str,
-        model: str,
+        model: Optional[str],
         usage: Dict[str, int],
         finish_reason: Optional[str],
         raw: Dict[str, Any],
+        requested_model: Optional[str] = None,
     ):
         self.content = content
         self.model = model
+        self.requested_model = requested_model
         self.usage = usage
         self.finish_reason = finish_reason
         self.raw = raw
@@ -118,6 +126,15 @@ class LLMResponse:
     @property
     def token_count(self) -> int:
         return int(self.usage.get("total_tokens", 0))
+
+    @property
+    def model_matches_request(self) -> Optional[bool]:
+        """True/False when the provider named a model, None when it did not."""
+        if self.model is None or not self.requested_model:
+            return None
+        return self.model == self.requested_model or self.model.startswith(
+            f"{self.requested_model}-"
+        )
 
 
 class FixedLLMClient:
@@ -138,6 +155,9 @@ class FixedLLMClient:
         self._max_tokens: Optional[int] = settings.LLM_MAX_TOKENS
         self._timeout = settings.LLM_TIMEOUT_SECONDS
         self._max_retries = settings.LLM_MAX_RETRIES
+        # Every distinct model the provider has said it served. Exposed so an
+        # operator can SEE routing instead of inferring it.
+        self._served_models: set = set()
 
     # ------------------------------------------------------------------
     # Fixed-model integrity
@@ -206,6 +226,14 @@ class FixedLLMClient:
             "api_key_masked": self._mask_key(),
             "policy": "single_fixed_model",
             "context_budget": self.budget.describe(),
+            # What the provider has actually said it served. Empty means no call
+            # has completed yet. A non-empty list containing anything other than
+            # the configured model is provider-side routing, not a configuration
+            # problem, and AirdropOS cannot prevent it.
+            "served_models_observed": sorted(
+                m for m in self._served_models if m is not None
+            ),
+            "provider_omitted_model": None in self._served_models,
         }
 
     @staticmethod
@@ -358,7 +386,9 @@ class FixedLLMClient:
             break
 
         record_usage(estimated, raw.get("usage"))
-        return self._normalize(raw)
+        response = self._normalize(raw)
+        self._record_served_model(response.model)
+        return response
 
     def _normalize(self, raw: Dict[str, Any]) -> "LLMResponse":
         """Turn a provider body into an `LLMResponse`, or fail loudly."""
@@ -394,11 +424,46 @@ class FixedLLMClient:
 
         return LLMResponse(
             content=content,
-            model=raw.get("model", self._model_id),
+            # `model` is what the provider actually reported. It is deliberately
+            # NOT defaulted to the configured id: filling in a model the provider
+            # never claimed is exactly how a router serving something else stays
+            # invisible. `None` means "the provider did not say", which is a
+            # different fact from "it said the configured one".
+            model=raw.get("model") or None,
+            requested_model=self._model_id,
             usage=raw.get("usage") or {},
             finish_reason=choice.get("finish_reason"),
             raw=raw,
         )
+
+    def _record_served_model(self, served_model: Optional[str]) -> None:
+        """Note a served-model mismatch without breaking a legitimate provider.
+
+        A provider may legitimately answer with a dated variant of the model it
+        was asked for (`gpt-4o` -> `gpt-4o-2024-08-06`), so a mismatch is
+        reported rather than treated as a failure. It is still loud, because on
+        this deployment the endpoint is a router: requesting `gpt-4o` has been
+        observed to return `nvidia/nemotron-3-super-120b-a12b`, which is a
+        different model entirely and not a variant of anything.
+        """
+        self._served_models.add(served_model)
+        if served_model is None or served_model == self._model_id:
+            return
+        if served_model.startswith(self._model_id + "-"):
+            return  # a dated variant of the same model; normal and not a fault
+        logger.warning(
+            "LLM provider served model %r, not the configured model %r. AirdropOS "
+            "requested %r and cannot control what the endpoint chooses to run: this is "
+            "a routing fault on the provider, not a configured one.",
+            served_model, self._model_id, self._model_id,
+        )
+        if settings.LLM_REQUIRE_SERVED_MODEL_MATCH:
+            raise LLMError(
+                f"The LLM endpoint served {served_model!r} but {self._model_id!r} is "
+                "required. Refusing the response under LLM_REQUIRE_SERVED_MODEL_MATCH.",
+                category="MODEL_MISMATCH",
+                retryable=False,
+            )
 
     async def complete_json(
         self,
@@ -558,10 +623,17 @@ class FixedLLMClient:
         try:
             raw = await self._post("/chat/completions", payload)
             latency_ms = (asyncio.get_event_loop().time() - started) * 1000
+            served = raw.get("model") or None
+            self._record_served_model(served)
             return {
                 "status": "HEALTHY",
                 "latency_ms": round(latency_ms, 2),
-                "model": raw.get("model", self._model_id),
+                "requested_model": self._model_id,
+                "served_model": served,
+                "model_matches_request": (
+                    None if served is None
+                    else served == self._model_id or served.startswith(f"{self._model_id}-")
+                ),
                 "detail": "Fixed model endpoint responding",
             }
         except LLMError as exc:

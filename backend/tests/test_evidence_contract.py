@@ -74,6 +74,52 @@ def test_simulation_evidence_cannot_satisfy_a_receipt_method():
     ) is False
 
 
+def test_a_pending_transaction_is_not_verified_by_its_own_hash():
+    """A tx hash proves submission, never execution.
+
+    `transfer_tools` returns `authoritative: False` when a broadcast is pending
+    or the receipt cannot be read, and still includes `tx_hash` in the payload.
+    The legacy payload fallback used to rescue exactly that case and mark the
+    step verified, so a transfer sitting in the mempool could complete a task
+    and be reported as "authoritative evidence" in the task report.
+    """
+    for evidence in (
+        {"authoritative": False, "kind": "chain_receipt", "tx_hash": "0xabc"},
+        {"authoritative": False, "kind": "chain_receipt"},
+    ):
+        for method in ("chain_receipt", "tx_hash", "receipt"):
+            assert _verify(evidence, {"tx_hash": "0xabc"}, method) is False, (
+                f"pending tx verified via method={method!r}"
+            )
+
+
+def test_a_reverted_receipt_is_not_verified_by_its_hash():
+    assert _verify(
+        {"authoritative": False, "kind": "chain_receipt", "status": "REVERTED"},
+        {"tx_hash": "0xabc", "status": "REVERTED"},
+        "chain_receipt",
+    ) is False
+
+
+def test_the_legacy_payload_fallback_still_works_for_genuinely_legacy_tools():
+    """A tool from before the evidence envelope must not be broken by the fix.
+
+    The fallback is restricted to results carrying no evidence block at all, so
+    an old tool that only ever reported `tx_hash` still verifies.
+    """
+    assert _verify(None, {"tx_hash": "0xabc"}, "chain_receipt") is True
+    assert _verify(None, {"screenshot_path": "/tmp/x.png"}, "page_observation") is True
+    assert _verify(None, {"expected_text_seen": True}, "expected_text_seen") is True
+
+
+def test_a_confirmed_receipt_is_still_verified():
+    assert _verify(
+        {"authoritative": True, "kind": "chain_receipt", "tx_hash": "0xabc"},
+        {"tx_hash": "0xabc", "status": "CONFIRMED"},
+        "chain_receipt",
+    ) is True
+
+
 def test_unspecified_method_is_never_auto_verified():
     """The planner's "nobody said how this is proven" default stays unverified."""
     assert _verify({"authoritative": True, "kind": "bot_started"}, {}, "unspecified") is False

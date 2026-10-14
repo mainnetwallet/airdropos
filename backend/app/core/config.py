@@ -198,14 +198,26 @@ class Settings(BaseSettings):
         ),
     )
     LLM_CONTEXT_ESTIMATOR_CHARS_PER_TOKEN: float = Field(
-        default=3.2,
+        default=3.0,
         ge=1.5,
         le=8.0,
         description=(
             "Characters per token assumed by the estimator. Lower = more tokens "
-            "counted = more conservative. 3.2 over-counts against the 4.5 "
-            "chars/token measured on this endpoint, so the budget is never "
-            "exceeded by an undercount."
+            "counted = more conservative. Only one measurement exists: 4.5 "
+            "chars/token for English prose on this endpoint. Code, JSON and hex "
+            "are denser and were NOT measured, so the default sits well below "
+            "the prose figure rather than at it. Never raise this to fit more "
+            "content: an under-count is the one failure mode that matters."
+        ),
+    )
+    LLM_REQUIRE_SERVED_MODEL_MATCH: bool = Field(
+        default=False,
+        description=(
+            "Refuse a response whose reported model is not the configured model "
+            "(or a dated variant of it). Off by default because a provider may "
+            "legitimately answer with a versioned id such as "
+            "'gpt-4o-2024-08-06'. Turn this on where routing must fail closed. "
+            "A mismatch is always logged at WARNING either way."
         ),
     )
 

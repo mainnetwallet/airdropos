@@ -131,6 +131,15 @@ export interface TaskContextView {
   error?: string
 }
 
+export interface ContextBudget {
+  context_window: number
+  reserved_output: number
+  safety_margin: number
+  usable_input: number
+  trigger: number
+  target: number
+}
+
 export interface AgentInfo {
   base_url: string
   model_id: string
@@ -141,6 +150,17 @@ export interface AgentInfo {
   api_key_configured: boolean
   api_key_masked: string
   policy: string
+  /**
+   * What the provider actually said it served.
+   *
+   * `model_id` is what AirdropOS REQUESTED. The backend never fabricates a
+   * served model, so an entry here that differs from `model_id` means the
+   * endpoint routed the request somewhere else -- which AirdropOS cannot
+   * prevent, but an operator must be able to see.
+   */
+  context_budget?: ContextBudget
+  served_models_observed?: string[]
+  provider_omitted_model?: boolean
 }
 
 /**

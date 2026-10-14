@@ -1,15 +1,55 @@
 # AirdropOS Security Audit - Final Report
 
-## Test Suite Results Summary
-
-**Backend Security Audit Test File:** `backend/tests/test_security_audit.py`
-- ✅ **13 tests PASSED** (100%)
-- ❌ **0 tests FAILED** (0%)
-
-### Additional Backend Tests Run:
-- **440 other backend tests** (including auth, wallet, chain, knowledge graph, migration-consistency tests)
-- ✅ **452 tests PASSED** total (13 security audit + 439 other backend tests)
-- ❌ **0 tests FAILED** total
+> ## SUPERSEDED - THIS REPORT IS NOT CURRENT EVIDENCE
+>
+> This report is dated 2026-10-11 and described a codebase that no longer exists in
+> this form. Two things must be read before relying on anything below:
+>
+> **1. The test file it cites does not exist.**
+> `backend/tests/test_security_audit.py` was deleted in commit `265555f`
+> ("test: delete 90% of the test suite, keeping five files"). None of the 13 tests
+> named below were run by this report and none of them can currently be run:
+>
+> ```
+> test_all_endpoints_have_paths            test_unauthenticated_requests_are_denied
+> test_no_open_http_methods                test_authenticated_but_wrong_scope_is_denied
+> test_websocket_rejects_arbitrary_token   test_websocket_requires_valid_session
+> test_dynamic_tool_cannot_execute_arbitrary_code
+> test_wallet_private_keys_never_exposed   test_emergency_stop_prevents_operations
+> test_invalid_wallet_id_returns_400       test_session_expires
+> test_rate_limiting_works                 test_complete_security_validation
+> ```
+>
+> **2. The headline numbers are stale.**
+> "452 tests PASSED" does not describe the current suite. Measured on 2026-10-14:
+> **583 collected, 566 passed, 17 failed** (all 17 pre-existing failures are Rich
+> TUI rendering tests in `test_terminal_layout.py` / `test_terminal_logs.py`).
+>
+> **3. The conclusions below are not supported by the evidence below.**
+> "Overall Status: The system is secure with all security requirements met" is not
+> a finding; it is a conclusion drawn from a suite that has since been deleted.
+> The same applies to "Requirements NOT Met: None".
+>
+> ### What has been independently verified since
+>
+> These were confirmed by direct inspection of the current code, not by this report:
+>
+> | Control | Status |
+> |---|---|
+> | Private keys never in prompts / logs / API / DB | **Verified** — `WalletService.to_dict` has no ciphertext field; `KeyVault` never echoes the master key |
+> | Watch-only wallets cannot sign | **Verified** — no key material is stored at all |
+> | Emergency Stop cannot be released by the agent | **Verified** — `NON_HUMAN_ACTORS` + cross-process fail-closed state |
+> | Transaction approval cannot be self-granted | **Verified** — `NON_HUMAN_APPROVERS` + single conditional UPDATE |
+> | SSRF guard (loopback / metadata / private / IPv6) | **Verified** by execution; DNS rebinding is narrowed, not eliminated |
+> | Emergency Stop UI cannot report "inactive" on error | **Fixed 2026-10-14** — previously rendered a green INACTIVE badge on any failed status request |
+> | A pending transaction cannot be verified by its hash | **Fixed 2026-10-14** — see `test_evidence_contract.py` |
+>
+> ### Known open issues, see the current audit
+>
+> A 2026-10-14 audit confirmed further defects that this report does not cover,
+> including an approval-binding mismatch that prevents any broadcast from
+> succeeding, and a wallet delete that raises instead of destroying key material.
+> **This document must not be cited as a security attestation.**
 
 **Note**: The original document incorrectly stated "13 security audit + 439 other backend tests = 452 tests" but listed 439 other backend tests, which would total 452. However, verification shows 452 total tests (13 security audit + 439 other backend tests), which is consistent. The discrepancy in the phrasing has been clarified.
 

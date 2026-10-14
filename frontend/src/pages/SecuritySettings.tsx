@@ -72,13 +72,16 @@ export default function SecuritySettings() {
   const queryClient = useQueryClient()
   const [reason, setReason] = useState('')
 
-  const { data: stop, isLoading } = useQuery({
+  const { data: stop, isLoading, error: stopError, refetch: refetchStop } = useQuery({
     queryKey: ['emergency-stop'],
     queryFn: api.stopStatus,
     refetchInterval: 5000,
   })
 
-  const { data: agent } = useQuery({ queryKey: ['agent-info'], queryFn: api.agentInfo })
+  const { data: agent, error: agentError } = useQuery({
+    queryKey: ['agent-info'],
+    queryFn: api.agentInfo,
+  })
 
   const engage = useMutation({
     mutationFn: () => api.engageStop(reason || 'Manual stop from dashboard'),
@@ -96,7 +99,12 @@ export default function SecuritySettings() {
 
   if (isLoading) return <Loading label="Loading security settings" />
 
-  const stopped = stop?.emergency_stop_enabled ?? false
+  // The kill switch must never be reported as inactive on the strength of a
+  // failed request. `stop?.x ?? false` turned a 403/500/network drop into a
+  // green "INACTIVE" badge, so an operator who could not reach the status
+  // endpoint was told the platform was safe. Unknown is its own state.
+  const stopKnown = Boolean(stop) && !stopError
+  const stopped = stopKnown ? Boolean(stop?.emergency_stop_enabled) : null
 
   const moreItems = NAV_SECTIONS.flatMap((section) => section.items).filter((item) => MORE_ROUTES.has(item.to))
 
@@ -161,17 +169,43 @@ export default function SecuritySettings() {
       <div id="emergency-stop" className="scroll-mt-4 max-lg:order-last">
       <Card
         title="Emergency Stop"
-        className={stopped ? 'border-status-error/50' : 'max-lg:border-status-error/30 max-lg:bg-status-error/5'}
+        className={
+          stopped === null
+            ? 'border-status-error/50'
+            : stopped
+              ? 'border-status-error/50'
+              : 'max-lg:border-status-error/30 max-lg:bg-status-error/5'
+        }
         action={
-          <span className={`badge ${stopped ? 'bg-red-700 text-white' : 'bg-green-900 text-green-300'}`}>
-            {stopped ? 'ACTIVE' : 'INACTIVE'}
-          </span>
+          stopped === null ? (
+            <span className="badge bg-slate-700 text-slate-200">UNKNOWN</span>
+          ) : (
+            <span className={`badge ${stopped ? 'bg-red-700 text-white' : 'bg-green-900 text-green-300'}`}>
+              {stopped ? 'ACTIVE' : 'INACTIVE'}
+            </span>
+          )
         }
       >
-        <Alert kind={stopped ? 'error' : 'success'} title={stop?.disclaimer}>
-          When engaged, the platform prevents new task execution, new wallet signing, and new
-          transaction submission. Records and checkpoints are preserved.
-        </Alert>
+        {stopped === null ? (
+          <Alert kind="error" title="Stop status could not be read">
+            AirdropOS could not determine whether the emergency stop is engaged. Until this
+            resolves, treat the platform as if it might be stopped: do not rely on this page to
+            tell you the stop is off.
+            {(engage.error || release.error) && (
+              <span className="mt-2 block text-xs opacity-80">
+                Last action failed: {String((engage.error ?? release.error))}
+              </span>
+            )}
+            <button type="button" className="btn btn-ghost mt-3" onClick={() => void refetchStop()}>
+              Retry
+            </button>
+          </Alert>
+        ) : (
+          <Alert kind={stopped ? 'error' : 'success'} title={stop?.disclaimer}>
+            When engaged, the platform prevents new task execution, new wallet signing, and new
+            transaction submission. Records and checkpoints are preserved.
+          </Alert>
+        )}
 
         {stopped && stop?.activated_at && (
           <div className="mt-4 space-y-1 rounded-lg bg-surface-200 p-3 text-xs">
@@ -215,17 +249,38 @@ export default function SecuritySettings() {
             </button>
           )}
         </div>
+
+        {/* A refused or failed engage/release used to be invisible: both mutations
+            had onSuccess only, so the button simply stopped spinning and the
+            operator could not tell whether the kill switch had engaged. */}
+        {(engage.error || release.error) && stopped !== null && (
+          <p className="mt-2 text-xs text-status-error">
+            {release.error
+              ? 'Resume was refused: '
+              : 'Engage failed: '}
+            {String(release.error ?? engage.error)}
+          </p>
+        )}
       </Card>
       </div>
 
       {/* Fixed model */}
+      {agentError && (
+        <div id="llm" className="scroll-mt-4">
+          <Card title="Fixed LLM Configuration">
+            <Alert kind="error" title="LLM configuration could not be read">
+              AirdropOS could not load the fixed-model settings. {String(agentError)}
+            </Alert>
+          </Card>
+        </div>
+      )}
       {agent && (
         <div id="llm" className="scroll-mt-4">
         <Card title="Fixed LLM Configuration">
           <div className="grid gap-3 sm:grid-cols-2">
             {[
               { label: 'Endpoint', value: agent.base_url, mono: true },
-              { label: 'Model ID', value: agent.model_id, mono: true },
+              { label: 'Model ID (requested)', value: agent.model_id, mono: true },
               { label: 'API key', value: agent.api_key_masked || '(not configured)', mono: true },
               { label: 'Policy', value: agent.policy },
               { label: 'Temperature', value: String(agent.temperature) },
@@ -245,6 +300,34 @@ export default function SecuritySettings() {
             The stored API key is never returned to the browser after saving. The masked value above
             is display-only.
           </p>
+          {/* Routing is invisible unless it is shown. AirdropOS requests one
+              model; it cannot control what the endpoint actually runs. */}
+          {agent.served_models_observed && agent.served_models_observed.length > 0 && (
+            <div className="mt-3 rounded-lg bg-surface-200 px-3 py-2">
+              <p className="text-[10px] uppercase tracking-wide text-slate-500">
+                Models the provider said it served
+              </p>
+              <p className="mt-1 font-mono text-sm text-slate-200">
+                {agent.served_models_observed.join(', ')}
+              </p>
+              {agent.served_models_observed.some((m) => m !== agent.model_id) && (
+                <p className="mt-2 text-xs text-status-error">
+                  The endpoint served a model other than the one requested. This is provider-side
+                  routing and AirdropOS cannot prevent it; set LLM_MODEL_ID to an id the endpoint
+                  actually serves.
+                </p>
+              )}
+            </div>
+          )}
+          {agent.context_budget && (
+            <p className="mt-3 text-xs text-slate-500">
+              Input context budget: {agent.context_budget.context_window} tokens, of which{' '}
+              {agent.context_budget.usable_input} are usable for input after reserving{' '}
+              {agent.context_budget.reserved_output} for output and{' '}
+              {agent.context_budget.safety_margin} of safety margin. Compaction begins above{' '}
+              {agent.context_budget.trigger} and aims for {agent.context_budget.target}.
+            </p>
+          )}
         </Card>
         </div>
       )}

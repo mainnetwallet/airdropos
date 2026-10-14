@@ -15,6 +15,7 @@ prove a site is safe, and says so instead of implying it can.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import select
@@ -151,12 +152,24 @@ async def _persist_campaigns(campaigns: List[Dict[str, Any]]) -> int:
                 continue
             url = (campaign.get("source_url") or "").strip()
 
-            project = Project(
-                name=title,
-                description=(campaign.get("description") or "")[:4000] or None,
-            )
-            db.add(project)
-            await db.flush()
+            # Deduplicate on the title BEFORE creating anything. The previous order
+            # created the Project first and then looked for an existing campaign
+            # under that brand-new id, which by construction owns none, so the
+            # lookup could never match. It also omitted the required `slug`,
+            # so the INSERT failed on NOT NULL, the exception was swallowed as a
+            # warning, and the tool still reported success while persisting
+            # nothing.
+            slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:200] or "campaign"
+
+            project = await db.scalar(select(Project).where(Project.slug == slug))
+            if project is None:
+                project = Project(
+                    name=title,
+                    slug=slug,
+                    description=(campaign.get("description") or "")[:4000] or None,
+                )
+                db.add(project)
+                await db.flush()
 
             existing = await db.scalar(
                 select(AirdropCampaign).where(
@@ -165,8 +178,12 @@ async def _persist_campaigns(campaigns: List[Dict[str, Any]]) -> int:
                 )
             )
             if existing is not None:
-                await db.delete(project)
-                await db.flush()
+                # Already stored. The Project is NOT deleted here: it is now a
+                # shared row looked up by slug, and deleting it would issue
+                # `UPDATE airdrop_campaigns SET project_id = NULL` and orphan
+                # every other campaign filed under it. That is only safe when
+                # the project was created in this same iteration and owns
+                # nothing, which is exactly what the old ordering guaranteed.
                 continue
 
             db.add(
@@ -318,7 +335,14 @@ class ResearchCampaignTool(BaseTool):
                 ),
             },
             evidence={
-                "authoritative": True,
+                # NOT authoritative. This reads a page the agent -- or an
+                # instruction embedded in a page it just read -- chose, and
+                # nothing here proves the page is the project's own. Marking it
+                # authoritative let any URL satisfy a plan step whose
+                # verification_method was `source_scan`, which is how a
+                # self-reported reward became "proven". What this tool proves is
+                # only that a page was fetched and what it said.
+                "authoritative": False,
                 "kind": "source_scan",
                 "url": url,
                 "risk_signals": len(risks),
@@ -369,13 +393,23 @@ class CheckWalletEligibilityTool(BaseTool):
                         f"'{params['wallet_id']}' is not a wallet id.", category="INVALID_INPUT"
                     )
             rows = list((await db.execute(query)).scalars().all())
+            # Projected from the REAL `wallet_eligibility` columns. This used to
+            # read `is_eligible`, `eligibility_score`, `eligibility_reason` and
+            # `checked_at`, none of which exist on the model, so the tool raised
+            # AttributeError on the first row whenever any eligibility had been
+            # recorded. Eligibility is deliberately NOT reduced to a boolean
+            # here: `UNKNOWN` and `INELIGIBLE` are different facts and the model
+            # has to be able to tell them apart.
             items = [
                 {
                     "wallet_id": str(r.wallet_id),
-                    "is_eligible": r.is_eligible,
-                    "eligibility_score": r.eligibility_score,
-                    "reason": r.eligibility_reason,
-                    "checked_at": r.checked_at.isoformat() if r.checked_at else None,
+                    "eligibility_status": r.eligibility_status,
+                    "participation_status": r.participation_status,
+                    "tasks_completed_count": r.tasks_completed_count,
+                    "cost_incurred_usd": r.cost_incurred_usd,
+                    "last_verified_at": (
+                        r.last_verified_at.isoformat() if r.last_verified_at else None
+                    ),
                 }
                 for r in rows
             ]

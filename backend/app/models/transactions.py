@@ -16,7 +16,13 @@ class BlockchainTransaction(Base):
 
     __tablename__ = "blockchain_transactions"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    # `Base` supplies `default=uuid.uuid4`, but redeclaring `id` in a subclass
+    # replaces that default with a bare column, so every INSERT sent NULL and the
+    # insert failed on NOT NULL. Declared explicitly for the same reason as
+    # `TransactionApproval.id` below.
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
     task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tasks.id"), nullable=True
     )
@@ -136,7 +142,9 @@ class TransactionReceipt(Base):
 
     __tablename__ = "transaction_receipts"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True
+    )
     transaction_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("blockchain_transactions.id"), nullable=False
     )

@@ -1569,12 +1569,20 @@ class AgentController:
 
         # Tools that predate the evidence envelope still expose their proof in the
         # payload. Kept, but only for a method that actually names that proof.
-        if data.get("tx_hash") and method in ("chain_receipt", "tx_hash", "receipt"):
-            return True, 1
-        if data.get("screenshot_path") and method in ("screenshot", "page_observation"):
-            return True, 1
-        if data.get("expected_text_seen") is True:
-            return True, 1
+        #
+        # ONLY for a tool that returned no evidence block at all. A tool that DID
+        # return one and set `authoritative: False` has explicitly said it cannot
+        # prove the outcome -- typically because the transaction is submitted but
+        # not yet mined, or the receipt could not be read. Falling through to the
+        # payload fallback for those let a bare tx_hash mark a pending transfer
+        # verified, which is the one thing this whole function exists to prevent.
+        if not evidence:
+            if data.get("tx_hash") and method in ("chain_receipt", "tx_hash", "receipt"):
+                return True, 1
+            if data.get("screenshot_path") and method in ("screenshot", "page_observation"):
+                return True, 1
+            if data.get("expected_text_seen") is True:
+                return True, 1
 
         if method and method not in GENERIC_EVIDENCE_METHODS:
             logger.info(

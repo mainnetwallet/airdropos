@@ -62,7 +62,10 @@ Each subsystem implements its own **deterministic guards**:
 ## Security Controls
 
 ### Authentication & Authorization
-- **Bearer token** for REST; **query parameter** for WebSocket.
+- **Bearer token** for REST **and** for the WebSocket, sent as either an
+  `Authorization: Bearer` header or the `Sec-WebSocket-Protocol: bearer, <token>`
+  sub-protocol. A **query parameter is rejected on purpose**: a token in the URL
+  lands in access logs, proxy logs, browser history and `Referer` headers.
 - `UserSession` records: token hash, user reference, scopes, expiration.
 - **Rate limiting** per‑IP, per‑bucket (`read`, `write`, `chat`, `auth`, `emergency`).
 - **Audit logging** (`write_audit`) for security‑relevant actions; secrets redacted via `_redact()`.

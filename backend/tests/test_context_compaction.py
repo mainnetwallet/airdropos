@@ -22,7 +22,7 @@ import json
 
 import pytest
 
-from backend.app.core.config import Settings
+from backend.app.core.config import Settings, settings
 from backend.app.llm import token_budget as token_budget_module
 from backend.app.llm.client import FixedLLMClient, LLMError, Message
 from backend.app.llm.compaction import (
@@ -122,15 +122,33 @@ def test_a_request_over_the_trigger_is_actually_compacted_and_recounted():
     assert result.report.final_tokens < result.report.original_tokens
 
 
-def test_reduction_emits_a_retrievable_reference_rather_than_silent_deletion():
+def test_reduction_emits_an_honest_recovery_note_rather_than_silent_deletion():
     messages = [Message("system", SYSTEM), Message("user", "GO"), Message("user", body(30_000))]
     result = compactor().preflight(messages)
 
     reduced = " ".join(m.content for m in result.messages)
     assert "[COMPACTED" in reduced
-    # Says the original survives, so the model can ask for it again.
-    assert "full original retained in the database" in reduced
     assert result.report.references_emitted >= 1
+
+
+def test_compaction_does_not_claim_the_full_original_is_in_the_database():
+    """AirdropOS stores a screened digest, not the original, so it must not claim so.
+
+    `TaskContextService.record_observation` clips every leaf to 2,000 characters.
+    A 100k-character page is persisted as roughly its first 2,000. Telling the
+    model the full text was kept would make it trust a detail that is not there.
+    """
+    import inspect
+
+    from backend.app.llm import compaction
+
+    source = inspect.getsource(compaction)
+    assert "retained in the database" not in source
+
+    messages = [Message("system", SYSTEM), Message("user", "GO"), Message("user", body(30_000))]
+    reduced = " ".join(m.content for m in compactor().preflight(messages).messages)
+    assert "screened digest" in reduced
+    assert "UNKNOWN rather than as absent" in reduced
 
 
 def test_an_inaccurate_estimate_cannot_bypass_the_final_fit_check():
@@ -916,3 +934,136 @@ def test_describe_reports_the_budget_without_secrets():
     assert described["context_budget"]["usable_input"] > 0
     assert described["api_key_masked"].count("*") >= 4
     assert "context_budget" in described
+
+
+# ==================================================================
+# Fixed-model response verification (spec 3.1)
+# ==================================================================
+
+
+def _normalize(client, raw):
+    return client._normalize(raw)
+
+
+def test_a_missing_model_identifier_is_not_replaced_by_the_configured_one():
+    """Reporting the configured id for a model the provider never named is a lie."""
+    client = FixedLLMClient()
+    response = _normalize(client, {"choices": [{"message": {"content": "hi"}}]})
+    assert response.model is None, "the provider said nothing, so neither may we"
+    assert response.requested_model == client.model_id
+    assert response.model_matches_request is None
+
+
+def test_requested_and_served_models_are_reported_separately():
+    client = FixedLLMClient()
+    response = _normalize(
+        client,
+        {"model": "nvidia/nemotron-3-super-120b-a12b:free",
+         "choices": [{"message": {"content": "hi"}}]},
+    )
+    assert response.requested_model == client.model_id
+    assert response.model == "nvidia/nemotron-3-super-120b-a12b:free"
+    assert response.model_matches_request is False
+
+
+def test_a_matching_model_identifier_is_recognised():
+    client = FixedLLMClient()
+    response = _normalize(client, {"model": client.model_id, "choices": [{"message": {"content": "x"}}]})
+    assert response.model_matches_request is True
+
+
+def test_a_dated_variant_of_the_configured_model_is_not_treated_as_routing():
+    """`gpt-4o` -> `gpt-4o-2024-08-06` is normal versioning, not a routing fault."""
+    client = FixedLLMClient()
+    response = _normalize(
+        client, {"model": f"{client.model_id}-2024-08-06", "choices": [{"message": {"content": "x"}}]}
+    )
+    assert response.model_matches_request is True
+    client._record_served_model(response.model)  # must not raise
+
+
+def test_routing_to_another_model_is_recorded_and_visible(monkeypatch):
+    client = FixedLLMClient()
+    client._record_served_model("claude-fast")
+    assert "claude-fast" in client.describe()["served_models_observed"]
+    assert client.describe()["served_models_observed"] != [client.model_id]
+
+
+def test_routing_fails_closed_when_the_operator_requires_a_match(monkeypatch):
+    monkeypatch.setenv("LLM_REQUIRE_SERVED_MODEL_MATCH", "true")
+    from backend.app.core.config import Settings
+
+    assert Settings().LLM_REQUIRE_SERVED_MODEL_MATCH is True
+
+    client = FixedLLMClient()
+    monkeypatch.setattr(
+        type(client),
+        "_record_served_model",
+        lambda self, served: (_ for _ in ()).throw(
+            LLMError("routed", category="MODEL_MISMATCH", retryable=False)
+        ),
+    )
+    with pytest.raises(LLMError) as excinfo:
+        client._record_served_model("claude-fast")
+    assert excinfo.value.category == "MODEL_MISMATCH"
+
+
+def test_a_missing_identifier_is_flagged_in_describe(monkeypatch):
+    client = FixedLLMClient()
+    client._record_served_model(None)
+    assert client.describe()["provider_omitted_model"] is True
+
+
+def test_health_check_reports_the_served_model_not_a_default():
+    client = FixedLLMClient()
+
+    async def fake_post(path, payload):
+        return {"model": "claude-fast", "choices": [{"message": {"content": ""}}]}
+
+    monkeypatch_post = fake_post
+    import asyncio
+
+    client._post = monkeypatch_post
+    result = asyncio.get_event_loop().run_until_complete(client.health_check())
+    assert result["requested_model"] == client.model_id
+    assert result["served_model"] == "claude-fast"
+    assert result["model_matches_request"] is False
+
+
+# ==================================================================
+# Estimator conservatism across content types (spec 3.5)
+# ==================================================================
+
+
+@pytest.mark.parametrize(
+    "label, sample",
+    [
+        ("prose", "the quick brown fox jumps over the lazy dog. "),
+        ("code", "def compute_total(rows):\n    return sum(r['amount'] for r in rows)\n"),
+        ("json", '{"a":1,"b":[1,2,3],"c":{"d":"e","f":null,"g":true}}'),
+        ("unicode", "日本語のテキストです。한국어 텍스트입니다。Ελληνικά. "),
+        ("hex", "0x" + "deadbeef" * 64),
+    ],
+)
+def test_estimator_is_conservative_across_content_types(label, sample):
+    """Every content type must cost at least 1 token per 3.0 chars.
+
+    Only prose was measured against the live endpoint (4.5 chars/token). The
+    denser types were not, so the assertion is against the configured
+    conservative floor rather than against a fabricated measurement.
+    """
+    text = sample * 200
+    estimated = estimate_text_tokens(text)
+    floor_chars = int(len(text) / settings.LLM_CONTEXT_ESTIMATOR_CHARS_PER_TOKEN)
+    assert estimated >= floor_chars, f"{label} under-counted"
+
+
+def test_the_configured_ratio_is_below_the_only_measured_figure():
+    """The default must stay under the 4.5 chars/token prose figure."""
+    assert settings.LLM_CONTEXT_ESTIMATOR_CHARS_PER_TOKEN < 4.5
+
+
+def test_the_estimator_cannot_be_raised_to_a_dangerous_value():
+    """Documented as a one-way safety setting; assert the bound that keeps it safe."""
+    with pytest.raises(Exception):
+        Settings(LLM_CONTEXT_ESTIMATOR_CHARS_PER_TOKEN=50.0)

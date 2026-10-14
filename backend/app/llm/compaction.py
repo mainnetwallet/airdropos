@@ -87,15 +87,35 @@ SECURITY_MARKERS: Tuple[str, ...] = (
 )
 
 _ELISION_MARKER = "[COMPACTED"
-_REFERENCE_MARKER = "[full original retained in the database"
+_RECOVERY_MARKER = "[recovery: re-read the authoritative record for this task"
 
 
 def _describe_elision(kind: str, removed_chars: int, source: str) -> str:
+    """Describe a reduction honestly, without promising retrieval that may not exist.
+
+    An earlier version of this function claimed the full original was "retained
+    in the database". That was not true. What AirdropOS stores for a tool result
+    is a SCREENED DIGEST -- `TaskContextService.record_observation` runs the
+    payload through `_screened_dict`, which clips every leaf string to 2,000
+    characters and caps depth and breadth. A 100,000-character page is persisted
+    as roughly its first 2,000 characters. Telling the model the full text was
+    kept would invite it to trust that it does not need the detail, and then be
+    wrong.
+
+    So the claim made here is the one that is actually true: compaction deleted
+    nothing, AirdropOS' own records for the task still describe the outcome, and
+    the way to recover a specific omitted detail is to re-read that record or
+    re-fetch the original source.
+    """
     return (
-        f"{_ELISION_MARKER} by AirdropOS: {source} was too large for the model's context "
-        f"window, so {removed_chars} characters were reduced to fit. This is not a "
-        f"security decision and nothing was deleted: {_REFERENCE_MARKER}, and re-read "
-        f"the original {source} if a specific detail is needed."
+        f"{_ELISION_MARKER} by AirdropOS: {source} was too large for the model's "
+        f"context window, so {removed_chars} characters were reduced to fit. "
+        f"This is not a security decision and compaction deleted nothing from "
+        f"any store. The middle of this block is NOT reproduced here, and the "
+        f"task's own records keep only a screened digest of it, not the full "
+        f"text. {_RECOVERY_MARKER} if you need a specific detail, or re-fetch "
+        f"the original source. Treat any detail that is not shown here as "
+        f"UNKNOWN rather than as absent."
     )
 
 
@@ -255,8 +275,8 @@ def _reduce_json_object(text: str, allow: int) -> Tuple[str, int]:
     kept["__compacted__"] = {
         "note": (
             "Whole top-level keys were omitted to fit the context window. Every value "
-            "shown is still exactly as recorded. "
-            f"{_REFERENCE_MARKER} and re-read the original record for omitted keys."
+            "shown is still exactly as recorded, and an omitted key is NOT an empty "
+            f"one. {_RECOVERY_MARKER} for omitted keys, or re-fetch the source."
         ),
         "omitted_keys": dropped,
         "characters_removed": original_len - len(json.dumps(kept, default=str)),
