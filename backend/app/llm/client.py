@@ -6,11 +6,24 @@ MANDATORY CONSTRAINT (Specification Part 3):
 
 All AI-powered reasoning (planning, research interpretation, tool selection, task
 decomposition, reporting, learning analysis, self-coding) flows through this module.
+
+INPUT CONTEXT BUDGET
+--------------------
+`complete` and `stream` run a token preflight before submitting. A request that
+fits the configured budget is sent byte-for-byte as built, with no rewriting of
+any kind. A request that cannot fit is reduced by `llm.compaction`, which never
+touches a system message or the active objective and never discards content
+silently. See `llm/compaction.py` for why that is the rule and not a preference.
+
+This is strictly an INPUT concern. It has nothing to do with `LLM_MAX_TOKENS`,
+which is an OUTPUT limit and remains unset by default, leaving `max_tokens` off
+the request entirely.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import re
@@ -19,8 +32,21 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import httpx
 
 from backend.app.core.config import settings
+from backend.app.llm.compaction import (
+    ContextCompactionError,
+    classify_provider_error,
+    detect_billing_refusal_in_content,
+)
+from backend.app.llm.token_budget import TokenBudget, count_request_tokens, record_usage
 
 logger = logging.getLogger(__name__)
+
+# Set while compaction is running so a nested request can never re-enter the
+# guarded path and recurse. Compaction itself makes no model calls, so this is
+# a safety property rather than a currently-exercised one.
+_in_compaction: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "airdropos_llm_in_compaction", default=False
+)
 
 
 class LLMError(Exception):
@@ -179,6 +205,7 @@ class FixedLLMClient:
             "api_key_configured": bool(self.api_key) and "placeholder" not in self.api_key,
             "api_key_masked": self._mask_key(),
             "policy": "single_fixed_model",
+            "context_budget": self.budget.describe(),
         }
 
     @staticmethod
@@ -189,6 +216,74 @@ class FixedLLMClient:
         if len(key) <= 8:
             return "*" * len(key)
         return f"{key[:3]}{'*' * (len(key) - 7)}{key[-4:]}"
+
+    # ------------------------------------------------------------------
+    # Input context budget
+    # ------------------------------------------------------------------
+    @property
+    def budget(self) -> TokenBudget:
+        return TokenBudget.from_settings()
+
+    @property
+    def in_compaction(self) -> bool:
+        return _in_compaction.get()
+
+    def _preflight(self, messages: List[Message], *, aggressive: bool = False) -> List[Message]:
+        """Size-check and, only if necessary, reduce a request.
+
+        A request inside the budget returns the identical list of identical
+        message objects, so the overwhelming majority of calls pay a token count
+        and nothing else.
+        """
+        from backend.app.llm.compaction import build_compactor
+
+        budget = self.budget
+        estimated = count_request_tokens(messages)
+        if estimated <= budget.trigger:
+            return messages
+
+        logger.info(
+            "llm.context preflight: estimated=%s trigger=%s usable=%s window=%s; compacting",
+            estimated,
+            budget.trigger,
+            budget.usable_input,
+            budget.context_window,
+        )
+
+        token = _in_compaction.set(True)
+        try:
+            compactor = build_compactor(budget)
+            result = compactor.preflight(messages, aggressive=aggressive)
+        finally:
+            _in_compaction.reset(token)
+
+        report = result.report
+        logger.info(
+            "llm.context compacted: estimated=%s -> counted=%s strategies=%s reduced=%s "
+            "removed_chars=%s references=%s",
+            report.original_tokens,
+            report.final_tokens,
+            ",".join(report.strategies) or "none",
+            report.messages_reduced,
+            report.characters_removed,
+            report.references_emitted,
+        )
+        return result.messages
+
+    def _try_preflight(self, messages: List[Message], *, aggressive: bool = False) -> List[Message]:
+        """Preflight, surfacing "cannot fit" as the error type callers already handle.
+
+        `ContextCompactionError` deliberately does not inherit from `LLMError`,
+        because an unreducible request is not a provider fault. It is translated
+        here so the existing `except LLMError` handlers in the planner, the
+        discovery extractor and the chat loop report it correctly instead of it
+        escaping as an unhandled exception. The message is preserved verbatim, so
+        the operator still gets the actionable explanation.
+        """
+        try:
+            return self._preflight(messages, aggressive=aggressive)
+        except ContextCompactionError as exc:
+            raise LLMError(str(exc), category="CONTEXT_TOO_LARGE", retryable=False) from exc
 
     # ------------------------------------------------------------------
     # Core completion
@@ -202,16 +297,71 @@ class FixedLLMClient:
         stop: Optional[List[str]] = None,
     ) -> LLMResponse:
         """Execute a chat completion against the single fixed model."""
-        payload = self._build_payload(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            json_mode=json_mode,
-            stop=stop,
-        )
+        if self.in_compaction:
+            # Reached only if compaction ever grows a model call. Compacting a
+            # request by making a request that needs the same compaction would
+            # recurse, so it is refused rather than retried.
+            raise LLMError(
+                "A nested LLM request was made while compaction was running.",
+                category="COMPACTION_RECURSION",
+                retryable=False,
+            )
 
-        raw = await self._post("/chat/completions", payload)
+        prepared = self._try_preflight(messages)
 
+        attempts = 0
+        while True:
+            payload = self._build_payload(
+                prepared,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                stop=stop,
+            )
+            estimated = count_request_tokens(prepared)
+
+            try:
+                raw = await self._post("/chat/completions", payload)
+            except LLMError as exc:
+                if exc.category != "CONTEXT_OVERFLOW":
+                    raise
+                if attempts >= settings.LLM_CONTEXT_OVERFLOW_MAX_RETRIES:
+                    logger.error(
+                        "llm.context overflow recovery exhausted after %s retry attempt(s); "
+                        "estimated=%s usable=%s",
+                        attempts,
+                        estimated,
+                        self.budget.usable_input,
+                    )
+                    raise
+                attempts += 1
+                logger.warning(
+                    "llm.context provider reported a context overflow at estimated=%s tokens; "
+                    "retrying once with a harder reduction (attempt %s/%s)",
+                    estimated,
+                    attempts,
+                    settings.LLM_CONTEXT_OVERFLOW_MAX_RETRIES,
+                )
+                # A smaller request is required. Retrying the same payload could
+                # only fail the same way, so the retry is built from a harder
+                # reduction and recounted before it is sent.
+                prepared = self._try_preflight(messages, aggressive=True)
+                if count_request_tokens(prepared) >= estimated:
+                    raise LLMError(
+                        "The provider reported a context overflow but the request could not "
+                        "be reduced any further, so it was not retried.",
+                        category="CONTEXT_OVERFLOW",
+                        retryable=False,
+                    )
+                continue
+
+            break
+
+        record_usage(estimated, raw.get("usage"))
+        return self._normalize(raw)
+
+    def _normalize(self, raw: Dict[str, Any]) -> "LLMResponse":
+        """Turn a provider body into an `LLMResponse`, or fail loudly."""
         choices = raw.get("choices") or []
         if not choices:
             raise LLMError("LLM returned no choices", category="MALFORMED_RESPONSE", retryable=False)
@@ -219,6 +369,28 @@ class FixedLLMClient:
         choice = choices[0]
         message = choice.get("message") or {}
         content = message.get("content") or ""
+
+        # A reasoning model can spend the whole reply on reasoning and return a
+        # null body. That is not an empty answer, and it must not be mistaken
+        # for one: it is reported as what it is.
+        if not content and message.get("reasoning"):
+            raise LLMError(
+                "The model used its entire response on reasoning and returned no content.",
+                category="EMPTY_CONTENT",
+                retryable=False,
+            )
+
+        # The configured endpoint answers an unfunded request with a normal
+        # completion whose text is a top-up notice. Surfacing that as the
+        # model's answer would send the caller hunting for a JSON problem that
+        # does not exist.
+        if detect_billing_refusal_in_content(content):
+            raise LLMError(
+                "The LLM endpoint refused the request for lack of credit; it is not a "
+                "model answer and not a context problem.",
+                category="BILLING_REFUSAL",
+                retryable=False,
+            )
 
         return LLMResponse(
             content=content,
@@ -315,8 +487,18 @@ class FixedLLMClient:
         max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
         """Stream tokens from the single fixed model for chat UIs."""
+        if self.in_compaction:
+            raise LLMError(
+                "A nested LLM request was made while compaction was running.",
+                category="COMPACTION_RECURSION",
+                retryable=False,
+            )
+
+        # Preflight runs BEFORE the stream opens, because once the first token
+        # has been handed to the caller a retry is no longer transparent.
+        prepared = self._try_preflight(messages)
         payload = self._build_payload(
-            messages, temperature=temperature, max_tokens=max_tokens, stream=True
+            prepared, temperature=temperature, max_tokens=max_tokens, stream=True
         )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -328,8 +510,21 @@ class FixedLLMClient:
             async with client.stream("POST", url, json=payload, headers=headers) as response:
                 if response.status_code != 200:
                     body = await response.aread()
+                    text = body.decode("utf-8", "replace")
+                    # The stream never yields partial output before this point,
+                    # so a context overflow here is still safely retryable. Once
+                    # the first token has been yielded below, no retry is ever
+                    # attempted: replaying would duplicate output the caller has
+                    # already seen.
+                    if classify_provider_error(response.status_code, text) == "CONTEXT_OVERFLOW":
+                        raise LLMError(
+                            "The model refused the streamed request because it exceeded "
+                            "the context window.",
+                            category="CONTEXT_OVERFLOW",
+                            retryable=False,
+                        )
                     raise LLMError(
-                        f"LLM stream failed with HTTP {response.status_code}: {body[:300]!r}",
+                        f"LLM stream failed with HTTP {response.status_code}: {text[:300]!r}",
                         category="HTTP_ERROR",
                         retryable=response.status_code >= 500,
                     )
@@ -399,6 +594,27 @@ class FixedLLMClient:
                     return response.json()
 
                 body_snippet = response.text[:400]
+
+                # A genuine context-window refusal is the one 4xx that is worth
+                # acting on rather than merely reporting, because the caller can
+                # genuinely fix it by sending a smaller request. It is detected
+                # from the provider's own wording, never guessed from the status
+                # code alone: a 400 that is not about size must stay a plain
+                # bad request and must not trigger compaction.
+                overflow = classify_provider_error(response.status_code, response.text)
+                if overflow == "CONTEXT_OVERFLOW":
+                    raise LLMError(
+                        "The model refused the request because it exceeded the context "
+                        f"window: {body_snippet}",
+                        category="CONTEXT_OVERFLOW",
+                        retryable=False,
+                    )
+                if overflow == "BILLING_REFUSAL":
+                    raise LLMError(
+                        "The LLM endpoint refused the request for lack of credit.",
+                        category="BILLING_REFUSAL",
+                        retryable=False,
+                    )
 
                 # 4xx (other than rate limit) is not retryable: retrying cannot help.
                 if response.status_code in (401, 403):

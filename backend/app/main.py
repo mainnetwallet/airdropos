@@ -33,6 +33,21 @@ logger = logging.getLogger("airdropos.api")
 async def lifespan(app: FastAPI):
     logger.info("AirdropOS backend starting (environment=%s)", settings.ENVIRONMENT)
     logger.info("Fixed model: %s @ %s", settings.LLM_MODEL_ID, settings.LLM_BASE_URL)
+    # Sizes are logged, never content. An operator reading this knows whether a
+    # compaction event later was expected or a sign the window is set too low.
+    from backend.app.llm.token_budget import TokenBudget
+
+    _budget = TokenBudget.from_settings()
+    logger.info(
+        "Input context budget: window=%s usable=%s compact-above=%s compact-to=%s "
+        "(output reserved=%s, safety margin=%s)",
+        _budget.context_window,
+        _budget.usable_input,
+        _budget.trigger,
+        _budget.target,
+        _budget.reserved_output,
+        _budget.safety_margin,
+    )
     # Count only. `bootstrap_tools` logs one summary line; the individual tool
     # names are DEBUG and are also served by GET /tools.
     bootstrap_tools()

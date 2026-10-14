@@ -127,6 +127,88 @@ class Settings(BaseSettings):
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
     LLM_MAX_RETRIES: int = Field(default=3)
 
+    # ------------------------------------------------------------------
+    # INPUT CONTEXT BUDGET (never an output limit)
+    # ------------------------------------------------------------------
+    # These govern INPUT size only. They have nothing to do with LLM_MAX_TOKENS
+    # above, which governs OUTPUT. They do not cut content: a request that fits
+    # the budget is sent byte-for-byte as built. They exist so that a request
+    # which cannot possibly fit is reduced *before* submission instead of
+    # failing at the provider.
+    #
+    # The default below is deliberately CONSERVATIVE and is NOT the 300k figure
+    # that might be assumed from the configured model id. Measured against the
+    # configured endpoint:
+    #   * a 160,017-token prompt was accepted (HTTP 200, usage reported);
+    #   * the configured id is not in the provider's model catalog, and the
+    #     provider re-routes per request, so the served model is not stable.
+    # 128000 is therefore used: it is below anything observed to fail, and an
+    # operator who has verified a larger window for THEIR endpoint can raise it.
+    LLM_CONTEXT_WINDOW_TOKENS: int = Field(
+        default=128000,
+        ge=4096,
+        description=(
+            "The model's total context window in tokens, counting input and output "
+            "together. Default 128000 is a conservative verified floor, not a claim "
+            "that the configured model supports 300k."
+        ),
+    )
+    LLM_CONTEXT_RESERVED_OUTPUT_TOKENS: int = Field(
+        default=8000,
+        ge=0,
+        description=(
+            "Tokens held back from the input budget for the model's reply. Set this "
+            "when LLM_MAX_TOKENS is set so the reply always has room."
+        ),
+    )
+    LLM_CONTEXT_SAFETY_MARGIN_TOKENS: int = Field(
+        default=4000,
+        ge=0,
+        description=(
+            "Slack for token-count estimation error and provider message framing. "
+            "The estimator deliberately over-counts, so this is a second line of "
+            "defence rather than the only one."
+        ),
+    )
+    LLM_CONTEXT_COMPACTION_TRIGGER_TOKENS: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Input size at which compaction starts. Unset = 80% of the usable "
+            "input budget."
+        ),
+    )
+    LLM_CONTEXT_COMPACTION_TARGET_TOKENS: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Input size compaction aims for. Unset = 62% of the usable input "
+            "budget, which leaves room for the next operation to add content "
+            "without immediately re-triggering compaction."
+        ),
+    )
+    LLM_CONTEXT_OVERFLOW_MAX_RETRIES: int = Field(
+        default=1,
+        ge=0,
+        le=3,
+        description=(
+            "How many times a genuine context-overflow error may trigger a further, "
+            "harder reduction and a retry. Bounded on purpose: retrying an unchanged "
+            "oversized payload can never succeed."
+        ),
+    )
+    LLM_CONTEXT_ESTIMATOR_CHARS_PER_TOKEN: float = Field(
+        default=3.2,
+        ge=1.5,
+        le=8.0,
+        description=(
+            "Characters per token assumed by the estimator. Lower = more tokens "
+            "counted = more conservative. 3.2 over-counts against the 4.5 "
+            "chars/token measured on this endpoint, so the budget is never "
+            "exceeded by an undercount."
+        ),
+    )
+
     # =========================================================================
     # DETERMINISTIC SECURITY & AUTONOMOUS SPENDING LIMITS
     # =========================================================================
@@ -443,6 +525,18 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator(
+        "LLM_CONTEXT_COMPACTION_TRIGGER_TOKENS",
+        "LLM_CONTEXT_COMPACTION_TARGET_TOKENS",
+        mode="before",
+    )
+    @classmethod
+    def _blank_context_budget_means_derived(cls, value: Any) -> Any:
+        """A blank threshold means "derive it from the usable budget"."""
+        if isinstance(value, str) and value.strip().lower() in ("", "none", "null"):
+            return None
+        return value
+
     @field_validator("ENVIRONMENT")
     @classmethod
     def normalize_environment(cls, v: str) -> str:
@@ -464,6 +558,49 @@ class Settings(BaseSettings):
                 "(a 256-bit key, optionally prefixed with 0x)"
             )
         return v.strip()
+
+    @model_validator(mode="after")
+    def validate_context_budget(self) -> "Settings":
+        """Reject a context budget that could not possibly be honoured.
+
+        A trigger above the usable budget would silently disable compaction; a
+        target above the trigger would make compaction useless. Both are far
+        cheaper to catch at startup than to discover during a live task.
+        """
+        usable = (
+            self.LLM_CONTEXT_WINDOW_TOKENS
+            - self.LLM_CONTEXT_RESERVED_OUTPUT_TOKENS
+            - self.LLM_CONTEXT_SAFETY_MARGIN_TOKENS
+        )
+        if usable <= 0:
+            raise ValueError(
+                "LLM_CONTEXT_RESERVED_OUTPUT_TOKENS plus LLM_CONTEXT_SAFETY_MARGIN_TOKENS "
+                f"({self.LLM_CONTEXT_RESERVED_OUTPUT_TOKENS + self.LLM_CONTEXT_SAFETY_MARGIN_TOKENS}) "
+                "must be smaller than LLM_CONTEXT_WINDOW_TOKENS "
+                f"({self.LLM_CONTEXT_WINDOW_TOKENS}). There is no room for any input."
+            )
+
+        trigger = self.LLM_CONTEXT_COMPACTION_TRIGGER_TOKENS or int(usable * 0.80)
+        target = self.LLM_CONTEXT_COMPACTION_TARGET_TOKENS or int(usable * 0.62)
+
+        if target > trigger:
+            raise ValueError(
+                f"LLM_CONTEXT_COMPACTION_TARGET_TOKENS ({target}) must not exceed "
+                f"LLM_CONTEXT_COMPACTION_TRIGGER_TOKENS ({trigger}); compaction could "
+                "never bring a request below the trigger."
+            )
+        if trigger > usable:
+            raise ValueError(
+                f"LLM_CONTEXT_COMPACTION_TRIGGER_TOKENS ({trigger}) exceeds the usable "
+                f"input budget ({usable}). Compaction would never run before the "
+                "request was submitted."
+            )
+        if target > usable:
+            raise ValueError(
+                f"LLM_CONTEXT_COMPACTION_TARGET_TOKENS ({target}) exceeds the usable "
+                f"input budget ({usable})."
+            )
+        return self
 
     @model_validator(mode="after")
     def reject_insecure_production_config(self) -> "Settings":
