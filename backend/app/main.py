@@ -36,6 +36,10 @@ async def lifespan(app: FastAPI):
     # Count only. `bootstrap_tools` logs one summary line; the individual tool
     # names are DEBUG and are also served by GET /tools.
     bootstrap_tools()
+    # Apply a changed OPERATOR_PASSWORD_HASH (from --set-password) to the existing account.
+    from backend.app.security.operator_sync import sync_operator_password
+
+    await sync_operator_password()
     # Server-side approvals are what let a verified transfer be broadcast at all.
     # Without this the engine correctly refuses every broadcast, so an approved
     # transfer could never complete.
