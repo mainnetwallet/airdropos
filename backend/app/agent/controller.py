@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,7 +27,7 @@ from backend.app.agent.context import TaskContextService, action_fingerprint
 from backend.app.agent.discovery import DiscoveryBudget, extract_from_result
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
-from backend.app.models import Task
+from backend.app.models import AirdropCampaign, Task
 from backend.app.models.context import (
     OUTCOME_ATTEMPTED,
     OUTCOME_BLOCKED,
@@ -244,6 +244,11 @@ class AgentController:
         # executing it revealed something new.
         self.discovery_budget = DiscoveryBudget()
         self.discovery_replans = 0
+        # A planning cycle resolves the task's context once. The cache is cleared at each
+        # cycle boundary (`begin_planning_cycle`), which is exactly where a context write
+        # may have happened, so a second planner call in the same cycle does not re-read
+        # the same rows and a context that has moved on is never served stale.
+        self._planning_context_cache: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
 
     # ------------------------------------------------------------------
     # Main loop
@@ -506,6 +511,53 @@ class AgentController:
         current = await self.planner.current_plan(task)
         return current.revision if current is not None else None
 
+    async def _resolved_planning_context(
+        self, task: Task
+    ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Resolve the context the planner is allowed to see for this task.
+
+        Task context is always THIS task's; it is resolved from the task's own rows, so
+        another task's history cannot reach the planner. Campaign context is attached
+        only when this task carries an explicit campaign link, and then it is the
+        campaign-wide snapshot - never account- or wallet-specific state, and never a
+        fact learned by a different task.
+
+        Resolution happens once per planning cycle, so two planner calls in the same cycle
+        do not read the same rows twice.
+        """
+        from backend.app.airdrops.campaign_context import CampaignContextService
+
+        key = str(task.id)
+        cached = self._planning_context_cache.get(key)
+        if cached is not None:
+            return cached
+
+        resolved = await self.context.resolve(task)
+        context_payload = resolved.to_prompt_dict()
+
+        # The campaign id comes from the context that was just read, not from a second
+        # lookup, so this cannot add a duplicate database read.
+        campaign_payload: Optional[Dict[str, Any]] = None
+        if resolved.campaign_id is not None:
+            campaign = await self.db.get(AirdropCampaign, resolved.campaign_id)
+            if campaign is not None:
+                campaign_payload = (
+                    await CampaignContextService(self.db).snapshot(campaign)
+                ).to_dict()
+
+        self._planning_context_cache[key] = (context_payload, campaign_payload)
+        return context_payload, campaign_payload
+
+    def begin_planning_cycle(self, task: Task) -> None:
+        """Start a new planning cycle for this task.
+
+        Called at each point where planning begins, because that is where an intervening
+        context write (an observation, a discovered requirement, a recorded failure) may
+        have made the previously resolved payload stale. Anything already resolved in this
+        cycle stays reusable without another read.
+        """
+        self._planning_context_cache.pop(str(task.id), None)
+
     async def _record_progress(
         self,
         task: Task,
@@ -544,6 +596,7 @@ class AgentController:
         is not called from a request handler. Instructions are cleared before the planner is
         invoked so a replan can never be retried forever on the same note.
         """
+        self.begin_planning_cycle(task)
         instructions = self._take_operator_instructions(task)
         existing = await self.planner.load_plan_spec(task)
 
@@ -555,6 +608,11 @@ class AgentController:
             goal=task.title or None,
             normalized_objective=task.description or task.title or None,
         )
+
+        # Resolved once for this planning cycle: the same payload feeds whichever planner
+        # call follows, so planning never pays for two identical reads. Resolution happens
+        # after `set_goal` because that write bumps the context revision.
+        context_payload, campaign_payload = await self._resolved_planning_context(task)
 
         if existing is not None and existing.steps:
             if not instructions:
@@ -589,6 +647,8 @@ class AgentController:
                     existing,
                     trigger=ReplanTrigger.OPERATOR_REQUEST,
                     reason=reason,
+                    context=context_payload,
+                    campaign_context=campaign_payload,
                 )
             except PlanningError as exc:
                 logger.warning(
@@ -620,6 +680,8 @@ class AgentController:
             objective=objective,
             task=task,
             constraints=constraints,
+            context=context_payload,
+            campaign_context=campaign_payload,
         )
         await self.planner.persist_plan(task, spec)
         report.steps.append(
@@ -1086,6 +1148,7 @@ class AgentController:
         channel joined is the system working, not the system struggling, and must not
         consume the retry allowance or trip the failure-replan ceiling.
         """
+        self.begin_planning_cycle(task)
         if self.discovery_replans >= settings.MAX_DISCOVERY_REPLANS_PER_RUN:
             return None
 
@@ -1105,6 +1168,10 @@ class AgentController:
             if o.proved_completion
         ]
 
+        # Newly discovered requirements change the context, so this is a new planning
+        # cycle: the revision key means the memo cannot serve a stale payload here.
+        context_payload, campaign_payload = await self._resolved_planning_context(task)
+
         try:
             revised = await self.planner.replan(
                 task,
@@ -1117,6 +1184,8 @@ class AgentController:
                 ),
                 context_notes=[r.text for r in unaddressed],
                 evidence=confirmed,
+                context=context_payload,
+                campaign_context=campaign_payload,
             )
         except PlanningError as exc:
             logger.warning("Discovery replan for %s failed: %s", task.task_id, exc)
@@ -1354,6 +1423,7 @@ class AgentController:
         # legitimately discovered three new requirements could no longer replan after a
         # genuine failure - the budget for fixing things would be spent on learning about
         # them.
+        self.begin_planning_cycle(task)
         recovery_replans = await self._count_recovery_replans(task)
         if recovery_replans >= MAX_REPLANS_PER_TASK:
             msg = (
@@ -1375,8 +1445,16 @@ class AgentController:
         if trigger is ReplanTrigger.FAILURE and plan.total_cost() > settings.MAX_TRANSACTION_VALUE_USD:
             trigger = ReplanTrigger.BUDGET
 
+        context_payload, campaign_payload = await self._resolved_planning_context(task)
         try:
-            await self.planner.replan(task, plan, trigger=trigger, reason=reason)
+            await self.planner.replan(
+                task,
+                plan,
+                trigger=trigger,
+                reason=reason,
+                context=context_payload,
+                campaign_context=campaign_payload,
+            )
         except PlanningError as exc:
             logger.error("Replanning failed for %s: %s", task.task_id, exc)
             report.failures.append(f"Replanning failed: {exc}")

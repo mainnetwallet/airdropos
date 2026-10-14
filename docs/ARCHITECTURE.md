@@ -13,6 +13,32 @@ All critical operations are gated behind a deterministic authorization policy, w
 - No routing, no fallback model.
 - Enforced structurally in `FixedLLMClient.assert_model_locked()`.
 
+### 1a. Input Context Budget and Compaction
+- The input context budget (`LLM_CONTEXT_*`) is an **input** concern only; it never sets
+  an output limit. `LLM_MAX_TOKENS` stays unset by default, so `max_tokens` is omitted
+  from every request.
+- A request that fits the budget is sent **byte-for-byte as built**. Nothing is rewritten.
+- A request that cannot fit is **compacted by the same fixed model**: a bounded,
+  multi-round workflow in `app/llm/compaction.py` asks the configured `LLM_MODEL_ID` for
+  a strict-JSON, section-labelled summary of the reduceable content, re-estimates the
+  request after every round, and runs another round only while it is still making
+  progress. There is no second model, router or fallback.
+- System messages and the opening of the active objective are **never reduced**. Every
+  trust/security label present in the reduced content is re-emitted deterministically in
+  a preserved-labels ledger, so a summary can never launder untrusted content into an
+  instruction. Secrets are redacted with the platform's existing patterns before any
+  text reaches the compaction prompt.
+- Compaction terminates explicitly: the request fits, the configured maximum number of
+  rounds is reached, the summary is unusable, or a round stopped making progress. If it
+  cannot be made safe, the request fails with a non-retryable `CONTEXT_TOO_LARGE` error
+  instead of being submitted oversized or quietly trimmed.
+- The compaction model call is a dedicated internal path
+  (`FixedLLMClient._compaction_summarize`) that skips the budget preflight, so compaction
+  can never re-enter itself.
+- Chat history is bounded by **turn count only**. There is no character cap: an oversized
+  history reaches the context pipeline above, which can compact it, rather than being
+  thinned at the API boundary before anything could see it.
+
 ### 2. Deny-by-Default Authorization
 - **Scopes**: `read`, `tool_read`, `wallet_read`, `wallet_write`, `system_admin`, `emergency_stop`, etc.
 - Every REST endpoint requires `get_principal`; WebSocket sessions resolve from a live, unexpired `UserSession`.

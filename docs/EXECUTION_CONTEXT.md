@@ -276,10 +276,46 @@ campaign. It inherits none of the first task's history.
   success, and an empty "Outstanding requirements" list is labelled as not meaning the
   work is verified.
 
+### Planning receives it
+
+The context is not only recorded, it is *planned from*. Before the first plan is
+produced, `AgentController._ensure_plan` resolves the task's context and passes it to
+`Planner.decompose(context=...)`, and the matching campaign context to
+`Planner.decompose(campaign_context=...)` when — and only when — the task carries an
+explicit campaign link. The replan paths (`_replan` and `_maybe_replan_for_discovery`)
+pass the same resolved levels, so a revision planned mid-execution sees the verified
+facts, the failed attempts and the newly discovered requirements rather than only the
+failure text.
+
+The payload is *structured and level-labelled*, not a fused blob:
+
+* `verified_facts`, `unverified_observations` and `failed_attempts` are separate lists,
+  each entry carrying its tool, its provenance (`source`), its evidence class and
+  `evidence_authoritative`, its loop `iteration` and any error. A planner can therefore
+  tell an established fact from an unverified claim.
+* `outstanding_requirements` and `satisfied_requirements` carry `origin`, `source_ref`,
+  `account_specific` and `campaign_scoped` per requirement.
+* `campaign_facts` are labelled `scope: "campaign"` and
+  `shared_with_other_tasks_on_this_campaign: true`; they come only from campaign-scoped
+  memory read through the link, so no account- or wallet-specific claim can hide in them.
+* Timestamps are included where they exist (the context's `updated_at`, `resumed_at`).
+  Individual observations are attributed by iteration, because the table keeps no
+  created_at column and inventing one would be a false claim.
+* A task with no campaign gets `campaign_context=None` and an empty `campaign_facts`
+  list, and one task never receives another task's execution history.
+
+Resolution happens once per planning cycle (`begin_planning_cycle` clears the memo at
+the point where a context write may have occurred), so two planner calls in one cycle
+never read the same rows twice, and a context that has moved on is never served stale.
+
 ---
 
 ## Tests
 
+* `backend/tests/test_planning_context_integration.py` — the initial decomposition and the
+  replan paths receive the resolved task and campaign context, unrelated campaign data is
+  never injected, one task never receives another's history, and resolution is not
+  repeated inside a cycle.
 * `backend/tests/test_context_secret_exposure.py` — the leak suite. Each test asserts the
   behaviour that should hold and **failed against the previous code**, so it is evidence
   rather than intent: raw `external_state`, nested values, requirement text, error

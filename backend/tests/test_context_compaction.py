@@ -26,6 +26,7 @@ from backend.app.core.config import Settings, settings
 from backend.app.llm import token_budget as token_budget_module
 from backend.app.llm.client import FixedLLMClient, LLMError, Message
 from backend.app.llm.compaction import (
+    COMPACTION_SYSTEM_PROMPT,
     ContextCompactionError,
     ContextCompactor,
     TokenBudget,
@@ -208,6 +209,22 @@ def test_missing_or_malformed_usage_does_not_break_the_request(usage):
 # ==================================================================
 
 
+def _is_compaction_request(payload: dict) -> bool:
+    """True when a payload is the internal summarisation call, not a task request."""
+    messages = payload.get("messages") or []
+    if not messages:
+        return False
+    first = messages[0]
+    return first.get("role") == "system" and (
+        COMPACTION_SYSTEM_PROMPT.splitlines()[0] in (first.get("content") or "")
+    )
+
+
+def _task_requests(seen: list[dict]) -> list[dict]:
+    """Only the requests that are the actual task, never the compaction rounds."""
+    return [p for p in seen if not _is_compaction_request(p)]
+
+
 def _capture_client(monkeypatch, budget: TokenBudget, *, responder=None):
     """Install a client with a small budget and a recording transport."""
     client = FixedLLMClient()
@@ -256,7 +273,12 @@ async def test_json_completion_is_preflighted(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_json_delegation_does_not_compact_twice(monkeypatch):
-    """`complete_json` delegates to `complete`; compaction must run once."""
+    """`complete_json` delegates to `complete`; compaction runs exactly once.
+
+    One compaction cycle means one summarisation round here (the mocked model returns
+    an unusable summary, so the deterministic floor finishes the job) and exactly one
+    final task request. Two of either would mean the delegation compacted twice.
+    """
     budget = small_budget()
     client, seen = _capture_client(
         monkeypatch,
@@ -267,8 +289,9 @@ async def test_json_delegation_does_not_compact_twice(monkeypatch):
 
     await client.complete_json(messages)
 
-    assert len(seen) == 1, "one HTTP request means one preflight, not two"
-    sent = seen[0]["messages"]
+    assert len(_task_requests(seen)) == 1, "one preflight per task request, not two"
+    assert sum(_is_compaction_request(p) for p in seen) == 1, "one compaction cycle"
+    sent = _task_requests(seen)[0]["messages"]
     assert sum("[COMPACTED" in m["content"] for m in sent) <= 1
 
 
@@ -571,6 +594,17 @@ async def test_a_genuine_overflow_triggers_a_smaller_retry(monkeypatch):
     calls = {"n": 0}
 
     async def fake_post(path, payload):
+        # The compaction rounds are not task requests and always answer normally.
+        if _is_compaction_request(payload):
+            return {
+                "choices": [{
+                    "message": {
+                        "content": json.dumps(
+                            {"objective": "claim", "execution_state": "in progress"}
+                        )
+                    }
+                }]
+            }
         calls["n"] += 1
         seen.append(_tokens_of(payload["messages"]))
         if calls["n"] == 1:
@@ -579,7 +613,15 @@ async def test_a_genuine_overflow_triggers_a_smaller_retry(monkeypatch):
 
     monkeypatch.setattr(client, "_post", fake_post)
 
-    await client.complete([Message("system", SYSTEM), Message("user", body(120_000))])
+    # Deliberately BETWEEN the target and the trigger: this is the case the estimate
+    # cannot see. The request is under the normal compaction trigger, so nothing is
+    # compacted before it is submitted, and only the provider's own refusal reveals it
+    # is too large. The aggressive recovery must therefore compact here too - an
+    # early return on `estimated <= trigger` would resend the refused payload.
+    messages = [Message("system", SYSTEM), Message("user", body(40_000))]
+    assert budget.target < _tokens_of([m.to_payload() for m in messages]) <= budget.trigger
+
+    await client.complete(messages)
 
     assert calls["n"] == 2, "exactly one bounded recovery attempt"
     assert seen[1] < seen[0], "the retry must be materially smaller, never unchanged"
@@ -599,6 +641,8 @@ async def test_non_overflow_errors_are_never_treated_as_context_problems(monkeyp
     calls = {"n": 0}
 
     async def fake_post(path, payload):
+        if _is_compaction_request(payload):
+            return {"choices": [{"message": {"content": "{}"}}]}
         calls["n"] += 1
         raise LLMError("nope", category=category, retryable=False)
 
@@ -624,8 +668,11 @@ async def test_recovery_stops_after_the_configured_budget(monkeypatch):
         calls["n"] += 1
         raise LLMError("too long", category="CONTEXT_OVERFLOW", retryable=False)
 
+    async def passthrough_preflight(self, messages, aggressive=False):
+        return messages
+
     monkeypatch.setattr(client, "_post", fake_post)
-    monkeypatch.setattr(type(client), "_preflight", lambda self, messages, aggressive=False: messages)
+    monkeypatch.setattr(type(client), "_preflight", passthrough_preflight)
 
     from backend.app.core.config import settings
 

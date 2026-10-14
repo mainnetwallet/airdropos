@@ -570,6 +570,11 @@ class ObservationRecord:
     evidence_authoritative: bool = False
     observed_state: Dict[str, Any] = field(default_factory=dict)
     integration_ref: Optional[str] = None
+    # Which loop iteration produced this record, and what the tool said if it failed.
+    # Both are carried into the planner payload so a plan can be read against the run
+    # that generated it rather than as a flat, undated list of claims.
+    iteration: int = 0
+    error: Optional[str] = None
 
     @property
     def proved_completion(self) -> bool:
@@ -660,6 +665,116 @@ class ResolvedContext:
 
         text = "\n".join(parts)
         return text if max_chars is None else text[:max_chars]
+
+    def to_prompt_dict(self) -> Dict[str, Any]:
+        """The three context levels as structured, source-labelled planning input.
+
+        Deliberately not a single fused blob. Every entry keeps the level it came from,
+        how it was established, and where it was observed, because a planner that cannot
+        tell a verified fact from an unverified observation plans against a fiction. The
+        levels stay separated so a task with no campaign link cannot be handed campaign
+        facts, and a campaign-scoped fact is never presented as account state.
+        """
+        ctx = self.task_context
+        payload: Dict[str, Any] = {
+            "level": "task",
+            "isolated_to_task": True,
+            "goal": ctx.goal if ctx else None,
+            "normalized_objective": ctx.normalized_objective if ctx else None,
+            "success_criteria": list(ctx.success_criteria or []) if ctx else [],
+            "next_step_rationale": ctx.next_step_rationale if ctx else None,
+            "current_step_index": ctx.current_step_index if ctx else None,
+            "last_error": ctx.last_error if ctx else None,
+            "campaign_id": str(self.campaign_id) if self.campaign_id is not None else None,
+            # Timestamps where they exist. Context updates are stamped; individual
+            # observations are not (the table keeps no created_at column), so they are
+            # attributed by iteration instead of by an invented time.
+            "context_updated_at": (
+                ctx.updated_at.isoformat()
+                if ctx is not None and getattr(ctx, "updated_at", None)
+                else None
+            ),
+            "resumed_at": (
+                ctx.resumed_at.isoformat()
+                if ctx is not None and getattr(ctx, "resumed_at", None)
+                else None
+            ),
+            "resource_refs": dict(ctx.resource_refs or {}) if ctx else {},
+            "external_state": dict(ctx.external_state or {}) if ctx else {},
+            "unresolved_questions": list(ctx.unresolved_questions or []) if ctx else [],
+            "human_intervention": dict(ctx.human_intervention or {}) if ctx else {},
+            "authorization_state": dict(ctx.authorization_state or {}) if ctx else {},
+            "retry_summary": dict(ctx.retry_summary or {}) if ctx else {},
+        }
+
+        def _observation(record: ObservationRecord) -> Dict[str, Any]:
+            return {
+                "action": record.action,
+                "tool": record.tool,
+                "outcome": record.outcome,
+                # Provenance: which integration this was observed through, and the
+                # evidence class the verifier assigned it.
+                "source": record.integration_ref,
+                "evidence_kind": record.evidence_kind,
+                "evidence_authoritative": bool(record.evidence_authoritative),
+                "iteration": record.iteration,
+                "error": record.error,
+            }
+
+        payload["verified_facts"] = [
+            _observation(o) for o in self.observations if o.proved_completion
+        ]
+        payload["unverified_observations"] = [
+            _observation(o)
+            for o in self.observations
+            if o.outcome in (OUTCOME_UNVERIFIED, OUTCOME_ATTEMPTED, OUTCOME_EXECUTED)
+        ]
+        payload["failed_attempts"] = [
+            _observation(o)
+            for o in self.observations
+            if o.outcome in (OUTCOME_FAILED, OUTCOME_BLOCKED)
+        ]
+
+        def _requirement(req: Any) -> Dict[str, Any]:
+            return {
+                "text": req.text,
+                "status": req.status,
+                "origin": req.origin,
+                "source_ref": req.source_ref,
+                "account_specific": bool(req.is_account_specific),
+                "campaign_scoped": bool(req.is_campaign_scoped),
+            }
+
+        payload["outstanding_requirements"] = [
+            _requirement(r) for r in self.requirements if r.status == REQUIREMENT_DISCOVERED
+        ]
+        payload["satisfied_requirements"] = [
+            _requirement(r) for r in self.requirements if r.status == REQUIREMENT_SATISFIED
+        ]
+
+        # Campaign facts are campaign-wide by construction (`_campaign_facts` reads only
+        # campaign-scoped memory). They are labelled as such and never merged into the
+        # task's own state, so no account- or wallet-specific claim can hide in them.
+        payload["campaign_facts"] = [
+            {
+                "content": str(fact.get("content", "")),
+                "category": fact.get("category"),
+                "confidence": fact.get("confidence"),
+                "scope": "campaign",
+                "shared_with_other_tasks_on_this_campaign": True,
+            }
+            for fact in self.campaign_facts
+        ]
+        payload["global_facts"] = [
+            {
+                "content": str(fact.get("content", "")),
+                "category": fact.get("category"),
+                "confidence": fact.get("confidence"),
+                "scope": "global",
+            }
+            for fact in self.global_facts
+        ]
+        return payload
 
 
 class TaskContextService:
@@ -1140,6 +1255,8 @@ class TaskContextService:
                 evidence_authoritative=r.evidence_authoritative,
                 observed_state=r.observed_state or {},
                 integration_ref=r.integration_ref,
+                iteration=int(r.iteration or 0),
+                error=r.error,
             )
             for r in rows
         ]

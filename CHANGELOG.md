@@ -5,6 +5,47 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed (LLM-driven compaction, planned-from context, no chat history character cap)
+- **Context compaction is now LLM-driven.** `app/llm/compaction.py` asks the configured
+  fixed `LLM_MODEL_ID` for a strict-JSON, section-labelled summary of the reduceable
+  content instead of relying on deterministic head-and-tail elision alone. It is a
+  bounded, multi-round workflow: the request is re-estimated after every round, another
+  round runs only while the request is still over budget *and* the round made meaningful
+  progress, and it terminates on fitting, on `LLM_CONTEXT_COMPACTION_MAX_ROUNDS`, on an
+  unusable summary, or on insufficient progress. When it cannot be made safe it returns a
+  clear non-retryable `CONTEXT_TOO_LARGE` error. No second model, router or fallback is
+  introduced, and `LLM_MAX_TOKENS` stays unset by default.
+- **The compaction model call is a dedicated non-recursive path.**
+  `FixedLLMClient._compaction_summarize` builds the payload and posts it directly,
+  bypassing the budget preflight, so compaction can never re-enter itself. A new
+  `_in_compaction_call` guard refuses a nested compaction summarisation outright.
+- **Overflow recovery fixed.** The aggressive retry used to short-circuit on
+  `estimated <= trigger` and resend the payload the provider had just refused. It now
+  compacts in that case too, aiming straight at the target, and is covered by a
+  regression test.
+- **Compaction cannot weaken security.** System messages and the opening of the active
+  objective are never reduced; every trust/security label found in the reduced content is
+  re-emitted deterministically in a preserved-labels ledger; secrets are redacted with the
+  platform's existing `SECRET_PATTERNS` before any text reaches the compaction prompt;
+  and summaries stay request-local (nothing new is persisted).
+- **`CHAT_HISTORY_MAX_CHARS` (16,000) is removed.** `POST /agent/chat` no longer thins a
+  conversation by character count at the API boundary, which used to discard older turns
+  before the context pipeline could see them. History is bounded by turn count only, and
+  an oversized history is now compacted rather than pre-trimmed. The request model accepts
+  a longer transcript (a client sending its whole conversation no longer gets a 422).
+- **Initial planning receives the resolved task and campaign context.**
+  `AgentController._ensure_plan` resolves the task's context and passes it to
+  `Planner.decompose(context=...)`, plus the matching campaign snapshot as
+  `campaign_context=...` only when the task has an explicit campaign link. The replan
+  paths pass the same levels, so a revision sees verified facts, failed attempts and
+  newly discovered requirements. The payload is structured and level-labelled (verified
+  vs unverified vs failed, requirements with origin/provenance, campaign facts labelled
+  campaign-scoped, timestamps where they exist), one task never receives another's
+  history, and resolution happens once per planning cycle.
+- New settings: `LLM_CONTEXT_COMPACTION_MAX_ROUNDS` (default 4) and
+  `LLM_CONTEXT_COMPACTION_MIN_PROGRESS_FRACTION` (default 0.05); documented in
+  `.env.example`.
+
 ### Changed (no application-imposed LLM token limits or call-count cap)
 - **`LLM_MAX_TOKENS` no longer defaults to 4096.** Unset (blank in `.env`) means no
   output limit: `max_tokens` is omitted from normal, JSON-mode and streaming requests

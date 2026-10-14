@@ -197,6 +197,27 @@ class Settings(BaseSettings):
             "oversized payload can never succeed."
         ),
     )
+    LLM_CONTEXT_COMPACTION_MAX_ROUNDS: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description=(
+            "Maximum number of LLM summarisation rounds in a single compaction. Each "
+            "round asks the SAME fixed model for a tighter summary and re-estimates the "
+            "request. A ceiling, not the only termination condition: an unusable summary "
+            "or insufficient progress stops the loop sooner."
+        ),
+    )
+    LLM_CONTEXT_COMPACTION_MIN_PROGRESS_FRACTION: float = Field(
+        default=0.05,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Fraction of the request a compaction round must remove for another round "
+            "to run. Below it the round made no meaningful progress, so compaction stops "
+            "rather than re-summarising effectively the same context forever."
+        ),
+    )
     LLM_CONTEXT_ESTIMATOR_CHARS_PER_TOKEN: float = Field(
         default=3.0,
         ge=1.5,

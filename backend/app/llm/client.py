@@ -11,9 +11,14 @@ INPUT CONTEXT BUDGET
 --------------------
 `complete` and `stream` run a token preflight before submitting. A request that
 fits the configured budget is sent byte-for-byte as built, with no rewriting of
-any kind. A request that cannot fit is reduced by `llm.compaction`, which never
-touches a system message or the active objective and never discards content
-silently. See `llm/compaction.py` for why that is the rule and not a preference.
+any kind. A request that cannot fit is reduced by `llm.compaction`, which now asks
+the SAME fixed model for a bounded, structured summary - it never touches a system
+message or the active objective, and never discards content silently. See
+`llm/compaction.py` for the workflow and its termination policy.
+
+Compaction calls the model through `_compaction_summarize`, a private path that
+skips the budget preflight entirely. Without that, a compaction request would need
+compacting itself, which is exactly the recursion it must not have.
 
 This is strictly an INPUT concern. It has nothing to do with `LLM_MAX_TOKENS`,
 which is an OUTPUT limit and remains unset by default, leaving `max_tokens` off
@@ -41,11 +46,17 @@ from backend.app.llm.token_budget import TokenBudget, count_request_tokens, reco
 
 logger = logging.getLogger(__name__)
 
-# Set while compaction is running so a nested request can never re-enter the
-# guarded path and recurse. Compaction itself makes no model calls, so this is
-# a safety property rather than a currently-exercised one.
+# Set while the budget preflight (and therefore compaction) is running, so a nested
+# normal request can never re-enter the guarded path and recurse.
 _in_compaction: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "airdropos_llm_in_compaction", default=False
+)
+
+# Set while the compaction summarisation call is in flight. That path deliberately
+# bypasses the preflight, so this flag is what stops it from ever being re-entered:
+# a compaction request can never trigger a second compaction.
+_in_compaction_call: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "airdropos_llm_compaction_call", default=False
 )
 
 
@@ -256,49 +267,100 @@ class FixedLLMClient:
     def in_compaction(self) -> bool:
         return _in_compaction.get()
 
-    def _preflight(self, messages: List[Message], *, aggressive: bool = False) -> List[Message]:
+    async def _preflight(
+        self, messages: List[Message], *, aggressive: bool = False
+    ) -> List[Message]:
         """Size-check and, only if necessary, reduce a request.
 
         A request inside the budget returns the identical list of identical
         message objects, so the overwhelming majority of calls pay a token count
         and nothing else.
+
+        `aggressive` exists for the one case the estimate cannot see: the provider
+        itself refused a request that was under the trigger. It must therefore NOT
+        short-circuit on `estimated <= trigger`, or the recovery retry would resend the
+        very payload that was just refused.
         """
         from backend.app.llm.compaction import build_compactor
 
         budget = self.budget
         estimated = count_request_tokens(messages)
-        if estimated <= budget.trigger:
+        if estimated <= budget.trigger and not aggressive:
             return messages
 
         logger.info(
-            "llm.context preflight: estimated=%s trigger=%s usable=%s window=%s; compacting",
+            "llm.context preflight: estimated=%s trigger=%s usable=%s window=%s aggressive=%s",
             estimated,
             budget.trigger,
             budget.usable_input,
             budget.context_window,
+            aggressive,
         )
 
         token = _in_compaction.set(True)
         try:
-            compactor = build_compactor(budget)
-            result = compactor.preflight(messages, aggressive=aggressive)
+            compactor = build_compactor(budget, summarizer=self._compaction_summarize)
+            result = await compactor.compact_request(messages, aggressive=aggressive)
         finally:
             _in_compaction.reset(token)
 
         report = result.report
         logger.info(
             "llm.context compacted: estimated=%s -> counted=%s strategies=%s reduced=%s "
-            "removed_chars=%s references=%s",
+            "llm_rounds=%s removed_chars=%s references=%s",
             report.original_tokens,
             report.final_tokens,
             ",".join(report.strategies) or "none",
             report.messages_reduced,
+            report.llm_rounds,
             report.characters_removed,
             report.references_emitted,
         )
         return result.messages
 
-    def _try_preflight(self, messages: List[Message], *, aggressive: bool = False) -> List[Message]:
+    async def _compaction_summarize(self, messages: List[Message]) -> Optional[str]:
+        """Ask the fixed model to summarise context for compaction - no recursion.
+
+        This is a DEDICATED internal path: it builds the payload and posts it directly,
+        bypassing the budget preflight. Going through `complete()` instead would make
+        compaction depend on compaction, which for an oversized request is an infinite
+        regress. `_in_compaction_call` guards the path against ever being re-entered.
+
+        The model is the same locked `LLM_MODEL_ID` as every other call. No routing, no
+        fallback and no model switching is introduced here, and the output-token limit is
+        left exactly as configured (unset by default).
+        """
+        if _in_compaction_call.get():
+            logger.warning("Refusing a nested compaction summarisation call")
+            return None
+
+        token = _in_compaction_call.set(True)
+        try:
+            payload = self._build_payload(messages, temperature=0.0, json_mode=True)
+            try:
+                raw = await self._post("/chat/completions", payload)
+            except LLMError as exc:
+                logger.warning(
+                    "LLM compaction round could not complete (%s); falling back.", exc.category
+                )
+                return None
+            record_usage(count_request_tokens(messages), raw.get("usage"))
+            try:
+                response = self._normalize(raw)
+            except LLMError as exc:
+                logger.warning(
+                    "LLM compaction round produced an unusable reply (%s); falling back.",
+                    exc.category,
+                )
+                return None
+            self._record_served_model(response.model)
+            return response.content
+        finally:
+            _in_compaction_call.reset(token)
+
+    async def _try_preflight(
+        self, messages: List[Message], *, aggressive: bool = False
+    ) -> List[Message]:
         """Preflight, surfacing "cannot fit" as the error type callers already handle.
 
         `ContextCompactionError` deliberately does not inherit from `LLMError`,
@@ -309,7 +371,7 @@ class FixedLLMClient:
         the operator still gets the actionable explanation.
         """
         try:
-            return self._preflight(messages, aggressive=aggressive)
+            return await self._preflight(messages, aggressive=aggressive)
         except ContextCompactionError as exc:
             raise LLMError(str(exc), category="CONTEXT_TOO_LARGE", retryable=False) from exc
 
@@ -325,17 +387,18 @@ class FixedLLMClient:
         stop: Optional[List[str]] = None,
     ) -> LLMResponse:
         """Execute a chat completion against the single fixed model."""
-        if self.in_compaction:
-            # Reached only if compaction ever grows a model call. Compacting a
-            # request by making a request that needs the same compaction would
-            # recurse, so it is refused rather than retried.
+        if self.in_compaction or _in_compaction_call.get():
+            # Compacting a request by making a request that needs the same compaction
+            # would recurse, so it is refused rather than retried. The dedicated
+            # summarisation path (`_compaction_summarize`) uses the transport directly
+            # and never arrives here.
             raise LLMError(
                 "A nested LLM request was made while compaction was running.",
                 category="COMPACTION_RECURSION",
                 retryable=False,
             )
 
-        prepared = self._try_preflight(messages)
+        prepared = await self._try_preflight(messages)
 
         attempts = 0
         while True:
@@ -373,7 +436,7 @@ class FixedLLMClient:
                 # A smaller request is required. Retrying the same payload could
                 # only fail the same way, so the retry is built from a harder
                 # reduction and recounted before it is sent.
-                prepared = self._try_preflight(messages, aggressive=True)
+                prepared = await self._try_preflight(messages, aggressive=True)
                 if count_request_tokens(prepared) >= estimated:
                     raise LLMError(
                         "The provider reported a context overflow but the request could not "
@@ -552,7 +615,7 @@ class FixedLLMClient:
         max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
         """Stream tokens from the single fixed model for chat UIs."""
-        if self.in_compaction:
+        if self.in_compaction or _in_compaction_call.get():
             raise LLMError(
                 "A nested LLM request was made while compaction was running.",
                 category="COMPACTION_RECURSION",
@@ -561,7 +624,7 @@ class FixedLLMClient:
 
         # Preflight runs BEFORE the stream opens, because once the first token
         # has been handed to the caller a retry is no longer transparent.
-        prepared = self._try_preflight(messages)
+        prepared = await self._try_preflight(messages)
         payload = self._build_payload(
             prepared, temperature=temperature, max_tokens=max_tokens, stream=True
         )

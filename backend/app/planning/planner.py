@@ -750,6 +750,8 @@ Produce EXACTLY this JSON shape:
         constraints: Optional[PlanConstraints] = None,
         context_notes: Optional[Sequence[str]] = None,
         evidence: Optional[Sequence[Dict[str, Any]]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        campaign_context: Optional[Dict[str, Any]] = None,
     ) -> ExecutionPlanSpec:
         """Revise a plan after failure, external change, budget pressure, or a discovery.
 
@@ -762,6 +764,12 @@ Produce EXACTLY this JSON shape:
         grew a step, which is the case the specification calls discovering requirements
         while executing. `evidence` carries the proven actions so a revision never
         re-proposes work that is already done.
+
+        `context` and `campaign_context` carry the same resolved, source-labelled levels the
+        initial decomposition gets, so a revision planned mid-execution sees the verified
+        facts, the failed attempts and the newly discovered requirements rather than only the
+        failure text. Both stay optional and are omitted entirely when absent, so a task with
+        no context (or no campaign) produces exactly the prompt it did before.
         """
         constraints = constraints or PlanConstraints(
             spent_already_usd=task.actual_cost_usd,
@@ -778,6 +786,11 @@ Produce EXACTLY this JSON shape:
         catalog = self.registry.catalog_for_llm() if self.registry else []
         catalog_text = "\n".join(f"- {t['name']}: {t['description']}" for t in catalog) or "(none)"
 
+        campaign_section = (
+            f"CAMPAIGN CONTEXT:\n{_json(campaign_context)}" if campaign_context else ""
+        )
+        context_section = f"ADDITIONAL CONTEXT:\n{_json(context)}" if context else ""
+
         user = f"""OBJECTIVE (unchanged): {current_spec.objective}
 
 REPLAN TRIGGER: {trigger.value}
@@ -793,6 +806,8 @@ STEPS THAT FAILED OR REMAIN:
 {_json([{"index": s.index, "description": s.description, "kind": s.kind.value, "failure": s.failure_reason} for s in current_spec.steps if s.status not in ("completed", "skipped")])}
 {_section("REQUIREMENTS DISCOVERED WHILE EXECUTING (an external system stated these; your new plan MUST cover every one that is still outstanding, and MUST NOT claim any is already done)", list(context_notes or []))}
 {_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}
+{campaign_section}
+{context_section}
 CONSTRAINTS (hard limits):
 {_json(constraints.to_dict())}
 

@@ -161,29 +161,38 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=8000)
     # Earlier turns of this conversation (oldest first), so the model remembers
     # what was already said and can continue instead of starting from zero.
-    history: List[ChatTurn] = Field(default_factory=list, max_length=60)
+    #
+    # The bound is a request-size guard, not a conversation limit: a client that sends
+    # its whole transcript is accepted and the server keeps the most recent turns. A
+    # tight bound here previously turned a long conversation into an opaque 422 the
+    # moment it grew past the limit.
+    history: List[ChatTurn] = Field(default_factory=list, max_length=200)
 
 
-# Context budget for remembered turns. The system prompt is already large, so the
-# history is trimmed from the OLDEST end once it exceeds these limits.
+# Remembered turns are bounded by COUNT only, never by characters.
+#
+# There is deliberately no CHAT_HISTORY_MAX_CHARS: a character cap here discarded
+# older turns BEFORE the token-aware context pipeline could see them, so a long,
+# information-rich conversation was silently thinned at the API boundary and
+# compaction never got the chance to decide what mattered. Ordering, roles and the
+# tool-call/tool-result relationships are preserved; an oversized history is now
+# handled by `llm.compaction` (which re-estimates and asks the fixed model for a
+# bounded, labelled summary) rather than by dropping valid messages on length.
 CHAT_HISTORY_MAX_TURNS = 24
-CHAT_HISTORY_MAX_CHARS = 16000
 
 
 def _trim_history(history: List["ChatTurn"]) -> List["ChatTurn"]:
-    recent = [t for t in history if t.content.strip()][-CHAT_HISTORY_MAX_TURNS:]
-    kept: List["ChatTurn"] = []
-    total = 0
-    for turn in reversed(recent):
-        total += len(turn.content)
-        if total > CHAT_HISTORY_MAX_CHARS and kept:
-            break
-        kept.append(turn)
-    kept.reverse()
+    """Most recent turns: empty ones dropped, recent ones kept whole.
+
+    No length-based reduction happens here. A message is never removed because the
+    conversation is long; that decision belongs to the context budget, which can
+    actually see token counts and can compact instead of deleting.
+    """
+    recent = [t for t in history if t.content and t.content.strip()][-CHAT_HISTORY_MAX_TURNS:]
     # Providers expect the conversation to start with a user turn.
-    while kept and kept[0].role != "user":
-        kept.pop(0)
-    return kept
+    while recent and recent[0].role != "user":
+        recent.pop(0)
+    return recent
 
 
 class AutonomyCheckRequest(BaseModel):
