@@ -314,6 +314,46 @@ class PlanConstraints:
 # ======================================================================
 # LLM decomposition
 # ======================================================================
+# Keyword hints that map a free-text verification method the model wrote onto a concrete
+# method the controller recognises (controller.EVIDENCE_KINDS). Matching is conservative: only
+# an unambiguous phrase is mapped, anything else stays as written and is treated as UNVERIFIED
+# by the controller, never silently upgraded.
+_VERIFICATION_HINTS = (
+    (("wallet address", "get_wallet_address", "evm address", "0x address"), "wallet_record"),
+    (("chain receipt", "transaction receipt", "tx receipt"), "chain_receipt"),
+    (("tx hash", "transaction hash"), "tx_hash"),
+    (("screenshot",), "screenshot"),
+    (("http status", "status code"), "http_status"),
+)
+
+
+def normalize_verification_method(raw: Any, description: str = "") -> str:
+    """Return a recognised verification method where the model's text clearly names one.
+
+    The planner is told to use the concrete methods, but models still write sentences such as
+    "verify that get_wallet_address returns a valid 0x public evm address". Those matched
+    nothing and left a genuinely successful step UNVERIFIED. An exact known method is kept;
+    a sentence is mapped only when it unambiguously names exactly one known method.
+    """
+    # Imported here: the controller imports this module, so a top-level import would be circular.
+    from backend.app.agent.controller import EVIDENCE_KINDS, GENERIC_EVIDENCE_METHODS
+
+    text = str(raw or "").strip()
+    if not text:
+        return "unspecified"
+    lowered = text.lower()
+    if lowered in EVIDENCE_KINDS or lowered in GENERIC_EVIDENCE_METHODS or lowered == "unspecified":
+        return lowered
+    matches = {
+        method
+        for phrases, method in _VERIFICATION_HINTS
+        if any(phrase in lowered for phrase in phrases)
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    return text
+
+
 PLANNER_SYSTEM_PROMPT = """You are the planning engine of AirdropOS.
 
 You produce STRICT JSON. Never produce prose outside JSON.
@@ -352,7 +392,12 @@ Hard rules:
     wallet signature), set "tool" to null, kind to "human_verification" or
     "user_intervention", and describe exactly what the operator must do. The task
     will PAUSE and ask the operator rather than fail or pretend it succeeded.
-12. Prefer one real tool call per step. A step that changes the world and a step
+12. "verification_method" MUST be one short identifier, not a sentence: chain_receipt,
+    tx_hash, simulation, page_observation, post_action_observation, screenshot,
+    visible_text, http_status, source_scan, notification_delivered, prepared_transfer,
+    contract_read, wallet_record, record_read, or tool_evidence. Put the detail of what
+    must be true in "expected_evidence", never in "verification_method".
+13. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """
 
@@ -378,6 +423,22 @@ class Planner:
     def __init__(self, db: AsyncSession, registry: Optional[ToolRegistry] = None) -> None:
         self.db = db
         self.registry = registry
+
+    async def _release_write_lock(self) -> None:
+        """Commit pending writes before a slow LLM call.
+
+        The API, the worker and the gateway share one SQLite file. A flushed-but-uncommitted
+        write holds the database write lock until commit, so keeping it open across an LLM
+        round trip (many seconds) starves every other writer: worker heartbeats and the API's
+        session bookkeeping then time out with "database is locked". Committing first keeps
+        the lock window short. Objects stay usable (expire_on_commit=False).
+        """
+        try:
+            await self.db.commit()
+        except Exception:  # pragma: no cover - never let lock hygiene break planning
+            logger.warning("Could not commit before the planner LLM call", exc_info=True)
+            await self.db.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Decomposition
@@ -442,6 +503,7 @@ Produce EXACTLY this JSON shape:
   ]
 }}
 """
+        await self._release_write_lock()
         try:
             result = await llm.complete_json(
                 [Message("system", PLANNER_SYSTEM_PROMPT), Message("user", user)]
@@ -507,7 +569,9 @@ Produce EXACTLY this JSON shape:
                     parameters=raw.get("parameters") if isinstance(raw.get("parameters"), dict) else {},
                     depends_on=depends_on,
                     prerequisites=[str(p) for p in (raw.get("prerequisites") or [])],
-                    verification_method=str(raw.get("verification_method") or "unspecified"),
+                    verification_method=normalize_verification_method(
+                        raw.get("verification_method"), description
+                    ),
                     verification_tool=str(verification_tool) if verification_tool else None,
                     expected_evidence=str(raw.get("expected_evidence") or ""),
                     estimated_cost_usd=float(raw.get("estimated_cost_usd") or 0.0),
@@ -838,6 +902,7 @@ Produce EXACTLY this JSON shape:
   ]
 }}
 """
+        await self._release_write_lock()
         try:
             result = await llm.complete_json(
                 [Message("system", REPLAN_SYSTEM_PROMPT), Message("user", user)]
