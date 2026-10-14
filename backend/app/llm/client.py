@@ -401,6 +401,7 @@ class FixedLLMClient:
         prepared = await self._try_preflight(messages)
 
         attempts = 0
+        empty_retries = 0
         while True:
             payload = self._build_payload(
                 prepared,
@@ -446,10 +447,30 @@ class FixedLLMClient:
                     )
                 continue
 
+            # A router picks the model per request, and a reasoning model sometimes spends
+            # its whole reply thinking and returns no content. That is transient: the same
+            # request often succeeds on the next call, so retry a bounded number of times
+            # instead of failing the operator's message on the first empty reply.
+            try:
+                response = self._normalize(raw)
+            except LLMError as exc:
+                if (
+                    exc.category == "EMPTY_CONTENT"
+                    and empty_retries < settings.LLM_EMPTY_CONTENT_MAX_RETRIES
+                ):
+                    empty_retries += 1
+                    record_usage(estimated, raw.get("usage"))
+                    logger.warning(
+                        "llm.empty_content the model returned reasoning but no answer; "
+                        "retrying the same request (%s/%s)",
+                        empty_retries,
+                        settings.LLM_EMPTY_CONTENT_MAX_RETRIES,
+                    )
+                    continue
+                raise
             break
 
         record_usage(estimated, raw.get("usage"))
-        response = self._normalize(raw)
         self._record_served_model(response.model)
         return response
 

@@ -631,6 +631,7 @@ python -m pytest backend/tests/ -q
 | `Docker could not start PostgreSQL` / `Cannot reach the database` | Start Docker Desktop and wait for "Engine running", or use `--sqlite`. |
 | Cannot log in / bootstrap returns 503 | Run `run.py --set-password` (Docker: set `OPERATOR_PASSWORD_HASH` in `.env`). |
 | Task stuck in `RETRYING`/`FAILED`, worker log says `no such column: ...` | Your SQLite file was made by an older version. `py run.py` now adds missing columns automatically at startup (it backs up `airdropos.db` first and only adds columns), so `git pull` then `py run.py` is enough. Then create the task again or press Retry (a task that already hit its retry limit is `FAILED`). PostgreSQL: `alembic upgrade head`. To only check, run `python scripts/sqlite_add_missing_columns.py`. |
+| Chat says `Blocked: The configured model is unavailable (EMPTY_CONTENT)` | The model spent its whole reply on reasoning and returned no answer (common with routers and reasoning models). The app now resends up to `LLM_EMPTY_CONTENT_MAX_RETRIES` times (default 2). If it still happens, send the message again, shorten it, or set `LLM_MAX_TOKENS` (e.g. `8000`) so the reply has room, or pick a non-reasoning model on your router. |
 | `ModuleNotFoundError: backend` | Run from the repository root (the folder with `run.py`). |
 | `WALLET_VAULT_MASTER_KEY must be exactly 64 hex characters` | Use `openssl rand -hex 32` or `py -c "import secrets; print(secrets.token_hex(32))"`. |
 | Port 8000 / 5173 / 3000 already in use | Stop the other program, or change the port. |

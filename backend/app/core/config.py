@@ -124,6 +124,16 @@ class Settings(BaseSettings):
             "limit in force. Set it only if your provider requires one."
         ),
     )
+    LLM_EMPTY_CONTENT_MAX_RETRIES: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description=(
+            "How many times to resend a request when the model returned reasoning but no "
+            "answer (EMPTY_CONTENT). Common with routers and reasoning models, and usually "
+            "gone on the next call. 0 disables the retry."
+        ),
+    )
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
     LLM_MAX_RETRIES: int = Field(default=3)
 
