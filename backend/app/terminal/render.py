@@ -32,11 +32,12 @@ reference image cannot be reproduced literally:
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from rich.align import Align
 from rich.cells import cell_len
-from rich.console import Group, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.padding import Padding
 from rich.panel import Panel
 from rich.table import Table
@@ -242,17 +243,28 @@ def _middle_pref(state: RuntimeState, width: int) -> int:
 # ----------------------------------------------------------------------
 # Header
 # ----------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _edge_slack() -> int:
+    """Cells rich leaves unused at the right edge of the console.
+
+    A legacy Windows console cannot draw into its last column, so rich renders into
+    ``width - 1`` cells there and folds a renderable exactly ``width`` cells wide onto a
+    second row. Every other terminal draws the full width. Ask rich rather than
+    assume: hard-coding either answer is wrong on the other platform.
+    """
+    return 1 if Console().legacy_windows else 0
+
+
 def _rule(width: int) -> Text:
     """A gradient rule that occupies exactly one terminal row.
 
-    ``theme.gradient_rule(width)`` emits exactly ``width`` cells. In a console that is
-    exactly ``width`` wide, rich folds that onto a second row - it breaks after
-    ``width - 1`` cells and leaves the final cell on a line of its own. The layout
-    budget counts a rule as one row, so a rule built at the full width silently cost
-    two, and the dashboard came out two rows taller than the window and scrolled on
-    every redraw. One cell short of the width is the longest rule that stays on one row.
+    ``theme.gradient_rule(width)`` emits exactly ``width`` cells. On a console with edge
+    slack (see ``_edge_slack``) rich folds that onto a second row, and the layout budget
+    counts a rule as one row, so a full-width rule would silently cost two and the
+    dashboard would come out two rows taller than the window and scroll on every redraw.
+    The rule is therefore built as wide as rich will actually draw on one row.
     """
-    return Text.from_markup(theme.gradient_rule(max(1, int(width) - 1)))
+    return Text.from_markup(theme.gradient_rule(max(1, int(width) - _edge_slack())))
 
 
 def _header_block(state: RuntimeState, width: int, height: int) -> Tuple[RenderableType, int]:
@@ -898,14 +910,14 @@ def _bottom_row(state: RuntimeState, width: int, height: int, top: int = 0) -> R
         subtitle=alr_text,
     )
     border_row = top + height - 1
-    # A renderable exactly `width` cells wide is NOT drawn `width` cells wide: rich
-    # breaks after `width - 1` and leaves the final cell on a line of its own (the same
-    # behaviour that made a full-width rule cost two rows). A panel row laid out to the
-    # full width therefore comes out one cell narrower than its own geometry says, and
-    # any click target derived from that geometry lands one cell to the right of the
-    # drawn button. Laying the row out in the width rich actually draws keeps the
-    # border, the subtitle and the recorded target in agreement.
-    drawable = max(1, width - 1)
+    # On a console with edge slack (see `_edge_slack`) a renderable exactly `width` cells
+    # wide is NOT drawn `width` cells wide: rich breaks after `width - 1` and leaves the
+    # final cell on a line of its own. A panel row laid out to the full width would then
+    # come out one cell narrower than its own geometry says, and any click target derived
+    # from that geometry would land one cell to the right of the drawn button. Laying the
+    # row out in the width rich actually draws keeps the border, the subtitle and the
+    # recorded target in agreement.
+    drawable = max(1, width - _edge_slack())
     if width < 90:
         # Not enough width for both: show whichever matters right now.
         if state.alerts:

@@ -279,12 +279,14 @@ class PlanConstraints:
         budget nobody asked for. An operator who sets either one gets it applied here
         exactly as before.
         """
+        daily_left = (
+            None
+            if self.max_daily_spend_usd is None
+            else self.max_daily_spend_usd - self.spent_already_usd
+        )
         limits = [
             limit
-            for limit in (
-                self.max_cost_usd,
-                self.max_daily_spend_usd - self.spent_already_usd,
-            )
+            for limit in (self.max_cost_usd, daily_left)
             if limit is not None
         ]
         if not limits:

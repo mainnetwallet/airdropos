@@ -1434,10 +1434,15 @@ class TestLiveSessionVerification:
 # ======================================================================
 class TestTelegramVerificationUsesTheOwningClient:
     @pytest.mark.asyncio
-    async def test_verifier_never_constructs_a_second_telethon_client(self, monkeypatch):
+    async def test_verifier_never_constructs_a_second_telethon_client(self, monkeypatch, tmp_path):
         """It must ask the worker that owns the client, not open its own on the same file."""
         from backend.app.core import config as config_mod
 
+        # The readiness pre-check looks for a session file on disk. Point it at a
+        # throwaway one so the test does not depend on the machine it runs on.
+        session_base = tmp_path / "agent"
+        (tmp_path / "agent.session").write_bytes(b"")
+        monkeypatch.setattr(config_mod.settings, "TELEGRAM_SESSION_PATH", str(session_base), raising=False)
         monkeypatch.setattr(config_mod.settings, "TELEGRAM_USER_ENABLED", True, raising=False)
         monkeypatch.setattr(config_mod.settings, "TELEGRAM_API_ID", 12345, raising=False)
         monkeypatch.setattr(config_mod.settings, "TELEGRAM_API_HASH", "hash", raising=False)

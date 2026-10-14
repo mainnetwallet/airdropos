@@ -1442,7 +1442,14 @@ class AgentController:
             )
 
         # Budget pressure is a distinct trigger worth reporting accurately.
-        if trigger is ReplanTrigger.FAILURE and plan.total_cost() > settings.MAX_TRANSACTION_VALUE_USD:
+        # The per-transaction ceiling is optional; with none configured there is no
+        # budget to be under pressure from.
+        tx_ceiling = settings.MAX_TRANSACTION_VALUE_USD
+        if (
+            trigger is ReplanTrigger.FAILURE
+            and tx_ceiling is not None
+            and plan.total_cost() > tx_ceiling
+        ):
             trigger = ReplanTrigger.BUDGET
 
         context_payload, campaign_payload = await self._resolved_planning_context(task)
