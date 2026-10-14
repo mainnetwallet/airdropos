@@ -4,6 +4,9 @@ Read endpoints need `read`. Sending a reply needs `agent_chat` because it is a c
 action, plus `task_write` because a sufficiently clear reply can requeue a task -- an
 informational message never does, which is enforced in the reply router rather than here.
 
+Deleting a conversation removes the conversation, its messages and its intervention requests
+and nothing else: the Task it belongs to is never read for modification, cancelled or deleted.
+
 Every handler resolves the conversation server-side and checks ownership against the stored
 record. A task id from the request body is never trusted on its own.
 """
@@ -26,7 +29,7 @@ from backend.app.inbox.service import (
 )
 from backend.app.models import AgentConversation, Task
 from backend.app.security.auth import Principal, Scope, enforce_rate_limit, require_scopes, write_audit
-from backend.app.tasks.state_machine import TaskStatus
+from backend.app.tasks.state_machine import TERMINAL_STATES, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +218,64 @@ async def send_message(
     )
     await db.commit()
     return outcome.to_dict()
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_scopes(Scope.AGENT_CHAT)),
+) -> Dict[str, Any]:
+    """Delete one conversation, its messages and its intervention requests.
+
+    The Task is left exactly as it is. If that task later needs a person again, a new
+    conversation with a new id is opened; this one is never reused.
+
+    Refused (409) while a request is still waiting on the operator and the task is not
+    finished: deleting it would leave a parked task with no way to reply and resume. Once the
+    request is answered, or the task has finished, the conversation can be removed.
+    """
+    enforce_rate_limit(request, "write")
+
+    conversation = await _load_owned_conversation(db, _as_uuid(conversation_id), principal)
+
+    task: Optional[Task] = None
+    if conversation.task_id is not None:
+        task = await db.get(Task, conversation.task_id)
+
+    pending = await InterventionService(db).active_for_conversation(conversation.id)
+    if pending is not None and task is not None and task.status not in {
+        s.value for s in TERMINAL_STATES
+    }:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Task {task.task_id} is still waiting on your input in this conversation. "
+                "Reply to it (or cancel the task) before deleting the conversation."
+            ),
+        )
+
+    task_public_id = task.task_id if task is not None else None
+    removed = await ConversationService(db).delete_conversation(conversation)
+    # Audited in the same transaction as the delete, so the record and the deletion stand or
+    # fall together. The audit holds ids and counts only, never message content.
+    await write_audit(
+        db,
+        principal,
+        "AGENT_INBOX_CONVERSATION_DELETE",
+        "conversation",
+        str(conversation_id),
+        before_state={"task_id": task_public_id},
+        after_state={"deleted": True, **removed},
+    )
+    await db.commit()
+    return {
+        "conversation_id": str(conversation_id),
+        "task_id": task_public_id,
+        "deleted": True,
+        **removed,
+    }
 
 
 @router.get("/summary")

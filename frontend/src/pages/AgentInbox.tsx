@@ -11,7 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import clsx from 'clsx'
 import {
@@ -26,6 +26,7 @@ import {
   Search,
   Send,
   ShieldQuestion,
+  Trash2,
 } from 'lucide-react'
 
 import { Alert, EmptyState, ErrorState, Loading, ProgressBar, StatusBadge } from '@/components/ui'
@@ -471,6 +472,7 @@ function ConversationPane({
   error,
   onRetry,
   onSent,
+  onDeleted,
   liveEvent,
 }: {
   detail: InboxConversationDetail | undefined
@@ -478,9 +480,17 @@ function ConversationPane({
   error: unknown
   onRetry: () => void
   onSent: (result: InboxReplyResult) => void
+  onDeleted: (conversationId: string) => void
   liveEvent: string | null
 }) {
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  // Removes the conversation only. The task it belongs to is left exactly as it is, and a
+  // later request for the same task opens a new conversation.
+  const remove = useMutation({
+    mutationFn: (conversationId: string) => api.deleteInboxConversation(conversationId),
+    onSuccess: (_result, conversationId) => onDeleted(conversationId),
+  })
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ block: 'end' })
@@ -505,6 +515,20 @@ function ConversationPane({
   }
 
   const status = detail.task?.status ?? detail.task_status
+  // The server refuses to delete a conversation that is still waiting on the operator while its
+  // task is unfinished, because that would strand the task. Mirror it so the button explains
+  // itself instead of failing.
+  const waitingOnYou = detail.requires_reply && !(status && TERMINAL_STATUSES.has(status))
+
+  const handleDelete = () => {
+    if (waitingOnYou || remove.isPending) return
+    const label = detail.task_id ? ` for task ${detail.task_id}` : ''
+    const confirmed = window.confirm(
+      `Delete this conversation${label}? Its messages are removed permanently. ` +
+        'The task itself is not changed. If it needs your input again, a new conversation is opened.',
+    )
+    if (confirmed) remove.mutate(detail.conversation_id)
+  }
 
   return (
     <>
@@ -517,7 +541,35 @@ function ConversationPane({
               Waiting for your reply
             </span>
           )}
+          <button
+            type="button"
+            onClick={handleDelete}
+            disabled={waitingOnYou || remove.isPending}
+            title={
+              waitingOnYou
+                ? 'Reply to this request or cancel the task before deleting the conversation.'
+                : 'Delete this conversation. The task is not changed.'
+            }
+            className={clsx(
+              'flex min-h-[32px] items-center gap-1.5 rounded-md border border-surface-300 px-2 py-1 text-xs text-slate-300 hover:border-status-error/60 hover:text-status-error disabled:cursor-not-allowed disabled:opacity-50',
+              !detail.requires_reply && 'ml-auto',
+            )}
+          >
+            {remove.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Trash2 className="h-3.5 w-3.5" />
+            )}
+            Delete
+          </button>
         </div>
+        {remove.isError && (
+          <div className="mt-2">
+            <Alert kind="error">
+              {remove.error instanceof Error ? remove.error.message : 'The conversation could not be deleted.'}
+            </Alert>
+          </div>
+        )}
         <h2 className="mt-1 truncate text-base font-semibold text-slate-100">
           {detail.title ?? 'Untitled task'}
         </h2>
@@ -810,6 +862,23 @@ export default function AgentInbox() {
     [queryClient, selectedId],
   )
 
+  const onDeleted = useCallback(
+    (conversationId: string) => {
+      setNotice(null)
+      queryClient.removeQueries({ queryKey: ['agent-inbox-conversation', conversationId] })
+      void queryClient.invalidateQueries({ queryKey: ['agent-inbox'] })
+      void queryClient.invalidateQueries({ queryKey: ['inbox-summary'] })
+      // Leave the deleted conversation. The task and its page are unaffected, so nothing
+      // under ['task', ...] is invalidated.
+      setParams((prev) => {
+        const next = new URLSearchParams(prev)
+        next.delete('conversation')
+        return next
+      })
+    },
+    [queryClient, setParams],
+  )
+
   const select = (id: string) => {
     setNotice(null)
     setParams((prev) => {
@@ -885,6 +954,7 @@ export default function AgentInbox() {
           error={detailQuery.error}
           onRetry={() => void detailQuery.refetch()}
           onSent={onSent}
+          onDeleted={onDeleted}
           liveEvent={liveEvent}
         />
         <TaskDetailsDrawer taskId={selectedTaskId} />

@@ -294,11 +294,20 @@ export default function TaskManagerPage() {
     onSuccess: () => {
       selectTask(null)
       queryClient.invalidateQueries({ queryKey: ['tasks'] })
+      // The task's Agent Inbox conversation is deleted with it, so refresh the Inbox too.
+      queryClient.invalidateQueries({ queryKey: ['agent-inbox'] })
+      queryClient.invalidateQueries({ queryKey: ['inbox-summary'] })
+      queryClient.removeQueries({ queryKey: ['agent-inbox-conversation'] })
     },
   })
 
   const handleDelete = (id: string) => {
-    if (window.confirm(`Delete task ${id} permanently? This cannot be undone.`)) {
+    if (
+      window.confirm(
+        `Delete task ${id} permanently? Its Agent Inbox conversation and messages are deleted ` +
+          'with it. This cannot be undone.',
+      )
+    ) {
       remove.mutate(id)
     }
   }

@@ -141,6 +141,8 @@ interface Routes {
   task?: unknown
   sent?: unknown
   sendStatus?: number
+  deleteStatus?: number
+  deleteBody?: unknown
 }
 
 function stubFetch(routes: Routes) {
@@ -152,6 +154,14 @@ function stubFetch(routes: Routes) {
     const json = (payload: unknown, status = 200) =>
       new Response(JSON.stringify(payload), { status, headers: { 'Content-Type': 'application/json' } })
 
+    if (method === 'DELETE' && url.includes('/inbox/conversations/')) {
+      return json(
+        routes.deleteBody ?? {
+          conversation_id: 'c1', task_id: 'AIR-2026-000042', deleted: true, messages: 1, intervention_requests: 1,
+        },
+        routes.deleteStatus ?? 200,
+      )
+    }
     if (url.includes('/inbox/conversations/') && url.includes('/messages')) {
       return json(routes.sent ?? {}, routes.sendStatus ?? 200)
     }
@@ -581,5 +591,89 @@ describe('honesty', () => {
     await screen.findByText('Waiting for your reply')
     await waitFor(() => expect(detailsPanel().getByText(/Progress unavailable/)).toBeTruthy())
     expect(document.body.innerHTML).not.toMatch(/NaN/)
+  })
+})
+
+// ======================================================================
+// 11. Deleting a conversation
+// ======================================================================
+/** A finished task whose request was answered: the case the Delete button exists for. */
+function finishedDetail(): InboxConversationDetail {
+  return detail({
+    task_status: 'COMPLETED',
+    requires_reply: false,
+    open_request: null,
+    task: { ...detail().task!, status: 'COMPLETED' },
+  })
+}
+
+function deleteButton() {
+  return screen.getByRole('button', { name: /^delete$/i }) as HTMLButtonElement
+}
+
+describe('deleting a conversation', () => {
+  it('asks for confirmation and sends nothing when the operator declines', async () => {
+    const requests = stubFetch({ detail: finishedDetail() })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    renderInbox('/inbox?conversation=c1')
+    await screen.findByText('AIR-2026-000042', { selector: 'span' })
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+
+    fireEvent.click(deleteButton())
+
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(String(confirm.mock.calls[0][0])).toMatch(/task itself is not changed/i)
+    expect(requests.filter((r) => r.method === 'DELETE')).toHaveLength(0)
+  })
+
+  it('deletes only the conversation and never touches the task', async () => {
+    const requests = stubFetch({ detail: finishedDetail() })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderInbox('/inbox?conversation=c1')
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+
+    fireEvent.click(deleteButton())
+
+    await waitFor(() =>
+      expect(requests.filter((r) => r.method === 'DELETE')).toHaveLength(1),
+    )
+    const deletes = requests.filter((r) => r.method === 'DELETE')
+    expect(deletes[0].url).toMatch(/\/inbox\/conversations\/c1$/)
+    // No call may modify, cancel or delete the task.
+    const taskWrites = requests.filter((r) => /\/tasks\//.test(r.url) && r.method !== 'GET')
+    expect(taskWrites).toEqual([])
+
+    // The deleted conversation is closed rather than left on screen.
+    expect(await screen.findByText('Select a conversation')).toBeTruthy()
+  })
+
+  it('cannot delete a conversation that is still waiting on the operator', async () => {
+    const requests = stubFetch({})
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderInbox('/inbox?conversation=c1')
+    await screen.findByText('Waiting for your reply')
+
+    expect(deleteButton().disabled).toBe(true)
+    fireEvent.click(deleteButton())
+
+    expect(confirm).not.toHaveBeenCalled()
+    expect(requests.filter((r) => r.method === 'DELETE')).toHaveLength(0)
+  })
+
+  it('shows the server refusal and keeps the conversation when the delete fails', async () => {
+    stubFetch({
+      detail: finishedDetail(),
+      deleteStatus: 409,
+      deleteBody: { detail: 'Task AIR-2026-000042 is still waiting on your input in this conversation.' },
+    })
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    renderInbox('/inbox?conversation=c1')
+    await waitFor(() => expect(deleteButton().disabled).toBe(false))
+
+    fireEvent.click(deleteButton())
+
+    expect(await screen.findByText(/still waiting on your input/i)).toBeTruthy()
+    // Still open: nothing was removed, so nothing is hidden.
+    expect(screen.queryByText('Select a conversation')).toBeNull()
   })
 })

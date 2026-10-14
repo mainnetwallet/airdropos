@@ -1,6 +1,8 @@
 """Durable, task-scoped conversations and structured human-intervention requests.
 
-One conversation per task, owned by the authenticated operator. An intervention request is
+One live conversation per task, owned by the authenticated operator. A conversation is a
+disposable view of "this task needed a person": deleting it (or its task) removes it for good,
+and a later user action on a task that still exists opens a brand-new conversation. An intervention request is
 persisted *before* the agent's message is published, so the conversation can never advertise a
 request that does not exist, and the message can never claim a checkpoint was saved when the
 save actually failed.
@@ -16,7 +18,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -203,12 +205,17 @@ class ConversationService:
             requires_reply=False,
             last_seq=0,
         )
-        self.db.add(conversation)
+        # The insert runs inside a SAVEPOINT so that losing a creation race only undoes this
+        # one insert. A full rollback here would also discard whatever the caller had already
+        # flushed in the same transaction (the task's claimed owner, a checkpoint).
         try:
-            await self.db.flush()
+            async with self.db.begin_nested():
+                self.db.add(conversation)
+                await self.db.flush()
         except IntegrityError:
             # Another writer created it first. Drop ours and take theirs.
-            await self.db.rollback()
+            if conversation in self.db:
+                self.db.expunge(conversation)
             existing = await self.get_for_task(task.id, owner_email)
             if existing is None:  # pragma: no cover - only if the row vanished
                 raise
@@ -223,6 +230,91 @@ class ConversationService:
                 AgentConversation.owner_email == owner_email,
             )
         )
+
+    # ------------------------------------------------------------------
+    # Deletion
+    # ------------------------------------------------------------------
+    async def delete_conversation(self, conversation: AgentConversation) -> Dict[str, int]:
+        """Remove ONE conversation with its messages and intervention requests.
+
+        Written as explicit DELETE statements instead of leaning on the database's ON DELETE
+        CASCADE. SQLite does not enforce foreign keys here, and a database whose Inbox tables
+        predate their foreign keys has none to cascade, so a cascade-only delete would leave
+        orphaned rows behind. The Task is never touched: nothing below names the tasks table.
+
+        Flushed, not committed; the caller owns the transaction. The conversation row is gone
+        when this returns, so its (channel, key) slot is free for a fresh conversation.
+        """
+        conversation_id = conversation.id
+        requests = await self.db.execute(
+            delete(InterventionRequest).where(InterventionRequest.conversation_id == conversation_id)
+        )
+        messages = await self.db.execute(
+            delete(ConversationMessage).where(ConversationMessage.conversation_id == conversation_id)
+        )
+        await self.db.execute(delete(AgentConversation).where(AgentConversation.id == conversation_id))
+        # The ORM may still hold the removed row (and its loaded `messages`); forget it so a
+        # later lookup in this session cannot hand back a conversation that no longer exists.
+        if conversation in self.db:
+            self.db.expunge(conversation)
+        await self.db.flush()
+        return {
+            "messages": int(messages.rowcount or 0),
+            "intervention_requests": int(requests.rowcount or 0),
+        }
+
+    async def delete_for_task(self, task_pk: Any) -> Dict[str, int]:
+        """Remove every Inbox record that belongs to one task.
+
+        Selected by the task as well as by the conversation, so a message or request whose
+        conversation row is already gone (an orphan from before this lifecycle existed) is
+        still removed along with its task.
+        """
+        conversation_ids = [
+            row
+            for row in (
+                await self.db.execute(
+                    select(AgentConversation.id).where(AgentConversation.task_id == task_pk)
+                )
+            ).scalars()
+        ]
+
+        requests = await self.db.execute(
+            delete(InterventionRequest).where(InterventionRequest.task_id == task_pk)
+        )
+        messages = await self.db.execute(
+            delete(ConversationMessage).where(ConversationMessage.task_id == task_pk)
+        )
+        removed_messages = int(messages.rowcount or 0)
+        removed_requests = int(requests.rowcount or 0)
+        if conversation_ids:
+            requests = await self.db.execute(
+                delete(InterventionRequest).where(
+                    InterventionRequest.conversation_id.in_(conversation_ids)
+                )
+            )
+            messages = await self.db.execute(
+                delete(ConversationMessage).where(
+                    ConversationMessage.conversation_id.in_(conversation_ids)
+                )
+            )
+            removed_requests += int(requests.rowcount or 0)
+            removed_messages += int(messages.rowcount or 0)
+            await self.db.execute(
+                delete(AgentConversation).where(AgentConversation.id.in_(conversation_ids))
+            )
+        # Drop anything the session still holds for the removed rows.
+        for obj in list(self.db.identity_map.values()):
+            if isinstance(obj, (AgentConversation, ConversationMessage, InterventionRequest)) and (
+                getattr(obj, "task_id", None) == task_pk
+            ):
+                self.db.expunge(obj)
+        await self.db.flush()
+        return {
+            "conversations": len(conversation_ids),
+            "messages": removed_messages,
+            "intervention_requests": removed_requests,
+        }
 
     # ------------------------------------------------------------------
     # Messages

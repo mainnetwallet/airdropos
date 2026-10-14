@@ -46,7 +46,7 @@ CONTEXT_MEMORY_COLUMNS = ("scope", "task_id", "campaign_id")
 
 # The revision at the head of the chain. Pinned so a new revision that breaks the chain
 # is caught here rather than at deploy time.
-HEAD_REVISION = "6_task_context"
+HEAD_REVISION = "7_inbox_lifecycle"
 
 
 def _run_alembic(db_path: Path, *args: str) -> subprocess.CompletedProcess:

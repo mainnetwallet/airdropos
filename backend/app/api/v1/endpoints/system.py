@@ -16,6 +16,7 @@ from backend.app.browser.controller import controller as browser_controller
 from backend.app.core.config import settings
 from backend.app.database.session import get_db
 from backend.app.airdrops.verifier import ChangeDetector
+from backend.app.inbox.service import ConversationService
 from backend.app.integrations.telegram import telegram_bot
 from backend.app.learning.engine import LearningEngine
 from backend.app.llm.client import llm
@@ -641,7 +642,13 @@ async def delete_task(
     public_id = task.task_id
     # Core DELETE: the database cascades to plans, executions, checkpoints, events
     # and evidence. (ORM delete would lazy-load relationships, which fails in async.)
+    # The task's Agent Inbox conversations, messages and intervention requests go with it.
+    # Removed explicitly: the database cannot be relied on to cascade (SQLite does not enforce
+    # foreign keys here, and older Inbox tables were created without them), and a surviving
+    # conversation would point at a task that no longer exists.
+    inbox_removed = await ConversationService(db).delete_for_task(task.id)
     await db.execute(delete(type(task)).where(type(task).id == task.id))
+    before["inbox_removed"] = inbox_removed
     await write_audit(db, principal, "TASK_DELETE", "task", public_id, before_state=before)
     await db.commit()
     return {"task_id": public_id, "deleted": True}

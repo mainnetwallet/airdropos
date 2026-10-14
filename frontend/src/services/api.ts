@@ -322,6 +322,18 @@ export const api = {
         body: JSON.stringify({ message, client_token: clientToken }),
       },
     ),
+  /**
+   * Delete one conversation with its messages and intervention requests. The task it belongs
+   * to is never touched: it is not cancelled, modified or deleted.
+   */
+  deleteInboxConversation: (conversationId: string) =>
+    request<{
+      conversation_id: string
+      task_id: string | null
+      deleted: boolean
+      messages: number
+      intervention_requests: number
+    }>(`/inbox/conversations/${encodeURIComponent(conversationId)}`, { method: 'DELETE' }),
   inboxSummary: () => request<InboxSummary>('/inbox/summary'),
 
   // --- Goals ------------------------------------------------------------
