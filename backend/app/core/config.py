@@ -424,7 +424,7 @@ class Settings(BaseSettings):
     TELEGRAM_API_HASH: Optional[str] = None
     TELEGRAM_SESSION_PATH: str = "./data/telegram/agent"
     TELEGRAM_USER_MIN_ACTION_DELAY_SECONDS: float = 3.0
-    TELEGRAM_USER_DAILY_ACTION_LIMIT: int = 60
+    TELEGRAM_USER_DAILY_ACTION_LIMIT: int = 1000
 
     DISCORD_BOT_TOKEN: Optional[str] = None
     DISCORD_AUTHORIZED_USER_IDS: List[int] = Field(default=[])
