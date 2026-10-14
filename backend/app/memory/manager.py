@@ -11,10 +11,11 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models import MemoryRecord
+from backend.app.models.memory import SCOPE_CAMPAIGN, SCOPE_GLOBAL, SCOPE_TASK
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +60,14 @@ class MemoryManager:
         is_inference: bool = False,
         related_entities: Optional[Dict[str, Any]] = None,
         ttl_days: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> MemoryRecord:
-        """Persist a memory record after screening it for secrets."""
+        """Persist a memory record after screening it for secrets.
+
+        `extra` sets model attributes that are not part of the historical signature
+        (currently the context hierarchy's scope and owner). They are applied as plain
+        attributes rather than as parameters so the existing callers keep working.
+        """
         self.assert_no_secrets(content)
 
         record = MemoryRecord(
@@ -74,9 +81,109 @@ class MemoryManager:
             last_verified_at=datetime.now(timezone.utc) if not is_inference else None,
             review_policy={"revalidate_after_days": 30 if category.endswith("_REQUIREMENT") else 90},
         )
+        for key, value in (extra or {}).items():
+            if value is not None and hasattr(record, key):
+                setattr(record, key, value)
         self.db.add(record)
         await self.db.flush()
         return record
+
+    # ------------------------------------------------------------------
+    # Context hierarchy
+    #
+    # Memory is three levels, and the levels are enforced here rather than trusted to
+    # each call site: a TASK record is readable only by that task, a CAMPAIGN record only
+    # by tasks linked to that campaign, and only GLOBAL records are general knowledge.
+    # Before this, every record was global, so any recall returned one task's private
+    # execution history to another task's prompt.
+    # ------------------------------------------------------------------
+    async def remember_scoped(
+        self,
+        category: str,
+        content: str,
+        source: str,
+        *,
+        scope: str = SCOPE_GLOBAL,
+        task_id: Optional[Any] = None,
+        campaign_id: Optional[Any] = None,
+        confidence: float = 0.7,
+        is_inference: bool = False,
+        related_entities: Optional[Dict[str, Any]] = None,
+        ttl_days: Optional[int] = None,
+    ) -> MemoryRecord:
+        """Store a memory at an explicit level of the context hierarchy.
+
+        The scope and the owner must agree. A TASK record with no task, or a GLOBAL record
+        carrying one, are both refused: the first would be private context nobody can
+        read back, the second would be private context published as general knowledge.
+        """
+        if scope not in (SCOPE_GLOBAL, SCOPE_CAMPAIGN, SCOPE_TASK):
+            raise ValueError(f"Unknown memory scope: {scope!r}")
+        if scope == SCOPE_TASK and task_id is None:
+            raise ValueError("A task-scoped memory must name its task.")
+        if scope == SCOPE_CAMPAIGN and campaign_id is None:
+            raise ValueError("A campaign-scoped memory must name its campaign.")
+        if scope == SCOPE_GLOBAL and (task_id is not None or campaign_id is not None):
+            raise ValueError(
+                "A global memory cannot belong to a task or campaign; that is what "
+                "'global' means. Write it at the narrower scope instead."
+            )
+
+        return await self.remember(
+            category,
+            content,
+            source,
+            confidence=confidence,
+            is_inference=is_inference,
+            related_entities=related_entities,
+            ttl_days=ttl_days,
+            extra={"scope": scope, "task_id": task_id, "campaign_id": campaign_id},
+        )
+
+    async def recall_for_context(
+        self,
+        *,
+        task_id: Optional[Any] = None,
+        campaign_id: Optional[Any] = None,
+        query: str = "",
+        categories: Optional[List[str]] = None,
+        limit: int = 20,
+    ) -> List[MemoryRecord]:
+        """Recall only what this task is entitled to see.
+
+        The three levels are unioned, never substituted for one another, and the result is
+        ordered so this task's own context is read before general knowledge.
+        """
+        owner_clauses = [MemoryRecord.scope == SCOPE_GLOBAL]
+        if task_id is not None:
+            owner_clauses.append(
+                (MemoryRecord.scope == SCOPE_TASK) & (MemoryRecord.task_id == task_id)
+            )
+        if campaign_id is not None:
+            owner_clauses.append(
+                (MemoryRecord.scope == SCOPE_CAMPAIGN)
+                & (MemoryRecord.campaign_id == campaign_id)
+            )
+
+        stmt = select(MemoryRecord).where(
+            or_(*owner_clauses),
+            # A scoped record with no owner is corrupt (the write path refuses to create
+            # one). It is excluded here rather than surfaced, so a bad row cannot widen
+            # what a task is shown.
+            or_(MemoryRecord.task_id.isnot(None), MemoryRecord.campaign_id.isnot(None))
+            | (MemoryRecord.scope == SCOPE_GLOBAL),
+        )
+        if categories:
+            stmt = stmt.where(MemoryRecord.category.in_(categories))
+        if query:
+            stmt = stmt.where(MemoryRecord.content.ilike(f"%{query}%"))
+        stmt = stmt.order_by(MemoryRecord.confidence.desc()).limit(limit)
+
+        records = list((await self.db.execute(stmt)).scalars().all())
+        for record in records:
+            record.access_count += 1
+        await self.db.flush()
+        return records
 
     # ------------------------------------------------------------------
     async def recall(
@@ -86,7 +193,11 @@ class MemoryManager:
         limit: int = 20,
         include_expired: bool = False,
     ) -> List[MemoryRecord]:
-        """Retrieve relevant memories. Loads selectively rather than everything."""
+        """Retrieve relevant memories. Loads selectively rather than everything.
+
+        Administrative view across every scope, for the operator's own console. Agent
+        decisions must go through `recall_for_context`, which enforces the hierarchy.
+        """
         stmt = select(MemoryRecord)
 
         if categories:

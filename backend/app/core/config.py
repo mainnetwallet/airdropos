@@ -170,6 +170,39 @@ class Settings(BaseSettings):
         default=20,
         description="Prevent runaway Observe-Plan-Act-Verify loops",
     )
+    MAX_PLAN_STEPS: int = Field(
+        default=24,
+        ge=6,
+        le=80,
+        description=(
+            "Maximum steps in one execution plan. A Telegram or Mini App airdrop is "
+            "genuinely multi-stage (open bot, start, read, join, verify membership, "
+            "return to bot, read, act, verify, report), so this must be large enough "
+            "that a legitimate workflow is not rejected outright."
+        ),
+    )
+    MAX_PROSE_EXTRACTIONS_PER_RUN: int = Field(
+        default=6,
+        ge=0,
+        le=40,
+        description=(
+            "How many times one task run may ask the model to summarise requirements out "
+            "of untrusted external prose (bot messages, page text). Each use is an LLM "
+            "call on the single fixed model, so it is bounded per run. Zero disables "
+            "prose extraction entirely; structured requirements are still read."
+        ),
+    )
+    MAX_DISCOVERY_REPLANS_PER_RUN: int = Field(
+        default=3,
+        ge=0,
+        le=12,
+        description=(
+            "How many times a run may revise its plan because executing it discovered "
+            "something new. Separate from the failure-replan budget: discovering that a "
+            "bot wants a channel joined is progress, not a failure, and must not exhaust "
+            "the retry allowance."
+        ),
+    )
     REQUIRE_CONFIRMATION_ABOVE_USD: float = Field(
         default=100.0,
         description="Threshold where user interaction is mandatory",

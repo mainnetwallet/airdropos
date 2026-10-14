@@ -32,7 +32,125 @@ import {
   ProgressBar,
   StatusBadge,
 } from '@/components/ui'
-import type { TaskStatus, TaskSummary } from '@/types'
+import type { TaskContextView, TaskStatus, TaskSummary } from '@/types'
+
+/**
+ * The task's persistent execution context, rendered from what the backend resolved.
+ *
+ * The backend separates three things this panel must not blur together: what was
+ * *attempted*, what was *proven*, and what is still *outstanding*. Nothing here renders
+ * an unproven action as a success, and nothing infers progress - if a list is empty the
+ * panel says so rather than implying the work is done.
+ */
+function TaskExecutionContext({ context }: { context: TaskContextView }) {
+  const hasAnything =
+    context.goal ||
+    context.outstanding_requirements.length > 0 ||
+    context.proven_actions.length > 0 ||
+    context.unproven_attempts.length > 0 ||
+    context.next_step_rationale
+
+  if (!hasAnything) return null
+
+  const pendingIntervention =
+    (context.human_intervention?.pending as boolean | undefined) === true
+
+  return (
+    <Card>
+      <div className="flex items-baseline justify-between gap-3">
+        <h4 className="text-sm font-semibold text-slate-100">Execution context</h4>
+        <span className="font-mono text-[11px] text-slate-500">
+          {context.observation_count} action{context.observation_count === 1 ? '' : 's'}
+        </span>
+      </div>
+
+      {context.goal && (
+        <p className="mt-2 text-xs text-slate-400">
+          <span className="font-semibold uppercase text-slate-500">Goal: </span>
+          {context.goal}
+        </p>
+      )}
+
+      {context.next_step_rationale && (
+        <p className="mt-1 text-xs text-slate-400">
+          <span className="font-semibold uppercase text-slate-500">Why next: </span>
+          {context.next_step_rationale}
+        </p>
+      )}
+
+      {pendingIntervention && (
+        <p className="mt-2 text-xs text-amber-300">
+          Waiting on a person
+          {typeof context.human_intervention?.reason === 'string'
+            ? `: ${context.human_intervention.reason}`
+            : '.'}
+        </p>
+      )}
+
+      <div className="mt-3 space-y-3">
+        <div>
+          <p className="text-[11px] font-semibold uppercase text-slate-500">
+            Outstanding requirements ({context.outstanding_requirements.length})
+          </p>
+          {context.outstanding_requirements.length === 0 ? (
+            <p className="mt-1 text-xs text-slate-500">
+              Nothing outstanding. This does not mean the work is verified - check
+              Proven below.
+            </p>
+          ) : (
+            <ul className="mt-1 space-y-1">
+              {context.outstanding_requirements.map((requirement, index) => (
+                <li key={`${requirement.text}-${index}`} className="text-xs text-slate-300">
+                  {requirement.text}
+                  {requirement.account_specific && (
+                    <span className="ml-1 text-[10px] uppercase text-slate-500">
+                      (this account only)
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        <div>
+          <p className="text-[11px] font-semibold uppercase text-slate-500">
+            Proven ({context.proven_actions.length})
+          </p>
+          {context.proven_actions.length === 0 ? (
+            <p className="mt-1 text-xs text-slate-500">No action has been verified yet.</p>
+          ) : (
+            <ul className="mt-1 space-y-1">
+              {context.proven_actions.map((action, index) => (
+                <li key={`${action}-${index}`} className="text-xs text-emerald-300">
+                  {action}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {context.unproven_attempts.length > 0 && (
+          <div>
+            <p className="text-[11px] font-semibold uppercase text-slate-500">
+              Attempted, not verified ({context.unproven_attempts.length})
+            </p>
+            <ul className="mt-1 space-y-1">
+              {context.unproven_attempts.map((attempt, index) => (
+                <li key={`${attempt.action}-${index}`} className="text-xs text-slate-400">
+                  {attempt.action}
+                  <span className="ml-1 text-[10px] uppercase text-slate-500">
+                    ({attempt.outcome})
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </Card>
+  )
+}
 
 const STATUSES: Array<TaskStatus | 'ALL'> = [
   'ALL',
@@ -466,6 +584,11 @@ export default function TaskManagerPage() {
                         <span className="font-semibold uppercase text-slate-500">Next: </span>
                         {detailQuery.data.next_planned_action}
                       </p>
+                    )}
+
+                  {detailQuery.data.context &&
+                    !('error' in detailQuery.data.context) && (
+                      <TaskExecutionContext context={detailQuery.data.context} />
                     )}
 
                   <div className="grid grid-cols-2 gap-2 text-center">

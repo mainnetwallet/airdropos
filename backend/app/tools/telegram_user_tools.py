@@ -1,4 +1,4 @@
-"""Telegram USER-client tools (Telethon).
+﻿"""Telegram USER-client tools (Telethon).
 
 These let the agent act through the operator's own Telegram account: join a
 channel/group, start a bot, read what it replied, press inline buttons, and send
@@ -133,6 +133,14 @@ class _TelegramUserSession:
         self.last_error: Optional[str] = None
         self.task_id: Optional[str] = None
         self.task_title: Optional[str] = None
+        # Chats resolved during this process, keyed by chat_id. This is what lets a
+        # later step address a private chat that was joined by invitation and has no
+        # public @username. Only safe identifiers are stored (see _describe_entity).
+        self.resolved_chats: Dict[int, Dict[str, Any]] = {}
+        self.resolved_by_username: Dict[str, Dict[str, Any]] = {}
+        # The bot the workflow is currently anchored to, so "return to the bot" is a
+        # real addressable target rather than something the LLM must remember.
+        self.current_bot: Optional[str] = None
 
     # -- Live Broadcast helpers ------------------------------------------------
     SESSION_ID = "telegram:agent"
@@ -149,6 +157,36 @@ class _TelegramUserSession:
             return bool(self._client is not None and self._client.is_connected())
         except Exception:
             return False
+
+    def remember_chat(self, ref: Dict[str, Any]) -> None:
+        """Record a resolved chat so a later step can address it by id or username."""
+        chat_id = ref.get("chat_id")
+        if chat_id is not None:
+            self.resolved_chats[int(chat_id)] = ref
+        username = ref.get("username")
+        if username:
+            self.resolved_by_username[str(username).lstrip("@").lower()] = ref
+
+    def resolve_ref(self, chat: str) -> Optional[Dict[str, Any]]:
+        """Look up a previously resolved chat by @username or numeric id."""
+        text = str(chat or "").strip()
+        if not text:
+            return None
+        if text.lstrip("-").isdigit():
+            return self.resolved_chats.get(int(text))
+        return self.resolved_by_username.get(text.lstrip("@").lower())
+
+    def known_chats(self) -> List[Dict[str, Any]]:
+        """Distinct resolved chats, for planner/operator visibility."""
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for ref in list(self.resolved_chats.values()) + list(self.resolved_by_username.values()):
+            key = (ref.get("chat_id"), ref.get("username"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(ref)
+        return out
 
     def actions_today(self) -> int:
         return self._count if self._day == datetime.now(timezone.utc).strftime("%Y-%m-%d") else 0
@@ -331,17 +369,149 @@ class _TelegramUserSession:
 _session = _TelegramUserSession()
 
 
+def _is_group_or_channel(entity: Any) -> bool:
+    """Whether a resolved entity is a group or channel (as opposed to a user/bot).
+
+    Duck-typed rather than `isinstance(entity, tl_types.Channel)`: Telethon's class
+    hierarchy and the `types` re-export have both moved between layers, and a strict
+    isinstance check that silently evaluates to False turns every join into
+    "not a channel or group" -- a refusal with no diagnosable cause.
+    """
+    if entity is None:
+        return False
+    if getattr(entity, "bot", False):
+        return False
+    # Channels/groups are identified by these flags; a user has none of them.
+    if any(getattr(entity, flag, False) for flag in ("broadcast", "megagroup", "gigagroup")):
+        return True
+    name = _type_name(entity).lower()
+    if name in ("channel", "chat", "chatforbidden", "channelforbbidden", "channelforbidden"):
+        return True
+    # A private group joined by invitation has no flags set on a minimal entity, so a
+    # negative id (Telegram's convention for chats/channels) plus a title is accepted.
+    chat_id = getattr(entity, "id", None)
+    return bool(isinstance(chat_id, int) and chat_id < 0 and getattr(entity, "title", None))
+
+
 def _button_kind(button: Any) -> str:
+    """Classify an inline/reply keyboard button.
+
+    Returns one of: url, callback, text, webapp, request_phone, request_location,
+    payment, login, switch_inline, game, buy, unsupported, unknown.
+
+    WHY THIS WAS REWRITTEN: it used to branch on ``tl_types.KeyboardButtonUrl``,
+    ``KeyboardButtonCallback`` and an exact ``type(raw) is KeyboardButton`` check.
+    Those class names do not exist in current Telethon (layer 2xx moved the button
+    variant into a ``type`` discriminator on a single ``KeyboardButton`` class), so
+    ``getattr(tl_types, "KeyboardButtonUrl", ())`` evaluated to an EMPTY TUPLE and
+    ``isinstance(raw, ())`` is always False. Every callback button was therefore
+    classified "unsupported" and refused with "the operator must handle it manually"
+    -- a legitimate, pressable bot button could never be clicked, which is a direct
+    cause of a workflow stalling at the first "Check eligibility" button.
+
+    The new implementation resolves the variant by NAME (from Telethon's `custom`
+    helpers when available) and falls back to the object's own attributes, so it keeps
+    working across Telethon layers instead of breaking on a rename.
+    """
     raw = getattr(button, "button", None)
-    if raw is None or tl_types is None:
+    if raw is None:
         return "unknown"
-    if getattr(button, "url", None) and isinstance(raw, getattr(tl_types, "KeyboardButtonUrl", ())):
-        return "url"
-    if isinstance(raw, getattr(tl_types, "KeyboardButtonCallback", ())):
+
+    # Collect every identifying name FIRST, then decide. Checking `button.url` before
+    # the variant name was a bug: a Web App button also carries a url, so Mini App
+    # buttons were classified as plain "url" and never routed to the Mini App path.
+    candidates = _type_names(raw)
+
+    def _matches(*needles: str) -> bool:
+        return any(needle in name for name in candidates for needle in needles)
+
+    # Most specific first.
+    if _matches("webview", "webapp"):
+        return "webapp"
+    if _matches("callback"):
         return "callback"
-    if type(raw) is getattr(tl_types, "KeyboardButton", None):
+    if _matches("requestphone", "phone"):
+        return "request_phone"
+    if _matches("requestlocation", "location"):
+        return "request_location"
+    if _matches("requestpoll", "poll"):
+        return "request_poll"
+    if _matches("buy"):
+        return "buy"
+    if _matches("payment"):
+        return "payment"
+    if _matches("game"):
+        return "game"
+    if _matches("switchinline", "switch_inline"):
+        return "switch_inline"
+    if _matches("auth", "login"):
+        return "login"
+    if _matches("url"):
+        return "url"
+
+    # A plain button has no special variant: an ordinary pressable label.
+    if _matches("keyboardbutton") and not _matches(
+        "row", "style", "inline", "markup", "forcereply", "hide"
+    ):
         return "text"
+    # No recognisable variant name at all, but the wrapper exposes plain text: Telegram
+    # renders this as an ordinary button.
+    if getattr(button, "text", None) and not getattr(button, "url", None):
+        return "text"
+
     return "unsupported"
+
+
+def _type_name(obj: Any) -> str:
+    """Best-effort type name for a Telethon object (class name, or TL `_` field)."""
+    name = type(obj).__name__
+    if name and name != "object":
+        return name
+    return str(getattr(obj, "_", "") or "")
+
+
+def _type_names(raw: Any) -> List[str]:
+    """Every name that could identify a button variant, lower-cased.
+
+    Includes the wrapper's own class name, its nested `type` object's class name, and
+    the TL constructor names (`_`), because different Telethon layers put the variant in
+    different places. The WRAPPER's own class name matters: Telethon's `custom.Button`
+    subclasses are named after the variant (e.g. `KeyboardButtonCallback`), so reading
+    only `button.button.type` would miss it.
+    """
+    names: set = set()
+    for obj in (raw, getattr(raw, "type", None)):
+        if obj is None:
+            continue
+        class_name = type(obj).__name__
+        if class_name and class_name != "object":
+            names.add(class_name.lower())
+        tl_name = getattr(obj, "_", None)
+        if tl_name:
+            names.add(str(tl_name).lower())
+    return sorted(n for n in names if n)
+
+
+# Button kinds the agent may press by itself.
+CLICKABLE_BUTTON_KINDS = frozenset({"callback", "text"})
+
+# Button kinds that are never pressed automatically, with the reason the operator gets.
+REFUSED_BUTTON_REASONS = {
+    "url": "It is a link. Links are never opened automatically.",
+    "webapp": (
+        "It launches a Telegram Mini App. Use telegram_detect_miniapp to inspect it and "
+        "telegram_open_miniapp to hand it to the browser, or let the operator open it in Telegram."
+    ),
+    "payment": "It is a payment button and requires explicit operator authorization.",
+    "buy": "It is a purchase button and requires explicit operator authorization.",
+    "request_phone": "It would share the operator's phone number. The operator must do it.",
+    "request_location": "It would share the operator's location. The operator must do it.",
+    "login": "It is a login/authorization button. The operator must approve it.",
+    "switch_inline": "It switches query mode and has no effect when pressed programmatically.",
+    "game": "It starts a game, which the operator must launch.",
+    "request_poll": "It starts a poll flow the operator must drive.",
+    "unsupported": "Its button type is not supported for automated pressing.",
+}
 
 
 def _describe_message(msg: Any) -> Dict[str, Any]:
@@ -388,8 +558,186 @@ async def _wait_for_replies(client: Any, entity: Any, after_id: int, timeout: fl
     return list(reversed(seen))
 
 
-def _evidence(**extra: Any) -> Dict[str, Any]:
-    return {"authoritative": True, "source": "telegram_user", **extra}
+def _describe_entity(entity: Any) -> Dict[str, Any]:
+    """Safe, persistable identity for a resolved Telegram chat.
+
+    Deliberately excludes ``access_hash`` and any session material: this dict is
+    persisted into plans, checkpoints and evidence, and is shown to the operator.
+    Only the identifiers needed to *find the chat again* are kept.
+    """
+    chat_id = getattr(entity, "id", None)
+    username = getattr(entity, "username", None)
+    title = getattr(entity, "title", None) or getattr(entity, "first_name", None)
+    kind = "channel" if getattr(entity, "broadcast", False) else (
+        "supergroup" if getattr(entity, "megagroup", False) else (
+            "group" if getattr(entity, "gigagroup", False) else "chat"
+        )
+    )
+    return {
+        "chat_id": int(chat_id) if isinstance(chat_id, int) else None,
+        "username": str(username) if username else None,
+        "title": str(title)[:200] if title else None,
+        "entity_kind": kind,
+    }
+
+
+def _ref_payload(ref: Dict[str, Any]) -> Dict[str, Any]:
+    """Flatten a resolved-chat ref into a tool result payload."""
+    return {
+        "chat_id": ref.get("chat_id"),
+        "username": ref.get("username"),
+        "title": ref.get("title"),
+        "entity_kind": ref.get("entity_kind"),
+    }
+
+
+async def _membership_state(client: Any, entity: Any) -> tuple[Optional[bool], str]:
+    """Determine whether the operator's account is actually a member.
+
+    Returns ``(state, method)`` where state is True/False, or None when it could
+    not be determined. This is what separates "we called join" from "we are in".
+    A None result must never be reported as verified membership.
+    """
+    chat_id = getattr(entity, "id", None)
+    if chat_id is None:
+        return None, "unknown"
+
+    # 1. Authoritative: ask Telegram for this account's own participant record.
+    try:
+        from telethon.tl.functions.channels import GetParticipantRequest
+
+        me = await client.get_me()
+        participant = await client(GetParticipantRequest(entity, me))
+        if participant is not None:
+            return True, "get_participant"
+    except Exception as exc:
+        name = type(exc).__name__
+        if name == "UserNotParticipantError":
+            return False, "get_participant"
+        # Any other failure (permissions, transient) falls through to the next probe.
+
+    # 2. The dialog list only contains chats the account is actually in.
+    try:
+        async for dialog in client.iter_dialogs():
+            if getattr(dialog, "id", None) == chat_id or getattr(getattr(dialog, "entity", None), "id", None) == chat_id:
+                return True, "iter_dialogs"
+        return False, "iter_dialogs"
+    except Exception:
+        return None, "unknown"
+
+
+async def _join_by_invite(client: Any, invite_hash: str) -> tuple[Dict[str, Any], Optional[ToolResult]]:
+    """Import a private invite link and RESOLVE the resulting chat.
+
+    Returns ``({"already": bool, "entity": <entity>}, None)`` on success, or
+    ``({}, <failure ToolResult>)`` when the invitation is expired, revoked,
+    needs approval, or yields no resolvable chat.
+
+    An invite hash is not a chat identity: ``get_messages`` cannot read from it.
+    Resolving the real entity here is what lets the next step read the joined
+    chat's messages instead of failing on an unusable reference.
+    """
+    try:
+        updates = await client(ImportChatInviteRequest(invite_hash))
+    except Exception as exc:
+        name = type(exc).__name__
+        if name == "UserAlreadyParticipantError":
+            # Already inside. Still resolve the entity so later steps can use it.
+            try:
+                entity = await client.get_entity(invite_hash)
+                return {"already": True, "entity": entity}, None
+            except Exception:
+                return {}, ToolResult.failure(
+                    "The account is already in this private chat, but the chat could not be "
+                    "resolved to an entity, so its messages cannot be read.",
+                    category="NOT_FOUND",
+                    retryable=False,
+                )
+        if name in ("InviteHashExpiredError", "InviteHashInvalidError", "InviteHashEmptyError"):
+            return {}, ToolResult.failure(
+                f"This invitation link is expired or invalid ({name}). A current link is needed.",
+                category="NOT_FOUND",
+                retryable=False,
+            )
+        if name in ("InviteRequestSentError", "InviteRequestSentMissingError"):
+            return {}, ToolResult.needs_user(
+                "This private group requires an admin to approve the join request. The operator "
+                "must wait for approval; the task can then continue."
+            )
+        if name in ("ChannelsTooMuchError", "UserBannedInChannelError", "ChannelPrivateError",
+                    "UserAlreadyInChannelError", "UsersTooMuchError"):
+            return {}, ToolResult.failure(
+                f"Telegram refused this invitation ({name}).",
+                category="FORBIDDEN",
+                retryable=False,
+            )
+        raise
+
+    chats = getattr(updates, "chats", None) or []
+    raw = chats[0] if chats else None
+    if raw is None:
+        messages = getattr(updates, "messages", None) or []
+        peer = getattr(messages[0], "peer_id", None) if messages else None
+        raw = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
+    if raw is None:
+        return {}, ToolResult.failure(
+            "The invitation was accepted but Telegram returned no chat to resolve, so the chat "
+            "identity is unknown and no later step can safely act on it.",
+            category="NOT_FOUND",
+            retryable=False,
+        )
+
+    # `updates.chats` already carries FULL, resolved chat objects. Re-resolving them
+    # through get_entity() is both pointless and fragile (get_entity expects a username
+    # or an id, not a TL object), and it is what failed after a successful join. Only a
+    # bare id needs resolving.
+    if getattr(raw, "id", None) is not None and getattr(raw, "title", None):
+        return {"already": False, "entity": raw}, None
+    try:
+        entity = await client.get_entity(raw)
+    except Exception as exc:
+        return {}, ToolResult.failure(
+            f"Joined via invitation, but the chat entity could not be resolved ({type(exc).__name__}).",
+            category="NOT_FOUND",
+            retryable=False,
+        )
+    return {"already": False, "entity": entity}, None
+
+
+def _evidence(kind: str, **extra: Any) -> Dict[str, Any]:
+    """Build an authoritative Telegram evidence envelope.
+
+    ``kind`` is mandatory and is the whole point: the controller matches a step's
+    declared ``verification_method`` against the *kind* of evidence a tool actually
+    produced. Telegram evidence previously carried no ``kind`` at all, so a
+    successful, genuinely-proven action (joining a group, starting a bot) could not
+    satisfy any concrete verification method. The step was then recorded as
+    "failed", its dependents never became ready, and the task stopped after one
+    action -- exactly the reported "joins the group and then stops" defect.
+
+    Only observed facts go in here. Never put message text, tokens or session
+    values in evidence: it is surfaced to the operator and persisted.
+    """
+    payload: Dict[str, Any] = {"authoritative": True, "source": "telegram_user", "kind": kind}
+    payload.update(extra)
+    return payload
+
+
+# Evidence kinds produced by the Telegram tools. Kept next to _evidence so the
+# two cannot drift apart; the controller maps verification methods to these.
+TELEGRAM_EVIDENCE_KINDS = frozenset(
+    {
+        "bot_started",           # a bot was opened and /start was answered
+        "message_sent",          # an ordinary authorised message was sent
+        "message_observed",      # messages were read from a real chat
+        "group_joined",          # a channel/group was joined
+        "membership_verified",   # membership was checked against live state
+        "button_clicked",        # a supported button was pressed
+        "dialog_listed",         # the account's dialogs were listed
+        "chat_resolved",         # a target was resolved to a usable entity
+        "miniapp_launch_detected",  # a Mini App launch was identified
+    }
+)
 
 
 _UNTRUSTED_NOTE = (
@@ -441,6 +789,11 @@ class TelegramOpenBotTool(BaseTool):
             sent = await client.send_message(entity, f"/start {start}" if start else "/start")
             replies = await _wait_for_replies(client, entity, sent.id)
             described = [_describe_message(m) for m in replies]
+            ref = _describe_entity(entity)
+            _session.remember_chat(ref)
+            # Anchor the workflow here. "Return to the bot" is a later step, and it must
+            # be able to find this bot without the LLM having remembered the name.
+            _session.current_bot = target["value"]
             return ToolResult.success(
                 data={
                     "bot": target["value"],
@@ -448,9 +801,14 @@ class TelegramOpenBotTool(BaseTool):
                     "sent_message_id": sent.id,
                     "replies": described,
                     "reply_count": len(described),
+                    "available_buttons": [
+                        b.get("text") for m in described for b in (m.get("buttons") or [])
+                        if b.get("text")
+                    ][:20],
+                    "chat_id": ref.get("chat_id"),
                     "note": _UNTRUSTED_NOTE,
                 },
-                evidence=_evidence(message_id=sent.id, reply_count=len(described)),
+                evidence=_evidence("bot_started", message_id=sent.id, reply_count=len(described)),
             )
 
         return await _session.run(action, interactive=True, label=f"Opened bot @{target['value']}")
@@ -458,8 +816,12 @@ class TelegramOpenBotTool(BaseTool):
 
 class TelegramJoinChatTool(BaseTool):
     name = "telegram_join_chat"
-    version = "1.0.0"
-    description = "Join a public Telegram channel/group (@name or t.me link) or a private one via invite link."
+    version = "1.1.0"
+    description = (
+        "Join a public Telegram channel/group (@name or t.me link) or a private one via invite link, "
+        "then VERIFY membership against live Telegram state. Returns the resolved chat id so later "
+        "steps can read that chat even when it has no public @username."
+    )
     required_permissions = ["telegram.interact"]
     side_effect = SideEffect.WEB_INTERACTION
     timeout_seconds = 45
@@ -480,42 +842,90 @@ class TelegramJoinChatTool(BaseTool):
             return ToolResult.failure(str(exc), category="INVALID_INPUT")
 
         async def action(client: Any) -> ToolResult:
-            try:
-                if target["kind"] == "invite":
-                    updates = await client(ImportChatInviteRequest(target["value"]))
-                    chats = getattr(updates, "chats", None) or []
-                    title = getattr(chats[0], "title", None) if chats else None
-                    return ToolResult.success(
-                        data={"joined": True, "already_member": False, "title": title},
-                        evidence=_evidence(action="join_invite", title=title),
-                    )
+            already = False
+            entity: Any = None
+
+            if target["kind"] == "invite":
+                # A private invite link is NOT a usable message-history target. Importing
+                # it yields Updates, not an entity, so the real chat must be resolved and
+                # remembered before any later step can read from it.
+                resolved, outcome = await _join_by_invite(client, target["value"])
+                if outcome is not None:
+                    return outcome
+                already = resolved["already"]
+                entity = resolved["entity"]
+            else:
                 entity = await client.get_entity(target["value"])
-                if not isinstance(entity, getattr(tl_types, "Channel", ())):
+                if not _is_group_or_channel(entity):
                     return ToolResult.failure(
                         f"@{target['value']} is not a channel or group.", category="INVALID_INPUT"
                     )
-                await client(JoinChannelRequest(entity))
-                return ToolResult.success(
-                    data={"joined": True, "already_member": False, "title": getattr(entity, "title", None)},
-                    evidence=_evidence(action="join", title=getattr(entity, "title", None)),
-                )
-            except Exception as exc:
-                if type(exc).__name__ == "UserAlreadyParticipantError":
-                    return ToolResult.success(
-                        data={"joined": True, "already_member": True},
-                        evidence=_evidence(action="join", already_member=True),
-                    )
-                raise
+                # Idempotency: inspect real membership BEFORE mutating anything, so a
+                # retried step does not re-join a chat the account is already in.
+                state, _how = await _membership_state(client, entity)
+                if state is True:
+                    already = True
+                if not already:
+                    try:
+                        await client(JoinChannelRequest(entity))
+                    except Exception as exc:
+                        if type(exc).__name__ == "UserAlreadyParticipantError":
+                            already = True
+                        else:
+                            raise
 
-        return await _session.run(action, interactive=True, label=("Joined @" + str(target["value"])) if target["kind"] == "username" else "Joined a chat via invite link")
+            # VERIFY: a successful join call is not proof of membership.
+            state, how = await _membership_state(client, entity)
+            if entity is None:
+                return ToolResult.failure(
+                    "The chat could not be resolved to an entity, so no later step can use it.",
+                    category="NOT_FOUND",
+                    retryable=False,
+                )
+            ref = _describe_entity(entity)
+            _session.remember_chat(ref)
+
+            if state is not True:
+                return ToolResult.failure(
+                    "The join call returned, but membership could not be confirmed against live "
+                    "Telegram state, so this step is NOT verified and will not be reported as done.",
+                    category="VERIFICATION_FAILED",
+                    retryable=True,
+                    data={"already_member": already, **_ref_payload(ref)},
+                )
+
+            return ToolResult.success(
+                data={
+                    "joined": True,
+                    "already_member": already,
+                    "membership_verified": True,
+                    "membership_method": how,
+                    **_ref_payload(ref),
+                    "note": _UNTRUSTED_NOTE,
+                },
+                evidence=_evidence(
+                    "membership_verified",
+                    chat_id=ref.get("chat_id"),
+                    already_member=already,
+                    method=how,
+                ),
+            )
+
+        label = (
+            ("Joined @" + str(target["value"]))
+            if target["kind"] == "username"
+            else "Joined a chat via a private invitation link"
+        )
+        return await _session.run(action, interactive=True, label=label)
 
 
 class TelegramReadMessagesTool(BaseTool):
     name = "telegram_read_messages"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
-        "Read the latest messages (with buttons) of a bot, channel or group. Use it to check what a "
-        "bot answered, e.g. to verify that a step was accepted."
+        "Read the latest messages (with buttons) of a bot, channel or group. Accepts @name, a t.me "
+        "link, or a numeric chat id resolved by an earlier step. Use it to check what a bot "
+        "answered, e.g. to verify that a step was accepted."
     )
     required_permissions = ["telegram.read"]
     side_effect = SideEffect.EXTERNAL_READ
@@ -524,7 +934,10 @@ class TelegramReadMessagesTool(BaseTool):
     input_schema = {
         "type": "object",
         "properties": {
-            "chat": {"type": "string", "description": "@name or t.me link", "maxLength": 300},
+            "chat": {"type": "string",
+                     "description": "@name, t.me link, or a numeric chat id returned by "
+                                    "telegram_join_chat / telegram_list_dialogs",
+                     "maxLength": 300},
             "limit": {"type": "integer", "description": "How many recent messages (1-20)",
                       "minimum": 1, "maximum": 20},
         },
@@ -532,25 +945,42 @@ class TelegramReadMessagesTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        try:
-            target = parse_target(params["chat"])
-        except ValueError as exc:
-            return ToolResult.failure(str(exc), category="INVALID_INPUT")
-        if target["kind"] != "username":
-            return ToolResult.failure("Use @name or a public t.me link to read messages.",
-                                      category="INVALID_INPUT")
+        raw_chat = str(params["chat"]).strip()
+        # A numeric chat id is a legitimate target: it is the ONLY address for a private
+        # group joined by invitation, which has no public @username.
+        if not raw_chat.lstrip("-").isdigit():
+            try:
+                target = parse_target(raw_chat)
+            except ValueError as exc:
+                return ToolResult.failure(str(exc), category="INVALID_INPUT")
+            if target["kind"] == "invite":
+                return ToolResult.failure(
+                    "A private invitation link cannot be used to read messages. Join it first "
+                    "with telegram_join_chat, then use the resolved chat id or @username it "
+                    "returns.",
+                    category="INVALID_INPUT",
+                )
+            display = target["value"]
+        else:
+            display = raw_chat
         limit = int(params.get("limit") or 10)
 
         async def action(client: Any) -> ToolResult:
-            entity = await client.get_entity(target["value"])
+            try:
+                entity = await _resolve_entity(client, raw_chat)
+            except ValueError as exc:
+                return ToolResult.failure(str(exc), category="INVALID_INPUT")
             messages = await _recent_messages(client, entity, limit)
+            ref = _describe_entity(entity)
+            _session.remember_chat(ref)
             return ToolResult.success(
-                data={"chat": target["value"], "messages": messages, "count": len(messages),
+                data={"chat": display, "chat_id": ref.get("chat_id"),
+                      "title": ref.get("title"), "messages": messages, "count": len(messages),
                       "note": _UNTRUSTED_NOTE},
-                evidence=_evidence(count=len(messages)),
+                evidence=_evidence("message_observed", chat_id=ref.get("chat_id"), count=len(messages)),
             )
 
-        return await _session.run(action, interactive=False, label=f"Read messages from @{target['value']}")
+        return await _session.run(action, interactive=False, label=f"Read messages from {display[:60]}")
 
 
 class TelegramSendMessageTool(BaseTool):
@@ -597,7 +1027,7 @@ class TelegramSendMessageTool(BaseTool):
             return ToolResult.success(
                 data={"chat": target["value"], "sent_message_id": sent.id, "replies": described,
                       "note": _UNTRUSTED_NOTE},
-                evidence=_evidence(message_id=sent.id, reply_count=len(described)),
+                evidence=_evidence("message_sent", message_id=sent.id, reply_count=len(described)),
             )
 
         return await _session.run(action, interactive=True, label=f"Sent a message to @{target['value']} ({len(text)} chars)")
@@ -650,15 +1080,35 @@ class TelegramClickButtonTool(BaseTool):
                     category="NOT_FOUND",
                 )
             kind = _button_kind(button)
-            if kind == "url":
+            if kind == "webapp":
+                # Route to the Mini App path rather than refusing outright: the launch
+                # can be inspected and handed to the browser with full context.
                 return ToolResult.needs_user(
-                    f"Button '{button.text}' is a link ({button.url}). Links are not opened "
-                    "automatically; the operator must open it manually if it is trusted."
+                    f"Button '{button.text}' launches a Telegram Mini App. Use "
+                    "telegram_detect_miniapp to inspect it and telegram_open_miniapp to hand it "
+                    "to the browser, or the operator can open it inside Telegram. "
+                    f"{REFUSED_BUTTON_REASONS['webapp']}",
+                    data={
+                        "button": button.text,
+                        "button_kind": kind,
+                        "url": getattr(button, "url", None),
+                        "chat": target["value"],
+                        "message_id": int(params["message_id"]),
+                        "next_tools": ["telegram_detect_miniapp", "telegram_open_miniapp"],
+                    },
                 )
-            if kind not in ("callback", "text"):
+            if kind not in CLICKABLE_BUTTON_KINDS:
+                reason = REFUSED_BUTTON_REASONS.get(
+                    kind, "This button type is not pressed automatically."
+                )
                 return ToolResult.needs_user(
-                    f"Button '{button.text}' is of an unsupported/sensitive type (payment, phone or "
-                    "location share, or mini-app). The operator must handle it manually."
+                    f"Button '{button.text}' is not pressed automatically. {reason}",
+                    data={
+                        "button": button.text,
+                        "button_kind": kind,
+                        "chat": target["value"],
+                        "message_id": int(params["message_id"]),
+                    },
                 )
             answer = await msg.click(text=button.text)
             alert = getattr(answer, "message", None) if answer is not None else None
@@ -666,25 +1116,188 @@ class TelegramClickButtonTool(BaseTool):
                 data={
                     "clicked": True,
                     "button": button.text,
+                    "button_kind": kind,
                     "answer": sanitize_external_text(alert or "", 500)["text"] or None,
+                    "chat": target["value"],
+                    "message_id": int(params["message_id"]),
                     "note": _UNTRUSTED_NOTE,
                 },
-                evidence=_evidence(message_id=msg.id, button=button.text),
+                evidence=_evidence(
+                    "button_clicked", message_id=msg.id, button=button.text, button_kind=kind
+                ),
             )
 
         return await _session.run(action, interactive=True, label=f"Pressed a button in @{target['value']}")
 
 
+class TelegramListDialogsTool(BaseTool):
+    """List the chats this account can actually see.
+
+    This is the OBSERVE half of the loop: it is how the agent discovers a bot it was
+    told to open, or a group it already joined, instead of guessing a name.
+    """
+
+    name = "telegram_list_dialogs"
+    version = "1.0.0"
+    description = (
+        "List the Telegram chats, groups, channels and bots this account can see, newest activity "
+        "first. Use it to find a bot or a group by title, or to confirm a chat exists, before "
+        "opening or reading it."
+    )
+    required_permissions = ["telegram.read"]
+    side_effect = SideEffect.EXTERNAL_READ
+    timeout_seconds = 30
+    is_idempotent = True
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "search": {"type": "string", "maxLength": 100,
+                       "description": "Optional title/username filter (case-insensitive)"},
+            "bots_only": {"type": "boolean", "description": "Only list bots"},
+        },
+    }
+
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        limit = int(params.get("limit") or 20)
+        search = str(params.get("search") or "").strip().lower()
+        bots_only = bool(params.get("bots_only"))
+
+        async def action(client: Any) -> ToolResult:
+            found: List[Dict[str, Any]] = []
+            async for dialog in client.iter_dialogs(limit=max(limit * 4, limit)):
+                entity = getattr(dialog, "entity", None)
+                if entity is None:
+                    continue
+                ref = _describe_entity(entity)
+                is_bot = bool(getattr(entity, "bot", False))
+                if bots_only and not is_bot:
+                    continue
+                haystack = f"{ref.get('title') or ''} {ref.get('username') or ''}".lower()
+                if search and search not in haystack:
+                    continue
+                _session.remember_chat(ref)
+                found.append({**ref, "is_bot": is_bot,
+                              "unread": int(getattr(dialog, "unread_count", 0) or 0)})
+                if len(found) >= limit:
+                    break
+            return ToolResult.success(
+                data={"dialogs": found, "count": len(found), "note": _UNTRUSTED_NOTE},
+                evidence=_evidence("dialog_listed", count=len(found)),
+            )
+
+        return await _session.run(action, interactive=False, label="Listed Telegram dialogs")
+
+
+class TelegramCheckMembershipTool(BaseTool):
+    """Check, against live Telegram state, whether the account is in a chat."""
+
+    name = "telegram_check_membership"
+    version = "1.0.0"
+    description = (
+        "Check whether the operator's account is really a member of a Telegram group or channel. "
+        "Use it to verify a join actually took effect, or to avoid joining twice."
+    )
+    required_permissions = ["telegram.read"]
+    side_effect = SideEffect.EXTERNAL_READ
+    timeout_seconds = 30
+    is_idempotent = True
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "chat": {"type": "string", "maxLength": 300,
+                     "description": "@channel, t.me link, or a numeric chat id resolved earlier"},
+        },
+        "required": ["chat"],
+    }
+
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        chat = str(params["chat"]).strip()
+        known = _session.resolve_ref(chat)
+        if known is not None and known.get("chat_id"):
+            # Prefer an already-resolved id: a private chat joined by invitation has no
+            # public username, so its id is the only addressable reference.
+            chat = str(known["chat_id"])
+
+        async def action(client: Any) -> ToolResult:
+            try:
+                entity = await _resolve_entity(client, chat)
+            except ValueError as exc:
+                return ToolResult.failure(str(exc), category="INVALID_INPUT")
+            except Exception as exc:
+                return ToolResult.failure(
+                    f"Telegram could not resolve that chat ({type(exc).__name__}).",
+                    category="NOT_FOUND",
+                    retryable=False,
+                )
+            ref = _describe_entity(entity)
+            _session.remember_chat(ref)
+            state, how = await _membership_state(client, entity)
+            is_member = state is True
+            return ToolResult.success(
+                data={
+                    "is_member": is_member,
+                    "membership_verified": is_member,
+                    "membership_method": how,
+                    "membership_determinable": state is not None,
+                    **_ref_payload(ref),
+                },
+                evidence=_evidence("membership_verified", chat_id=ref.get("chat_id"),
+                                   is_member=is_member, method=how),
+            )
+
+        return await _session.run(action, interactive=False, label=f"Checked membership of {chat[:60]}")
+
+
+async def _resolve_entity(client: Any, chat: str) -> Any:
+    """Resolve @name, a t.me link, or a numeric chat id to a Telethon entity.
+
+    Numeric ids matter for private chats joined by invitation: they have no public
+    username, so their id is the only reference that survives the join. An invite
+    hash is explicitly NOT accepted here -- it is not a history target.
+    """
+    text = str(chat or "").strip()
+    if text.lstrip("-").isdigit():
+        return await client.get_entity(int(text))
+    target = parse_target(text)
+    if target["kind"] == "invite":
+        raise ValueError(
+            "A private invitation link cannot be used to read messages. Join it first with "
+            "telegram_join_chat, then use the resolved chat id or @username it returns."
+        )
+    return await client.get_entity(target["value"])
+
+
 def register_telegram_user_tools(registry) -> bool:
-    """Register the tools only when the operator enabled and configured them."""
+    """Register the tools only when the operator enabled and configured them.
+
+    Returns whether the Telegram user client is usable. When it is not, the reason is
+    logged precisely (without secrets) so `GET /tools` and the diagnostics can report
+    the exact state instead of a generic "disabled".
+    """
     if not settings.TELEGRAM_USER_ENABLED:
+        logger.info(
+            "Telegram user tools not registered: TELEGRAM_USER_ENABLED is false "
+            "(set it to true and configure TELEGRAM_API_ID/TELEGRAM_API_HASH to enable)."
+        )
         return False
     if not (settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH):
-        logger.warning("TELEGRAM_USER_ENABLED is true but TELEGRAM_API_ID/TELEGRAM_API_HASH are missing.")
+        logger.warning(
+            "TELEGRAM_USER_ENABLED is true but TELEGRAM_API_ID/TELEGRAM_API_HASH are missing "
+            "(missing configuration)."
+        )
         return False
     if not TELETHON_AVAILABLE:
-        logger.warning("TELEGRAM_USER_ENABLED is true but telethon is not installed (pip install telethon).")
+        logger.warning(
+            "TELEGRAM_USER_ENABLED is true but telethon is not installed (missing dependency: "
+            "pip install telethon)."
+        )
         return False
+
+    # Imported here, not at module top: this module owns the shared Telethon session and
+    # the continuation tools import from it, so a top-level import would be circular.
+    from backend.app.tools.telegram_continuation_tools import CONTINUATION_TOOLS
+
     registry.register_or_replace_many(
         [
             TelegramOpenBotTool(),
@@ -692,6 +1305,57 @@ def register_telegram_user_tools(registry) -> bool:
             TelegramReadMessagesTool(),
             TelegramSendMessageTool(),
             TelegramClickButtonTool(),
+            TelegramListDialogsTool(),
+            TelegramCheckMembershipTool(),
+            *[tool() for tool in CONTINUATION_TOOLS],
         ]
     )
     return True
+
+
+def telegram_capability_report() -> Dict[str, Any]:
+    """Why the Telegram user client is or is not usable, without leaking secrets.
+
+    Used by diagnostics so an operator sees the exact blocking reason (login required,
+    missing configuration, ...) rather than a bare "disabled". Never returns the API
+    hash, session string, phone number or any credential.
+    """
+    report: Dict[str, Any] = {"available": False, "state": "disabled", "reason": "", "tools": []}
+    if not settings.TELEGRAM_USER_ENABLED:
+        report["reason"] = "TELEGRAM_USER_ENABLED is false."
+        return report
+    if not (settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH):
+        report["state"] = "missing_configuration"
+        report["reason"] = "TELEGRAM_API_ID and/or TELEGRAM_API_HASH are not configured."
+        return report
+    if not TELETHON_AVAILABLE:
+        report["state"] = "missing_dependency"
+        report["reason"] = "The telethon package is not installed."
+        return report
+
+    report["available"] = True
+    report["state"] = "authenticated_and_ready"
+    report["reason"] = (
+        "Registered. A login is still required before the first call: run "
+        "`python scripts/telegram_login.py` in a terminal if the session is not yet authorized."
+    )
+    report["tools"] = sorted(
+        tool.name
+        for tool in (
+            TelegramOpenBotTool,
+            TelegramJoinChatTool,
+            TelegramReadMessagesTool,
+            TelegramSendMessageTool,
+            TelegramClickButtonTool,
+            TelegramListDialogsTool,
+            TelegramCheckMembershipTool,
+        )
+    )
+    from backend.app.tools.telegram_continuation_tools import CONTINUATION_TOOLS
+
+    report["tools"] += sorted(tool.name for tool in CONTINUATION_TOOLS)
+    if _session.is_connected():
+        report["session"] = "connected"
+    else:
+        report["session"] = "not_connected"
+    return report

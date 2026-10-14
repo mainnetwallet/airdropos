@@ -435,6 +435,26 @@ class InterventionService:
             conversation.requires_reply = False
             await self.db.flush()
 
+        # The task's own execution context records that it was waiting on a person, so
+        # that "blocked on a human" stays a fact about this task and not only about this
+        # inbox. Cleared here, where the blocker is genuinely resolved, so a resumed run
+        # does not go on reporting a blocker nobody is looking at any more.
+        if request.task_id is not None:
+            try:
+                from backend.app.agent.context import TaskContextService
+                from backend.app.models import Task as _Task
+
+                task_row = await self.db.get(_Task, request.task_id)
+                if task_row is not None:
+                    await TaskContextService(self.db).record_human_intervention(
+                        task_row,
+                        required=False,
+                        reason=f"Resolved by {resolved_by}: {outcome}"[:500],
+                        resolved=True,
+                    )
+            except Exception as exc:  # never let bookkeeping block the resume
+                logger.debug("Could not clear the task context blocker: %s", exc)
+
     async def cancel_for_task(self, task_pk: Any, *, reason: str) -> int:
         """Close every open request on a task. Used when the task is cancelled."""
         rows = (

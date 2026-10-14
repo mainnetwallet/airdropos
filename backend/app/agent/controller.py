@@ -23,9 +23,21 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.agent.context import TaskContextService, action_fingerprint
+from backend.app.agent.discovery import DiscoveryBudget, extract_from_result
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
 from backend.app.models import Task
+from backend.app.models.context import (
+    OUTCOME_ATTEMPTED,
+    OUTCOME_BLOCKED,
+    OUTCOME_CONFIRMED,
+    OUTCOME_DUPLICATE_SUPPRESSED,
+    OUTCOME_EXECUTED,
+    OUTCOME_FAILED,
+    OUTCOME_SKIPPED,
+    OUTCOME_UNVERIFIED,
+)
 from backend.app.planning.planner import (
     ExecutionPlanSpec,
     PlanConstraints,
@@ -52,6 +64,26 @@ MAX_REPLANS_PER_TASK = 2
 # the planner's own default means "nobody said how this is proven", and treating
 # that as satisfied is how unverified work gets reported as done.
 GENERIC_EVIDENCE_METHODS = frozenset({"", "tool_evidence", "evidence_present"})
+
+# Cross-integration evidence equivalence. Some verification methods describe a FACT
+# rather than an integration ("the remote state now says X"). Reading a Telegram bot's
+# reply IS an authoritative observation of remote state, exactly like a page
+# observation, so either may satisfy the other's method.
+#
+# Without this, a planner that wrote "page_observation" for a Telegram read step caused
+# a genuinely successful action to be recorded as FAILED. Its dependents then never
+# became ready and the workflow stopped right after that action.
+EQUIVALENT_EVIDENCE_KINDS: Dict[str, frozenset] = {
+    "page_observation": frozenset(
+        {"page_observation", "post_action_observation", "message_observed"}
+    ),
+    "post_action_observation": frozenset(
+        {"post_action_observation", "page_observation", "message_observed"}
+    ),
+    "visible_text": frozenset(
+        {"post_action_observation", "page_observation", "message_observed"}
+    ),
+}
 
 # Which `ToolResult.evidence["kind"]` values can satisfy a concrete verification
 # method. A step is verified only when the tool produced evidence of the declared
@@ -86,12 +118,45 @@ EVIDENCE_KINDS: Dict[str, frozenset] = {
     "wallet_record": frozenset({"wallet_record"}),
     # Database-backed reads.
     "record_read": frozenset({"record_read"}),
+    # ------------------------------------------------------------------
+    # Telegram (telegram_user_tools / telegram_continuation_tools).
+    #
+    # These were entirely absent. A Telegram tool's evidence therefore matched no
+    # declared method, and any step whose planner-written method happened to be one
+    # of the mapped browser/chain methods (a natural choice for "read the bot's
+    # reply", e.g. page_observation) was recorded as FAILED even though the action
+    # had genuinely succeeded. Its dependents never became ready and the task stopped
+    # right after that action -- the reported "joins the group, then stops" defect.
+    # ------------------------------------------------------------------
+    "bot_started": frozenset({"bot_started"}),
+    "group_joined": frozenset({"group_joined", "membership_verified"}),
+    "joined": frozenset({"group_joined", "membership_verified"}),
+    "membership_verified": frozenset({"membership_verified"}),
+    "membership": frozenset({"membership_verified"}),
+    "message_observed": frozenset({"message_observed", "message_sent", "bot_started"}),
+    "message_read": frozenset({"message_observed"}),
+    "bot_reply": frozenset({"message_observed", "bot_started"}),
+    "button_clicked": frozenset({"button_clicked"}),
+    "message_sent": frozenset({"message_sent"}),
+    "dialog_listed": frozenset({"dialog_listed"}),
+    "chat_resolved": frozenset({"chat_resolved", "membership_verified"}),
+    # A Telegram read is genuinely an observation of remote state, so it also
+    # satisfies the generic page-observation methods the planner tends to write.
+    "miniapp_opened": frozenset({"miniapp_launch_detected"}),
+    "miniapp_state_observed": frozenset({"miniapp_state_observed", "page_observation", "post_action_observation"}),
+    "browser_state_observed": frozenset({"page_observation", "post_action_observation", "browser_state_observed"}),
+    "form_submitted": frozenset({"form_submitted", "post_action_observation"}),
+    "arithmetic_computed": frozenset({"arithmetic_computed"}),
+    "human_intervention_requested": frozenset({"human_intervention_requested"}),
+    "verification_completed": frozenset({"verification_completed", "membership_verified", "post_action_observation"}),
+    "task_resumed": frozenset({"task_resumed"}),
 }
 
 from backend.app.agent.prompts import AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
 from backend.app.inbox.raise_intervention import park_for_intervention  # noqa: E402
 from backend.app.inbox.service import (  # noqa: E402
     AMBIGUOUS_INSTRUCTION,
+    HUMAN_VERIFICATION,
     OPERATOR_FALLBACK_EMAIL,
     OPERATOR_PAUSE,
 )
@@ -170,6 +235,15 @@ class AgentController:
         self.diagnosis = FailureDiagnosisEngine()
         self.registry = registry
         self.policy = policy
+        # The task's own persistent execution context (§5). Every observation, discovered
+        # requirement, external reference and next-step rationale passes through here, so
+        # they survive a restart, a replan and a switch between integrations.
+        self.context = TaskContextService(db)
+        # Per-run ceilings on the two things that cost an LLM call mid-execution:
+        # reading requirements out of untrusted prose, and revising the plan because
+        # executing it revealed something new.
+        self.discovery_budget = DiscoveryBudget()
+        self.discovery_replans = 0
 
     # ------------------------------------------------------------------
     # Main loop
@@ -398,6 +472,14 @@ class AgentController:
                 iteration=iteration,
                 force_reason_code=force_reason_code,
             )
+            # The context records what is being waited on, so "waiting for a human" is a
+            # durable fact about this task rather than something only the inbox knows.
+            await self.context.record_human_intervention(
+                task,
+                required=result is not None,
+                reason=error_text,
+                instruction=blocking_step,
+            )
             if result is None:
                 logger.error(
                     "Could not raise an intervention for %s; leaving it in %s",
@@ -465,12 +547,25 @@ class AgentController:
         instructions = self._take_operator_instructions(task)
         existing = await self.planner.load_plan_spec(task)
 
+        # The context is the first thing established, before any decision is taken from
+        # it: the goal, and what "done" means, are recorded so every later decision can
+        # be read against them.
+        await self.context.set_goal(
+            task,
+            goal=task.title or None,
+            normalized_objective=task.description or task.title or None,
+        )
+
         if existing is not None and existing.steps:
             if not instructions:
                 logger.info(
                     "Task %s resuming with plan revision (%s step(s))",
                     task.task_id, len(existing.steps),
                 )
+                # Resuming is not a fresh start: record that this run continues an
+                # interrupted one, so the context shows the history is being picked up
+                # rather than rebuilt.
+                await self.context.mark_resumed(task)
                 return existing
 
             completed_irreversible = [
@@ -584,6 +679,15 @@ class AgentController:
         if plan.is_complete():
             return await self._finalize_plan(task, iteration, plan, report)
 
+        # --- RECONSILE: has executing this plan revealed work it does not contain? ---
+        # Checked before a step is picked, not after one finishes, so the very next action
+        # already accounts for what the previous ones discovered.
+        revised = await self._maybe_replan_for_discovery(task, iteration, report, plan)
+        if revised is not None:
+            plan = revised
+            if plan.is_complete():
+                return await self._finalize_plan(task, iteration, plan, report)
+
         ready = plan.ready_steps()
         if not ready:
             blocked = plan.blocked_steps()
@@ -601,6 +705,17 @@ class AgentController:
         step = ready[0]
         action = step.description
         reasoning = f"Plan step {step.index} ({step.kind.value})"
+
+        # --- OBSERVE (context): why is this step the next step? ----------
+        # The rationale is chosen against the whole task, not the last tool return: what
+        # is still outstanding, what is already proven, and what the previous action
+        # actually found. It is persisted so a resumed run, a replan or an operator can
+        # see the reasoning rather than infer it.
+        await self.context.set_next_step(
+            task,
+            rationale=await self._next_step_rationale(task, plan, step),
+            step_index=step.index,
+        )
 
         # --- OBSERVE: are this step's prerequisites actually met? --------
         satisfied, unmet = await self.planner.evaluate_prerequisites(task, step)
@@ -628,13 +743,15 @@ class AgentController:
 
         # --- ACT ---------------------------------------------------------
         if not step.tool:
-            passive = step.kind in (StepKind.ANALYZE, StepKind.NOTIFY, StepKind.WAIT)
-            if not passive:
-                # No catalog tool can do this research/interact/transact step.
-                # It must NOT be reported as done: hand it to the operator.
+            if not step.kind.is_passive:
+                # No catalog tool can perform this step. It must NOT be reported as
+                # done: hand it to the operator and PAUSE, so one unsupported action
+                # cannot be mistaken for a completed one.
+                human_gated = step.kind.requires_human
                 reason = (
-                    f"No catalog tool can perform this {step.kind.value} step; "
-                    f"the operator must do it manually: {action}"
+                    f"No catalog tool can perform this {step.kind.value} step"
+                    + (" (it requires a human: CAPTCHA, OTP, login or approval). " if human_gated else "; ")
+                    + f"the operator must do it manually: {action}"
                 )
                 step.status = "blocked"
                 step.failure_reason = reason
@@ -647,7 +764,10 @@ class AgentController:
                     iteration=iteration,
                     error_text=reason,
                     blocking_step=f"Step {step.index} ({step.kind.value}): {action}",
-                    force_reason_code=AMBIGUOUS_INSTRUCTION if step.kind is StepKind.INTERACT else None,
+                    force_reason_code=(
+                        HUMAN_VERIFICATION if human_gated
+                        else (AMBIGUOUS_INSTRUCTION if step.kind is StepKind.INTERACT else None)
+                    ),
                 )
                 return (
                     StepResult(iteration, action, None, None, False, reason, 0),
@@ -655,7 +775,7 @@ class AgentController:
                     LoopOutcome.NEEDS_USER_ACTION,
                 )
 
-            # analyze / notify / wait steps need no tool, but they produce no
+            # analyze / notify / report / wait steps need no tool, but they produce no
             # authoritative evidence either, so they are never counted as verified.
             step.status = "completed"
             await self.planner.update_step_status(
@@ -693,11 +813,90 @@ class AgentController:
                 LoopOutcome.PARTIALLY_COMPLETED,
             )
 
+        # --- OBSERVE (history): has this exact action already been proven? ---
+        # A replan can produce a step describing work that is already done, and a resumed
+        # run re-reads a plan whose steps it has executed. For an action that is not
+        # idempotent - a claim, a registration, a submitted form, a transaction - running
+        # it twice is a real-world consequence, not a wasted call.
+        #
+        # Only an authoritative confirmation suppresses the step. An attempt whose
+        # outcome was never proven does not: an uncertain action is investigated, not
+        # skipped and not blindly repeated.
+        tool_def = self.registry.get(step.tool) if self.registry else None
+        if tool_def is not None and not tool_def.is_idempotent:
+            confirmed = await self.context.confirmed_fingerprint(
+                task, step.tool, step.parameters or {}
+            )
+            if confirmed is not None:
+                note = (
+                    f"Already completed and verified earlier in this task "
+                    f"(observation {confirmed.id}); not repeating a non-idempotent action."
+                )
+                logger.info("Task %s step %s: %s", task.task_id, step.index, note)
+                step.status = "completed"
+                step.failure_reason = None
+                await self.planner.update_step_status(
+                    task, step.index, "completed",
+                    result={"evidence_kind": confirmed.evidence_kind, "reused_observation": str(confirmed.id)},
+                )
+                await self.context.record_observation(
+                    task,
+                    action=action,
+                    outcome=OUTCOME_DUPLICATE_SUPPRESSED,
+                    tool=step.tool,
+                    parameters=step.parameters or {},
+                    step_index=step.index,
+                    iteration=iteration,
+                    evidence={"authoritative": True, "kind": confirmed.evidence_kind},
+                    observed_state={"suppressed": True, "original_observation": str(confirmed.id)},
+                    is_idempotent=False,
+                )
+                await self.tasks.record_action(
+                    task,
+                    {"id": f"step-{step.index}", "tool": step.tool, "description": action},
+                    "completed",
+                    result={"skipped": "already verified", "observation": str(confirmed.id)},
+                )
+                report.verified_completions.append(action)
+                upcoming = plan.ready_steps()
+                report.next_actions = [s.description for s in upcoming[:3]]
+                await self._record_progress(
+                    task,
+                    reason="Repeated action suppressed by confirmed history",
+                    progress=self._plan_progress(plan),
+                    next_planned_action=(
+                        upcoming[0].description if upcoming else "All plan steps processed"
+                    ),
+                )
+                return (
+                    StepResult(iteration, action, step.tool, {"already_verified": True}, True, note, 0),
+                    False,
+                    LoopOutcome.PARTIALLY_COMPLETED,
+                )
+
         tool_result = await self.registry.invoke(
             step.tool, step.parameters, policy=self.policy, task_id=task.task_id
         )
 
         if tool_result.status is not ToolResultStatus.SUCCESS:
+            await self.context.record_observation(
+                task,
+                action=action,
+                outcome=(
+                    OUTCOME_BLOCKED
+                    if tool_result.status is ToolResultStatus.NEEDS_USER_ACTION
+                    else OUTCOME_FAILED
+                ),
+                tool=step.tool,
+                parameters=step.parameters or {},
+                step_index=step.index,
+                iteration=iteration,
+                evidence=tool_result.evidence,
+                result_digest={"error": tool_result.error, "category": tool_result.error_category},
+                integration_ref=self._integration_ref(tool_result),
+                is_idempotent=bool(getattr(tool_def, "is_idempotent", True)),
+                error=tool_result.error,
+            )
             diagnosis = self.diagnosis.diagnose(
                 tool_result.error or "Tool returned a non-success status.",
                 error_category=tool_result.error_category,
@@ -717,6 +916,14 @@ class AgentController:
         # --- VERIFY: an intent to verify is not verification --------------
         verified, evidence = await self._verify_step(task, step, tool_result)
 
+        # --- RECORD: what did this action actually teach us? ---------------
+        # Before choosing the next action, the result is written into the task's context:
+        # what the external system now looks like, and which requirements it revealed.
+        # The next action is then chosen against this, not against the raw tool return.
+        await self._absorb_result(
+            task, step, tool_result, verified=verified, iteration=iteration, plan=plan
+        )
+
         if verified:
             step.status = "completed"
             await self.planner.update_step_status(task, step.index, "completed", result=tool_result.data)
@@ -730,16 +937,29 @@ class AgentController:
             upcoming = plan.ready_steps()
             report.next_actions = [s.description for s in upcoming[:3]]
         else:
-            step.status = "failed"
-            step.failure_reason = "Tool returned success but produced no authoritative evidence."
+            # The tool SUCCEEDED but its evidence did not satisfy the declared method.
+            # Marking this "failed" is exactly what stranded the workflow: `ready_steps`
+            # counts only completed/skipped as done, so every dependent step stayed
+            # blocked forever and the run ended after this single action -- the reported
+            # "joins the group, then stops" defect.
+            #
+            # The honest classification is UNVERIFIED, not FAILED: the action ran, we
+            # simply cannot prove it. The step stays re-runnable, and the loop CONTINUES
+            # so a following verification step can still establish the fact independently.
+            step.status = "unverified"
+            step.failure_reason = (
+                "The tool succeeded but its evidence did not satisfy the declared "
+                "verification method, so the outcome is UNVERIFIED (not proven, not failed)."
+            )
             await self.planner.update_step_status(
-                task, step.index, "failed", failure_reason=step.failure_reason
+                task, step.index, "unverified", result=tool_result.data,
+                failure_reason=step.failure_reason,
             )
             report.unverified_claims.append(action)
-            await self.diagnosis.record(
-                self.db,
-                task,
-                self.diagnosis.diagnose(step.failure_reason, error_category="VERIFICATION_FAILURE"),
+            logger.info(
+                "Task %s step %s: the action succeeded but is UNVERIFIED. Continuing the plan "
+                "so a later step can prove it, instead of stranding every dependent step.",
+                task.task_id, step.index,
             )
 
         task.actual_cost_usd = round(task.actual_cost_usd + step.estimated_cost_usd, 6)
@@ -759,11 +979,238 @@ class AgentController:
         )
 
     # ------------------------------------------------------------------
+    # Context: absorbing what an action taught us, and choosing the next one from it
+    # ------------------------------------------------------------------
+    async def _absorb_result(
+        self,
+        task: Task,
+        step,
+        tool_result,
+        *,
+        verified: bool,
+        iteration: int,
+        plan: "ExecutionPlanSpec",
+    ) -> List[str]:
+        """Write one action's outcome into the task context and return new requirements.
+
+        This is the update the specification requires after every meaningful action
+        (§5.2). It separates three things that are easy to conflate and expensive to
+        conflate:
+
+        * the tool result - what the call returned,
+        * the observed external state - what the system looks like as a result,
+        * the requirements revealed - what the system is now saying must be done.
+
+        Only the third can change the plan, and only after it has been checked against
+        what the plan already covers.
+        """
+        tool_def = self.registry.get(step.tool) if self.registry else None
+        is_idempotent = bool(getattr(tool_def, "is_idempotent", True))
+
+        outcome = OUTCOME_CONFIRMED if verified else OUTCOME_UNVERIFIED
+        extracted = await extract_from_result(
+            tool_result.data or {},
+            budget=self.discovery_budget,
+            context_hint=f"{task.title or ''} {step.description}"[:500],
+        )
+
+        observation = await self.context.record_observation(
+            task,
+            action=step.description,
+            outcome=outcome,
+            tool=step.tool,
+            parameters=step.parameters or {},
+            step_index=step.index,
+            iteration=iteration,
+            evidence=tool_result.evidence,
+            observed_state=extracted.observed_state,
+            result_digest=tool_result.data,
+            integration_ref=self._integration_ref(tool_result),
+            is_idempotent=is_idempotent,
+        )
+
+        if extracted.reference_values:
+            await self.context.merge_resource_refs(task, extracted.reference_values)
+
+        if extracted.suspicious_content:
+            # External content tried to instruct the agent. It is recorded as a fact
+            # about the environment and as an outstanding question, and it is never
+            # turned into a step.
+            await self.context.add_question(
+                task,
+                "External content contained an instruction aimed at the agent; "
+                "it was not acted on. Review before continuing.",
+            )
+            logger.warning(
+                "Task %s: external content attempted to instruct the agent: %s",
+                task.task_id, extracted.suspicious_content[:200],
+            )
+
+        discovered: List[str] = []
+        for text in extracted.requirements:
+            requirement = await self.context.record_requirement(
+                task,
+                text,
+                origin="tool_result",
+                source_ref=f"{step.tool or 'step'}#{step.index}",
+            )
+            if requirement is not None and requirement.status != "satisfied":
+                discovered.append(requirement.text)
+
+        # Newly discovered requirements are only worth a replan when the current plan has
+        # nothing aimed at them. Otherwise the next ready step is already the right one and
+        # spending a model call to rediscover that would be waste.
+        if discovered:
+            unaddressed = await self.context.unaddressed_requirements(
+                task, [s.description for s in plan.steps]
+            )
+            if unaddressed:
+                logger.info(
+                    "Task %s: executing step %s revealed %d requirement(s) the plan does "
+                    "not address: %s",
+                    task.task_id, step.index, len(unaddressed),
+                    "; ".join(r.text[:80] for r in unaddressed[:3]),
+                )
+        return discovered
+
+    async def _maybe_replan_for_discovery(
+        self,
+        task: Task,
+        iteration: int,
+        report: LoopReport,
+        plan: "ExecutionPlanSpec",
+    ) -> Optional[ExecutionPlanSpec]:
+        """Revise the plan when executing it revealed requirements nothing addresses.
+
+        Budgeted separately from failure replanning: discovering that a bot wants a
+        channel joined is the system working, not the system struggling, and must not
+        consume the retry allowance or trip the failure-replan ceiling.
+        """
+        if self.discovery_replans >= settings.MAX_DISCOVERY_REPLANS_PER_RUN:
+            return None
+
+        outstanding = await self.context.requirements(task, only_outstanding=True)
+        if not outstanding:
+            return None
+
+        unaddressed = await self.context.unaddressed_requirements(
+            task, [s.description for s in plan.steps]
+        )
+        if not unaddressed:
+            return None  # the plan already covers everything outstanding
+
+        confirmed = [
+            {"action": o.action, "outcome": o.outcome}
+            for o in await self.context.observations(task, limit=200)
+            if o.proved_completion
+        ]
+
+        try:
+            revised = await self.planner.replan(
+                task,
+                plan,
+                trigger=ReplanTrigger.DISCOVERY,
+                reason=(
+                    f"Executing the plan revealed {len(unaddressed)} requirement(s) that no "
+                    f"current step addresses: "
+                    + "; ".join(r.text[:120] for r in unaddressed[:5])
+                ),
+                context_notes=[r.text for r in unaddressed],
+                evidence=confirmed,
+            )
+        except PlanningError as exc:
+            logger.warning("Discovery replan for %s failed: %s", task.task_id, exc)
+            return None
+
+        self.discovery_replans += 1
+        await self.context.set_next_step(
+            task,
+            rationale=(
+                f"Revised the plan because executing it revealed requirements the plan did "
+                f"not contain: {'; '.join(r.text[:120] for r in unaddressed[:3])}"
+            ),
+        )
+        await self._checkpoint(task, iteration, "replanned_discovery")
+        report.steps.append(
+            StepResult(
+                iteration, "replanned (discovery)", None,
+                {"revision_steps": len(revised.steps)}, True,
+                revised.rationale[:300], 0,
+            )
+        )
+        logger.info(
+            "Task %s: plan revision now covers %d newly discovered requirement(s)",
+            task.task_id, len(unaddressed),
+        )
+        return revised
+
+    # ------------------------------------------------------------------
+    async def _count_recovery_replans(self, task: Task) -> int:
+        """How many revisions of this plan were recovery replans rather than discoveries.
+
+        Read from the persisted revision history rather than the in-memory counter so it
+        survives a restart: a task that has already spent its recovery budget must not get
+        a fresh one because the worker bounced.
+
+        INITIAL is excluded: producing the first plan is not a replan. DISCOVERY is
+        excluded for the reason above.
+        """
+        from sqlalchemy import func, select as sa_select
+
+        from backend.app.models import PlanRevision
+
+        recovery_triggers = [
+            trigger.value
+            for trigger in ReplanTrigger
+            if trigger is not ReplanTrigger.DISCOVERY and trigger is not ReplanTrigger.INITIAL
+        ]
+        return int(
+            await self.db.scalar(
+                sa_select(func.count(PlanRevision.id)).where(
+                    PlanRevision.task_id == task.id,
+                    PlanRevision.trigger_category.in_(recovery_triggers),
+                )
+            )
+            or 0
+        )
+
+    # ------------------------------------------------------------------
+    async def _next_step_rationale(
+        self, task: Task, plan: "ExecutionPlanSpec", step
+    ) -> str:
+        """Explain, from the whole task, why this step is next.
+
+        Deliberately not derived from the last tool return alone: the choice has to be
+        readable against the objective, what is already proven, and what is outstanding.
+        """
+        outstanding = await self.context.requirements(task, only_outstanding=True)
+        proven = [
+            o for o in await self.context.observations(task, limit=200) if o.proved_completion
+        ]
+        parts = [
+            f"Step {step.index} of {len(plan.steps)} ({step.kind.value}) is the earliest "
+            f"step whose dependencies are met."
+        ]
+        if step.depends_on:
+            parts.append(f"It depends on step(s) {step.depends_on}, now satisfied.")
+        if proven:
+            parts.append(f"{len(proven)} action(s) already proven in this task.")
+        if outstanding:
+            parts.append(
+                f"{len(outstanding)} requirement(s) still outstanding: "
+                + "; ".join(r.text[:80] for r in outstanding[:3])
+            )
+        return " ".join(parts)[:1900]
+
+    # ------------------------------------------------------------------
     @staticmethod
     def _plan_progress(plan: "ExecutionPlanSpec") -> float:
         if not plan.steps:
             return 0.0
-        done = sum(1 for s in plan.steps if s.status in ("completed", "skipped"))
+        # An unverified step still consumed a real action, so it counts toward progress.
+        # Counting only completed/skipped made progress stall at a flat value while the
+        # agent was demonstrably working, which reads as "stuck" in the UI.
+        done = sum(1 for s in plan.steps if s.status in ("completed", "skipped", "unverified"))
         return round(min(0.99, done / len(plan.steps)), 4)
 
     # ------------------------------------------------------------------
@@ -815,6 +1262,14 @@ class AgentController:
         if tool_result.status is ToolResultStatus.NOT_AUTHORIZED:
             step.status = "skipped"
             step.failure_reason = tool_result.error or "not authorized"
+            # The reason a call was refused is part of the task's record: a later step, a
+            # replan or an operator needs to know this was policy, not a broken tool.
+            await self.context.record_authorization(
+                task,
+                permission=step.tool or "unknown",
+                granted=False,
+                detail=tool_result.error or "not authorized",
+            )
             await self.planner.update_step_status(
                 task, step.index, "skipped", failure_reason=step.failure_reason
             )
@@ -831,6 +1286,12 @@ class AgentController:
         # Retry is decided by the planner's deterministic policy, not the model.
         should_retry, retry_reason = self.planner.decide_retry(
             step, attempt=task.retry_count, failure_category=diagnosis.category.value
+        )
+        await self.context.record_failure(
+            task,
+            error=tool_result.error or diagnosis.summary,
+            category=diagnosis.category.value,
+            recovery=diagnosis.recovery_strategy,
         )
         within_budget = task.retry_count < min(task.max_retries, settings.MAX_TASK_RETRIES)
 
@@ -885,8 +1346,16 @@ class AgentController:
     ) -> tuple[StepResult, bool, LoopOutcome]:
         """Ask the planner for a new revision and continue with it."""
         # Every replan is an LLM call. Cap them so one task cannot burn calls forever.
-        current_plan = await self.planner.current_plan(task)
-        if current_plan is not None and current_plan.revision > MAX_REPLANS_PER_TASK:
+        #
+        # The cap counts RECOVERY replans only. Discovery replans
+        # (`ReplanTrigger.DISCOVERY`) advance the same revision counter but are progress,
+        # not recovery, and are bounded separately by
+        # MAX_DISCOVERY_REPLANS_PER_RUN. Counting them here would mean a task that
+        # legitimately discovered three new requirements could no longer replan after a
+        # genuine failure - the budget for fixing things would be spent on learning about
+        # them.
+        recovery_replans = await self._count_recovery_replans(task)
+        if recovery_replans >= MAX_REPLANS_PER_TASK:
             msg = (
                 f"Replan limit ({MAX_REPLANS_PER_TASK}) reached. Stopping instead of "
                 f"spending more LLM calls. Last problem: {reason[:200]}"
@@ -954,11 +1423,19 @@ class AgentController:
         self, task: Task, iteration: int, plan: "ExecutionPlanSpec", report: LoopReport
     ) -> tuple[StepResult, bool, LoopOutcome]:
         """All plan steps are processed. Verify the whole objective honestly."""
-        unverified = [s for s in plan.steps if s.status == "failed"]
+        # `unverified` is a distinct outcome: the action ran but its evidence did not
+        # prove it. It must never be reported as COMPLETED, and it must not be silently
+        # ignored either.
+        unverified = [s for s in plan.steps if s.status in ("failed", "unverified")]
         skipped = [s for s in plan.steps if s.status == "skipped"]
         blocked = [s for s in plan.steps if s.status == "blocked"]
         # Only steps that ran a real tool and passed verification count as evidence.
         verified_count = sum(1 for s in plan.steps if s.status == "completed" and s.tool)
+
+        # Requirements discovered while executing that nothing proved. They are named in
+        # the outcome because "the plan ran out of steps" and "the campaign still needs X"
+        # are different situations, and only the second tells the operator what is left.
+        outstanding = await self.context.requirements(task, only_outstanding=True)
 
         if not unverified and not skipped and not blocked and verified_count > 0:
             await self.tasks.transition(
@@ -993,14 +1470,26 @@ class AgentController:
             )
         if blocked:
             report.blockers.extend(s.description for s in blocked[:3])
+        if outstanding:
+            report.blockers.extend(
+                f"Outstanding requirement discovered while executing: {r.text}"
+                for r in outstanding[:3]
+            )
+
+        reason = (
+            f"{len(plan.steps)} step(s) processed but {len(unverified)} unverified, "
+            f"{len(skipped)} skipped, {len(blocked)} blocked. The objective is not fully verified."
+        )
+        if outstanding:
+            reason += (
+                f" {len(outstanding)} discovered requirement(s) remain unsatisfied: "
+                + "; ".join(r.text[:120] for r in outstanding[:3])
+            )
 
         await self.tasks.transition(
             task,
             TaskStatus.PARTIALLY_COMPLETED,
-            reason=(
-                f"{len(plan.steps)} step(s) processed but {len(unverified)} unverified, "
-                f"{len(skipped)} skipped, {len(blocked)} blocked. The objective is not fully verified."
-            ),
+            reason=reason,
             verified=False,
             evidence_count=verified_count,
             progress=self._plan_progress(plan),
@@ -1052,6 +1541,11 @@ class AgentController:
                 # from the model). Authoritative evidence is the best signal
                 # available; anything weaker is not.
                 return True, 1
+            # Cross-integration equivalence: some methods describe a FACT rather than
+            # an integration (e.g. "the remote state now says X"). A Telegram read and
+            # a page observation are both authoritative observations of remote state,
+            # so either may satisfy the other's method.
+            allowed = allowed | EQUIVALENT_EVIDENCE_KINDS.get(method, frozenset())
             if kind in allowed:
                 return True, 1
             logger.info(

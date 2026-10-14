@@ -97,6 +97,38 @@ export interface TaskReport {
     value_usd: number
     confirmations: number
   }>
+  context?: TaskContextView
+}
+
+/**
+ * The task's own persistent execution context, as the backend resolves it.
+ *
+ * `proven_actions` and `unproven_attempts` are deliberately separate lists: the backend
+ * records what was attempted and what was confirmed as different facts, and collapsing
+ * them here is how a UI ends up implying an uncertain action succeeded.
+ */
+export interface TaskContextView {
+  goal: string | null
+  normalized_objective: string | null
+  campaign_id: string | null
+  next_step_rationale: string | null
+  current_step_index: number | null
+  external_state: Record<string, unknown>
+  resource_refs: Record<string, unknown>
+  human_intervention: Record<string, unknown>
+  authorization_state: Record<string, unknown>
+  unresolved_questions: string[]
+  outstanding_requirements: Array<{
+    text: string
+    origin: string
+    account_specific: boolean
+  }>
+  proven_actions: string[]
+  unproven_attempts: Array<{ action: string; outcome: string }>
+  observation_count: number
+  campaign_facts: Array<{ content: string; category: string; confidence: number }>
+  global_fact_count: number
+  error?: string
 }
 
 export interface AgentInfo {

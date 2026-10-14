@@ -29,6 +29,7 @@ from backend.app.models.airdrops import (
 )
 from backend.app.models.tools import Tool, ToolExecution, GeneratedAdapter
 from backend.app.models.planning import ExecutionPlan, PlanRevision, ExecutionLease
+from backend.app.models.context import TaskContext, TaskObservation, TaskRequirement
 from backend.app.models.memory import (
     MemoryRecord,
     KnowledgeRelationship,
@@ -85,6 +86,9 @@ __all__ = [
     "ExecutionPlan",
     "PlanRevision",
     "ExecutionLease",
+    "TaskContext",
+    "TaskObservation",
+    "TaskRequirement",
     "MemoryRecord",
     "KnowledgeRelationship",
     "LearningRecord",

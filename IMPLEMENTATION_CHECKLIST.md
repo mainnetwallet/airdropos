@@ -1,11 +1,13 @@
 # AirdropOS Implementation Checklist
 
-**Status as of 2026-10-13 (browser system update):** the backend suite passes at
-**1203 tests** and the frontend at **32**, with `npm run lint` (0 errors) and
+**Status as of 2026-10-14:** the backend suite passes at
+**362 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
+and the frontend at **26**, with `npm run lint` (0 errors) and
 `npm run build` both clean. See
 [`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
 list, [`docs/AUTONOMOUS_EXECUTION.md`](./docs/AUTONOMOUS_EXECUTION.md) for the
-autonomy policy, and [`docs/AGENT_CAPABILITIES.md`](./docs/AGENT_CAPABILITIES.md) for
+autonomy policy, [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the
+context hierarchy, and [`docs/AGENT_CAPABILITIES.md`](./docs/AGENT_CAPABILITIES.md) for
 what the agent can do from chat.
 
 **The AI Agent Console executes tools.** `POST /agent/chat` selects registered tools
@@ -144,12 +146,17 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] `scripts/start_backend.sh`, `scripts/start_worker.sh`
 - [x] `docs/DEPLOYMENT.md`, `docs/DATABASE_BACKUP.md`
 
-## Known gaps (verified 2026-10-12)
-- [~] Airdrop discovery runs on a hard-coded community URL list and **does not persist** discovered campaigns to the database.
-- [~] Dynamic tools: proposals are AST-validated and stored inert; execution is intentionally disabled, so there are no working dynamic adapters.
-- [ ] Human-approval store/API: `TransactionEngine` requires an `ApprovalVerifier`, but no implementation or approval endpoint exists, so broadcast fails closed.
-- [~] Containers (backend, worker, frontend) run as root; the dashboard publishes on `0.0.0.0:3000` over plain HTTP unless `FRONTEND_BIND` is set.
-- [~] Egress: destinations are vetted before each request, but there is no network-level egress firewall; DNS rebinding is narrowed, not eliminated.
+## Known gaps (verified 2026-10-12)
+- [~] Airdrop discovery runs on a hard-coded community URL list and **does not persist** discovered campaigns to the database.
+- [~] Dynamic tools: proposals are AST-validated and stored inert; execution is intentionally disabled, so there are no working dynamic adapters.
+- [ ] Human-approval store/API: `TransactionEngine` requires an `ApprovalVerifier`, but no implementation or approval endpoint exists, so broadcast fails closed.
+- [~] Containers (backend, worker, frontend) run as root; the dashboard publishes on `0.0.0.0:3000` over plain HTTP unless `FRONTEND_BIND` is set.
+- [~] Egress: destinations are vetted before each request, but there is no network-level egress firewall; DNS rebinding is narrowed, not eliminated.
+- [~] **The terminal dashboard's layout tests fail (17).** `test_terminal_layout.py` and
+      `test_terminal_logs.py` fail at HEAD, before any of this work: click targets are
+      recorded at coordinates where the frame draws whitespace, and some sizes render a
+      row count other than the terminal height. Reproduced in a clean worktree of `fbca677`.
+      Unrelated to the agent; not fixed here.
 
 ## Phase 12 — Chat-Controlled Agent (added 2026-10-13)
 - [x] `app/agent/chat_loop.py` — bounded decide -> authorize -> execute -> verify -> report
@@ -207,6 +214,65 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [x] Test isolation fixed: every test now runs against its own in-memory database.
       Previously `session_scope` reached the operator's real `airdropos.db`, so test
       runs wrote wallets, tasks and approvals into production data.
+
+## Phase 15 — Persistent Execution Context (added 2026-10-14)
+See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference.
+
+- [x] `app/models/context.py` + migration `6_task_context` — `task_contexts`,
+      `task_observations`, `task_requirements`. One row per task; observations carry a
+      fingerprint of tool + canonical arguments.
+- [x] `memory_records` gains `scope` / `task_id` / `campaign_id`. Enforced in
+      `MemoryManager`: a scoped record without its owner is refused, and a "global"
+      record carrying an owner is refused. `recall_for_context` returns only what a task
+      is entitled to. **Before this, every memory was global, so any recall could return
+      one task's private history into another's prompt.**
+- [x] `app/agent/context.py` — `TaskContextService`. Goal, action history, observed
+      external state kept distinct from tool results, discovered requirements, external
+      resource references, next-step rationale, human-intervention and authorization
+      state, retry summary. Every write is scoped by `task_id`; there is no API that
+      reads "the" context without a task.
+- [x] `app/airdrops/campaign_context.py` — campaign facts shared across tasks, with
+      freshness reporting (stale after 24h or never checked), official-vs-community
+      provenance, and terminal-campaign handling. `record_shared_fact` **raises** on
+      account- or wallet-specific content.
+- [x] `app/agent/discovery.py` — deterministic structured requirement extraction
+      (no model call) plus bounded prose extraction (`MAX_PROSE_EXTRACTIONS_PER_RUN`).
+      Injection-shaped content is not sent to the model and never becomes a requirement.
+- [x] `AgentController` writes to the context after every meaningful action, records why
+      the next step is next, records failures and authorization refusals, and names
+      outstanding requirements at finalization.
+- [x] **Repeat suppression.** A non-idempotent action already proven in this task is not
+      executed again. Only an *authoritative confirmation* suppresses it, so an uncertain
+      action is investigated rather than skipped or blindly repeated. The suppression is
+      itself recorded as `duplicate_suppressed`.
+- [x] `ReplanTrigger.DISCOVERY` — the plan is revised when executing it revealed
+      requirements no current step addresses, under its own budget
+      (`MAX_DISCOVERY_REPLANS_PER_RUN`) so progress never consumes the failure-retry
+      allowance.
+- [x] Secrets cannot enter the context: every write is screened, and `resource_refs`
+      accepts an allowlist of reference keys only.
+- [x] `GET /api/v1/tasks/{id}/context` (`require_read`), a `context` block on the task
+      status report, and a `task.context_updated` live event.
+- [x] **Task Manager** detail panel renders the context: goal, why the next action is
+      next, outstanding requirements, proven actions, and attempted-but-unverified actions
+      as three separate lists. It never renders an unproven action as a success.
+- [x] `test_task_context_isolation.py` (31), `test_campaign_context.py` (15),
+      `test_context_aware_execution.py` (31), plus context assertions in
+      `test_migrations_sqlite.py`.
+- [x] **Recovery replans are budgeted separately from discovery replans.** Both advance
+      the same revision counter, so the recovery cap is now read from the persisted
+      revision history counting only recovery triggers. Without this, a task that
+      legitimately discovered new requirements would have spent its ability to recover
+      from a genuine failure.
+- [ ] **The panel does not yet subscribe to `task.context_updated`**; it renders what the
+      task status report carried when it loaded. The backend state is authoritative.
+- [ ] **No external-state reconciliation on resume.** A resumed run loads its context and
+      does not replay confirmed actions, but does not re-probe live state to confirm
+      recorded facts still hold. `observed_state` is the record to compare against.
+- [ ] **Campaign linking is not automatic.** `link_task` is called explicitly; nothing
+      yet attaches a task to a campaign during execution.
+
+---
 
 ## Phase 14 — Unified Persistent Chrome & Browser Automation (added 2026-10-13)
 

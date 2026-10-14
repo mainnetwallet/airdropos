@@ -1,0 +1,932 @@
+"""Persistent, isolated execution context for one task.
+
+This is the infrastructure the master specification calls for in §5 and §6: the
+knowledge that must survive a tool call, a switch between integrations, a replan, a
+worker restart and an application restart.
+
+What it stores, per task and in structured rows rather than in a prompt:
+
+* the original goal and the objective it was normalised to,
+* every action attempted, the arguments used, what came back, and what state was
+  observed afterwards,
+* requirements discovered while executing, and which of them are still outstanding,
+* references to the external resources involved (page, chat, session, wallet),
+* the reason the current next action is the next action,
+* human-intervention and authorization state,
+* errors, retries and the recovery decision taken.
+
+Three deliberate design points, each of which closes a specific way context is lost or
+mixed:
+
+**Attempted is not confirmed.** An observation records what was tried *and* what the
+external system then looked like, in separate columns, and the outcome vocabulary keeps
+`attempted`, `executed`, `unverified` and `confirmed` distinct. `confirmed_fingerprint()`
+answers "has this exact action already been proven?" from that record, so a resumed run
+does not repeat a completed non-idempotent action, and an action whose result is unknown
+is investigated rather than blindly retried.
+
+**Everything is addressed by `task_id`.** Loading a context requires the task; there is
+no "load the current context" call that could resolve to another task's history. Every
+write is filtered by task id, so two concurrent tasks cannot overwrite each other.
+
+**Secrets never enter context.** Reference values pass the same screening memory uses, so
+a page URL or a chat id can be recorded while a token, a seed phrase or a private key
+cannot. This is enforced at the write, not by convention at the call site.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
+
+from backend.app.memory.manager import MemoryManager, SecretLeakError
+from backend.app.models import (
+    MemoryRecord,
+    Task,
+    TaskContext,
+    TaskObservation,
+    TaskRequirement,
+)
+from backend.app.models.context import (
+    OBSERVATION_OUTCOMES,
+    OUTCOME_ATTEMPTED,
+    OUTCOME_BLOCKED,
+    OUTCOME_CONFIRMED,
+    OUTCOME_DUPLICATE_SUPPRESSED,
+    OUTCOME_EXECUTED,
+    OUTCOME_FAILED,
+    OUTCOME_SKIPPED,
+    OUTCOME_UNVERIFIED,
+    REQUIREMENT_DISCOVERED,
+    REQUIREMENT_SATISFIED,
+    REQUIREMENT_UNVERIFIABLE,
+    REQUIREMENT_WAIVED,
+)
+from backend.app.models.memory import SCOPE_CAMPAIGN, SCOPE_GLOBAL, SCOPE_TASK
+
+logger = logging.getLogger(__name__)
+
+# Reference-bearing keys that may be recorded in `resource_refs`. Anything outside this
+# set is refused, so a session token cannot be parked in the context "for later".
+ALLOWED_RESOURCE_REF_KEYS = frozenset(
+    {
+        "url",
+        "chat_id",
+        "chat_title",
+        "bot_username",
+        "channel",
+        "session_key",
+        "session_id",
+        "profile",
+        "wallet_address",
+        "wallet_id",
+        "network",
+        "contract_address",
+        "tx_hash",
+        "campaign_id",
+        "project_id",
+        "discord_guild_id",
+        "discord_channel_id",
+        "discord_role_id",
+        "x_handle",
+        "screenshot_path",
+        "evidence_uri",
+        "conversation_id",
+    }
+)
+
+# Keys whose values are external resource references rather than observations of state.
+# Anything else in a tool result is a *result*, and is recorded as such.
+_RESOURCE_KEYS = ALLOWED_RESOURCE_REF_KEYS
+
+_WHITESPACE = re.compile(r"\s+")
+
+
+def canonical_digest(payload: Any) -> str:
+    """A stable digest of arbitrary JSON-ish arguments.
+
+    Used so an action can be recognised again without storing its arguments verbatim:
+    typed text and secrets may be in them, and the digest is what the repeat check
+    compares.
+    """
+    try:
+        blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
+    except (TypeError, ValueError):
+        blob = repr(payload)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def action_fingerprint(tool: Optional[str], parameters: Dict[str, Any]) -> str:
+    """Identity of an action: the tool plus its arguments, independent of the step."""
+    return canonical_digest({"tool": tool or "", "parameters": parameters or {}})
+
+
+def normalize_requirement(text: str) -> str:
+    """Collapse a requirement to a comparable key so the same one is not stored twice."""
+    return _WHITESPACE.sub(" ", str(text or "").strip().lower())[:400]
+
+
+def _clip(value: Any, limit: int) -> Any:
+    """Bound a value before it is written, so a huge page dump cannot bloat a row."""
+    if isinstance(value, str):
+        return value[:limit]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    try:
+        return json.dumps(value, default=str)[:limit]
+    except (TypeError, ValueError):
+        return str(value)[:limit]
+
+
+@dataclass
+class ObservationRecord:
+    """What one meaningful action did, as persisted."""
+
+    id: Any
+    fingerprint: str
+    outcome: str
+    tool: Optional[str]
+    action: str
+    evidence_kind: Optional[str] = None
+    evidence_authoritative: bool = False
+    observed_state: Dict[str, Any] = field(default_factory=dict)
+    integration_ref: Optional[str] = None
+
+    @property
+    def proved_completion(self) -> bool:
+        """True only when the outcome is an authoritative confirmation.
+
+        `executed` and `unverified` deliberately do not qualify: an action that ran, or
+        ran without matching evidence, is not a completed requirement.
+        """
+        return self.outcome == OUTCOME_CONFIRMED and self.evidence_authoritative
+
+
+@dataclass
+class ResolvedContext:
+    """The three context levels, assembled but never merged into one blob.
+
+    The levels stay separate on purpose. A caller can tell which fact came from this
+    task, which from its campaign, and which from general knowledge, and can enforce the
+    boundaries between them - most importantly that only `global` facts may be offered
+    to a task that has no relationship to the others.
+    """
+
+    task_context: Optional[TaskContext] = None
+    campaign_id: Optional[Any] = None
+    campaign_facts: List[Dict[str, Any]] = field(default_factory=list)
+    global_facts: List[Dict[str, Any]] = field(default_factory=list)
+    observations: List[ObservationRecord] = field(default_factory=list)
+    requirements: List[TaskRequirement] = field(default_factory=list)
+
+    def outstanding_requirements(self) -> List[TaskRequirement]:
+        return [r for r in self.requirements if r.status == REQUIREMENT_DISCOVERED]
+
+    def digest(self, *, max_chars: int = 6000) -> str:
+        """A bounded, source-labelled summary for a prompt.
+
+        Only what a decision actually needs: what is outstanding, what is proven, what
+        the last observation found, and the relevant external references. Never the whole
+        history, and never at the cost of the distinctions the levels exist to preserve.
+        """
+        parts: List[str] = []
+
+        if self.task_context is not None:
+            ctx = self.task_context
+            if ctx.goal:
+                parts.append(f"GOAL (this task): {ctx.goal}")
+            if ctx.next_step_rationale:
+                parts.append(f"WHY THE NEXT ACTION: {ctx.next_step_rationale}")
+
+        confirmed = [o for o in self.observations if o.proved_completion]
+        if confirmed:
+            parts.append(
+                "ALREADY PROVEN (do not repeat): "
+                + "; ".join(f"{o.action}" for o in confirmed[-8:])
+            )
+        uncertain = [
+            o for o in self.observations if o.outcome in (OUTCOME_UNVERIFIED, OUTCOME_ATTEMPTED)
+        ]
+        if uncertain:
+            parts.append(
+                "ATTEMPTED BUT NOT PROVEN (investigate before retrying): "
+                + "; ".join(f"{o.action}" for o in uncertain[-5:])
+            )
+
+        outstanding = self.outstanding_requirements()
+        if outstanding:
+            parts.append(
+                "OUTSTANDING REQUIREMENTS (discovered while executing): "
+                + "; ".join(r.text for r in outstanding[:10])
+            )
+
+        if self.observations:
+            last = self.observations[-1]
+            if last.observed_state:
+                parts.append(
+                    f"LAST OBSERVED EXTERNAL STATE: {_clip(last.observed_state, 800)}"
+                )
+
+        if self.campaign_facts:
+            parts.append(
+                "CAMPAIGN FACTS (shared by every task on this campaign; not "
+                "account-specific): "
+                + "; ".join(str(f.get("content", "")) for f in self.campaign_facts[:8])
+            )
+        if self.global_facts:
+            parts.append(
+                "GENERAL KNOWLEDGE (reusable, contains no task's private history): "
+                + "; ".join(str(f.get("content", "")) for f in self.global_facts[:8])
+            )
+
+        text = "\n".join(parts)
+        return text[:max_chars]
+
+
+class TaskContextService:
+    """Reads and writes one task's execution context.
+
+    Every method that touches persistence is scoped by `task_id`. There is deliberately
+    no API here that reads "the" context without a task, because that is precisely the
+    call that would let one task read another's history.
+    """
+
+    def __init__(self, db: AsyncSession, task: Optional[Task] = None) -> None:
+        self.db = db
+        self._task = task
+        self._memory = MemoryManager(db)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+    async def load_or_create(self, task: Task) -> TaskContext:
+        """Return this task's context, creating it on first use.
+
+        The lookup is by `task_id`, so an existing context belonging to another task can
+        never be returned. A task created before this existed gets one here on its first
+        run rather than being silently skipped.
+        """
+        existing = await self.db.scalar(
+            select(TaskContext).where(TaskContext.task_id == task.id)
+        )
+        if existing is not None:
+            return existing
+
+        context = TaskContext(
+            task_id=task.id,
+            goal=(task.title or "")[:2000] or None,
+            normalized_objective=(task.description or task.title or "")[:4000] or None,
+            success_criteria=[],
+            outstanding_requirements=[],
+            unresolved_questions=[],
+            resource_refs={},
+            external_state={},
+            human_intervention={},
+            authorization_state={},
+            retry_summary={},
+            revision=1,
+        )
+        self.db.add(context)
+        await self.db.flush()
+        logger.info("Created execution context for task %s", task.task_id)
+        return context
+
+    async def get(self, task: Task) -> Optional[TaskContext]:
+        return await self.db.scalar(select(TaskContext).where(TaskContext.task_id == task.id))
+
+    # ------------------------------------------------------------------
+    # Writing the context after a meaningful action
+    # ------------------------------------------------------------------
+    async def set_goal(
+        self,
+        task: Task,
+        *,
+        goal: Optional[str] = None,
+        normalized_objective: Optional[str] = None,
+        success_criteria: Optional[Sequence[str]] = None,
+        campaign_id: Optional[Any] = None,
+    ) -> TaskContext:
+        context = await self.load_or_create(task)
+        if goal:
+            context.goal = goal[:2000]
+        if normalized_objective:
+            context.normalized_objective = normalized_objective[:4000]
+        if success_criteria is not None:
+            context.success_criteria = [str(c)[:300] for c in success_criteria][:20]
+        if campaign_id is not None:
+            context.campaign_id = campaign_id
+        self._touch(context)
+        await self.db.flush()
+        return context
+
+    async def set_next_step(
+        self, task: Task, *, rationale: str, step_index: Optional[int] = None
+    ) -> None:
+        """Record *why* the next action is the next action.
+
+        Without this the rationale exists only in the loop variable that produced it, so
+        a restart or a second worker cannot tell a considered choice from an arbitrary one.
+        """
+        context = await self.load_or_create(task)
+        context.next_step_rationale = rationale[:2000]
+        if step_index is not None:
+            context.current_step_index = int(step_index)
+        self._touch(context)
+        await self.db.flush()
+
+    async def record_observation(
+        self,
+        task: Task,
+        *,
+        action: str,
+        outcome: str,
+        tool: Optional[str] = None,
+        parameters: Optional[Dict[str, Any]] = None,
+        step_index: Optional[int] = None,
+        iteration: int = 0,
+        evidence: Optional[Dict[str, Any]] = None,
+        observed_state: Optional[Dict[str, Any]] = None,
+        result_digest: Optional[Dict[str, Any]] = None,
+        integration_ref: Optional[str] = None,
+        is_idempotent: bool = True,
+        error: Optional[str] = None,
+    ) -> ObservationRecord:
+        """Persist what one action did and what the external state then looked like.
+
+        `observed_state` is deliberately separate from `result_digest`: the first is what
+        the external system looks like (what the bot said, what the page shows), the second
+        is what the tool returned. Recording only the latter is what makes an attempt look
+        like a fact.
+        """
+        if outcome not in OBSERVATION_OUTCOMES:
+            # An unknown outcome must not silently become "fine". Unknown -> unverified.
+            logger.warning(
+                "Task %s: unknown observation outcome %r stored as unverified", task.task_id, outcome
+            )
+            outcome = OUTCOME_UNVERIFIED
+
+        context = await self.load_or_create(task)
+        evidence = evidence or {}
+        fingerprint = action_fingerprint(tool, parameters or {})
+
+        observation = TaskObservation(
+            task_id=task.id,
+            context_id=context.id,
+            iteration=int(iteration or 0),
+            step_index=step_index,
+            action=str(action)[:500],
+            tool=(tool or None) and str(tool)[:128],
+            arguments_digest=canonical_digest(parameters or {}),
+            fingerprint=fingerprint,
+            outcome=outcome,
+            evidence_kind=(str(evidence.get("kind"))[:64] if evidence.get("kind") else None),
+            evidence_authoritative=bool(evidence.get("authoritative")),
+            observed_state=self._screened_dict(observed_state or {}),
+            result_digest=self._screened_dict(result_digest or {}),
+            integration_ref=(integration_ref or None) and str(integration_ref)[:255],
+            is_idempotent=bool(is_idempotent),
+            error=(error or None) and str(error)[:2000],
+        )
+        self.db.add(observation)
+        await self.db.flush()
+
+        # The newest observation is the current external state, and any references it
+        # carries are the ones a later step in another integration will need.
+        if observed_state:
+            context.external_state = dict(observed_state)
+            flag_modified(context, "external_state")
+        if outcome in (OUTCOME_FAILED, OUTCOME_BLOCKED) and error:
+            context.last_error = str(error)[:2000]
+        await self.merge_resource_refs(task, self._refs_from(observed_state or {}))
+
+        self._touch(context)
+        await self.db.flush()
+
+        if outcome == OUTCOME_CONFIRMED and evidence.get("authoritative"):
+            await self._satisfy_matching_requirements(task, observation, action)
+
+        await self._notify_context_changed(task, action)
+
+        return ObservationRecord(
+            id=observation.id,
+            fingerprint=fingerprint,
+            outcome=outcome,
+            tool=tool,
+            action=str(action)[:500],
+            evidence_kind=observation.evidence_kind,
+            evidence_authoritative=observation.evidence_authoritative,
+            observed_state=observed_state or {},
+            integration_ref=integration_ref,
+        )
+
+    async def record_requirement(
+        self,
+        task: Task,
+        text: str,
+        *,
+        origin: str = "tool_result",
+        source_ref: Optional[str] = None,
+        is_campaign_scoped: bool = False,
+        is_account_specific: bool = False,
+        account_ref: Optional[str] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> Optional[TaskRequirement]:
+        """Record a requirement discovered while executing.
+
+        An account-specific requirement is one that belongs to *this* account or wallet.
+        It is stored here and is never offered to another task, even on the same campaign:
+        one wallet's eligibility is not evidence about another wallet.
+        """
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return None
+        context = await self.load_or_create(task)
+        key = normalize_requirement(cleaned)
+
+        # Queried explicitly rather than through `context.requirements`: a lazy
+        # relationship load raises MissingGreenlet in an async session, which is exactly
+        # the failure that made this unreadable from the loop before.
+        existing = next(
+            (
+                row
+                for row in await self.requirements(task)
+                if normalize_requirement(row.text) == key
+            ),
+            None,
+        )
+        if existing is not None:
+            return existing  # already known; do not duplicate the outstanding list
+
+        requirement = TaskRequirement(
+            task_id=task.id,
+            context_id=context.id,
+            text=cleaned[:1000],
+            origin=origin[:50],
+            source_ref=(source_ref or None) and str(source_ref)[:512],
+            status=REQUIREMENT_DISCOVERED,
+            is_campaign_scoped=bool(is_campaign_scoped),
+            is_account_specific=bool(is_account_specific),
+            account_ref=(account_ref or None) and str(account_ref)[:255],
+            evidence=self._screened_dict(evidence or {}),
+        )
+        self.db.add(requirement)
+        await self.db.flush()
+        await self._refresh_outstanding(task)
+        await self._notify_context_changed(task, f"Requirement discovered: {cleaned[:150]}")
+        return requirement
+
+    async def satisfy_requirement(
+        self, task: Task, requirement_id: Any, observation_id: Any, *, evidence: Optional[Dict[str, Any]] = None
+    ) -> None:
+        requirement = await self.db.get(TaskRequirement, requirement_id)
+        if requirement is None or requirement.task_id != task.id:
+            return
+        requirement.status = REQUIREMENT_SATISFIED
+        requirement.satisfied_by_observation_id = observation_id
+        if evidence:
+            requirement.evidence = self._screened_dict(evidence)
+        await self.db.flush()
+        await self._refresh_outstanding(task)
+
+    async def mark_requirement(
+        self, task: Task, requirement_id: Any, status: str, *, evidence: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Move a requirement to waived/unverifiable, recording why.
+
+        Only reachable states are accepted; anything else is a programming error and is
+        refused rather than written.
+        """
+        if status not in (REQUIREMENT_SATISFIED, REQUIREMENT_WAIVED, REQUIREMENT_UNVERIFIABLE):
+            raise ValueError(f"Not a terminal requirement status: {status!r}")
+        requirement = await self.db.get(TaskRequirement, requirement_id)
+        if requirement is None or requirement.task_id != task.id:
+            return
+        requirement.status = status
+        if evidence:
+            requirement.evidence = self._screened_dict(evidence)
+        await self.db.flush()
+        await self._refresh_outstanding(task)
+
+    async def add_question(self, task: Task, question: str) -> None:
+        context = await self.load_or_create(task)
+        questions = list(context.unresolved_questions or [])
+        if question and question not in questions:
+            questions.append(str(question)[:500])
+        context.unresolved_questions = questions[:20]
+        flag_modified(context, "unresolved_questions")
+        self._touch(context)
+        await self.db.flush()
+
+    async def record_human_intervention(
+        self,
+        task: Task,
+        *,
+        required: bool,
+        reason: str,
+        step_index: Optional[int] = None,
+        instruction: Optional[str] = None,
+        resolved: bool = False,
+    ) -> None:
+        """Record what the task is waiting on a person for.
+
+        Cleared when the operator clears it, so "waiting for a human" is a fact about
+        now, not a permanent label.
+        """
+        context = await self.load_or_create(task)
+        state = dict(context.human_intervention or {})
+        if resolved:
+            state = {
+                **state,
+                "pending": False,
+                "resolved_at": datetime.now(timezone.utc).isoformat(),
+            }
+        else:
+            state = {
+                **state,
+                "pending": bool(required),
+                "reason": str(reason)[:1000],
+                "instruction": str(instruction or reason)[:1000],
+                "step_index": step_index,
+                "raised_at": datetime.now(timezone.utc).isoformat(),
+            }
+        context.human_intervention = state
+        flag_modified(context, "human_intervention")
+        self._touch(context)
+        await self.db.flush()
+
+    async def record_authorization(
+        self, task: Task, *, permission: str, granted: bool, detail: str = ""
+    ) -> None:
+        """Record an authorization decision so the reason a call was refused survives."""
+        context = await self.load_or_create(task)
+        state = dict(context.authorization_state or {})
+        state[str(permission)[:128]] = {
+            "granted": bool(granted),
+            "detail": str(detail)[:500],
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        context.authorization_state = state
+        flag_modified(context, "authorization_state")
+        self._touch(context)
+        await self.db.flush()
+
+    async def record_failure(
+        self, task: Task, *, error: str, category: str = "", recovery: str = ""
+    ) -> None:
+        context = await self.load_or_create(task)
+        summary = dict(context.retry_summary or {})
+        attempts = int(summary.get("attempts", 0)) + 1
+        summary.update(
+            {
+                "attempts": attempts,
+                "last_error": str(error)[:1000],
+                "last_category": str(category)[:100],
+                "last_recovery": str(recovery)[:500],
+                "last_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        context.retry_summary = summary
+        context.last_error = str(error)[:2000]
+        flag_modified(context, "retry_summary")
+        self._touch(context)
+        await self.db.flush()
+
+    async def mark_resumed(self, task: Task) -> None:
+        """Record that this task is being picked up again after an interruption."""
+        context = await self.load_or_create(task)
+        context.resumed_at = datetime.now(timezone.utc)
+        self._touch(context)
+        await self.db.flush()
+
+    # ------------------------------------------------------------------
+    # Reading
+    # ------------------------------------------------------------------
+    async def confirmed_fingerprint(
+        self, task: Task, tool: Optional[str], parameters: Dict[str, Any]
+    ) -> Optional[TaskObservation]:
+        """The already-confirmed observation of this exact action, if there is one.
+
+        This is the repeat guard. It only reports an *authoritative confirmation*, never
+        an attempt or an unverified result, so an action whose outcome is genuinely
+        unknown is investigated rather than skipped and never silently repeated.
+        """
+        fingerprint = action_fingerprint(tool, parameters or {})
+        return await self.db.scalar(
+            select(TaskObservation)
+            .where(
+                TaskObservation.task_id == task.id,
+                TaskObservation.fingerprint == fingerprint,
+                TaskObservation.outcome == OUTCOME_CONFIRMED,
+                TaskObservation.evidence_authoritative.is_(True),
+            )
+            .order_by(TaskObservation.id.desc())
+            .limit(1)
+        )
+
+    async def latest_attempt(
+        self, task: Task, tool: Optional[str], parameters: Dict[str, Any]
+    ) -> Optional[TaskObservation]:
+        """The most recent outcome of this exact action, confirmed or not.
+
+        Used to tell "never tried" from "tried, outcome unknown", which are different
+        situations and deserve different handling.
+        """
+        fingerprint = action_fingerprint(tool, parameters or {})
+        return await self.db.scalar(
+            select(TaskObservation)
+            .where(
+                TaskObservation.task_id == task.id,
+                TaskObservation.fingerprint == fingerprint,
+            )
+            .order_by(TaskObservation.id.desc())
+            .limit(1)
+        )
+
+    async def observations(self, task: Task, *, limit: int = 200) -> List[ObservationRecord]:
+        rows = list(
+            (
+                await self.db.execute(
+                    select(TaskObservation)
+                    .where(TaskObservation.task_id == task.id)
+                    .order_by(TaskObservation.id.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows.reverse()
+        return [
+            ObservationRecord(
+                id=r.id,
+                fingerprint=r.fingerprint,
+                outcome=r.outcome,
+                tool=r.tool,
+                action=r.action,
+                evidence_kind=r.evidence_kind,
+                evidence_authoritative=r.evidence_authoritative,
+                observed_state=r.observed_state or {},
+                integration_ref=r.integration_ref,
+            )
+            for r in rows
+        ]
+
+    async def requirements(self, task: Task, *, only_outstanding: bool = False) -> List[TaskRequirement]:
+        stmt = select(TaskRequirement).where(TaskRequirement.task_id == task.id)
+        if only_outstanding:
+            stmt = stmt.where(TaskRequirement.status == REQUIREMENT_DISCOVERED)
+        return list(
+            (await self.db.execute(stmt.order_by(TaskRequirement.id))).scalars().all()
+        )
+
+    async def unaddressed_requirements(self, task: Task, plan_descriptions: Sequence[str]) -> List[TaskRequirement]:
+        """Outstanding requirements that no current plan step appears to address.
+
+        Word-overlap is a deliberately weak signal, and that is the point: it only has to
+        be good enough to notice that a newly discovered requirement has nothing in the
+        plan aimed at it, which is the condition that needs a replan. The decision to
+        replan is still made by bounded code, not by this heuristic.
+        """
+        outstanding = await self.requirements(task, only_outstanding=True)
+        if not outstanding:
+            return []
+        haystack = " ".join(str(d or "").lower() for d in plan_descriptions)
+        words = set(re.findall(r"[a-z0-9]{4,}", haystack))
+
+        unaddressed: List[TaskRequirement] = []
+        for requirement in outstanding:
+            terms = set(re.findall(r"[a-z0-9]{4,}", requirement.text.lower()))
+            if terms & words:
+                continue
+            unaddressed.append(requirement)
+        return unaddressed
+
+    async def merge_resource_refs(self, task: Task, refs: Dict[str, Any]) -> None:
+        """Store external references so a later step in another integration can resume.
+
+        Only an allowlisted set of reference keys is accepted, and every value is secret-
+        screened. A session cookie or a bot token has no key here and is refused, so the
+        context cannot become a place credentials accumulate.
+        """
+        accepted = {
+            key: value
+            for key, value in (refs or {}).items()
+            if key in ALLOWED_RESOURCE_REF_KEYS and value not in (None, "")
+        }
+        if not accepted:
+            return
+        context = await self.load_or_create(task)
+        merged = dict(context.resource_refs or {})
+        for key, value in accepted.items():
+            try:
+                MemoryManager.assert_no_secrets(str(value))
+            except SecretLeakError:
+                logger.warning(
+                    "Refusing to record %r as a task resource reference: it matches a secret pattern",
+                    key,
+                )
+                continue
+            merged[key] = _clip(value, 500)
+        if merged != (context.resource_refs or {}):
+            context.resource_refs = merged
+            flag_modified(context, "resource_refs")
+            self._touch(context)
+            await self.db.flush()
+
+    # ------------------------------------------------------------------
+    # Resolution across the three levels
+    # ------------------------------------------------------------------
+    async def resolve(
+        self, task: Task, *, global_limit: int = 8, observation_limit: int = 200
+    ) -> ResolvedContext:
+        """Assemble task, campaign and global context without merging their boundaries.
+
+        Task context is always this task's. Campaign context is read only through an
+        explicit campaign link. Global context is restricted to records written at global
+        scope, so a task- or campaign-scoped memory can never surface as general knowledge.
+        """
+        context = await self.get(task)
+        resolved = ResolvedContext(task_context=context)
+
+        if context is not None:
+            resolved.campaign_id = context.campaign_id
+            # Explicit query, not `context.requirements`: lazy loading raises
+            # MissingGreenlet in an async session.
+            resolved.requirements = await self.requirements(task)
+
+        resolved.observations = await self.observations(task, limit=observation_limit)
+
+        if context is not None and context.campaign_id is not None:
+            resolved.campaign_facts = await self._campaign_facts(context.campaign_id)
+
+        resolved.global_facts = await self._global_facts(
+            task, limit=global_limit
+        )
+        return resolved
+
+    async def _campaign_facts(self, campaign_id: Any) -> List[Dict[str, Any]]:
+        """Campaign-scoped memories: reusable facts, never account state.
+
+        Only records explicitly written at campaign scope are returned. A fact that
+        happened to be learned by one task lives in that task's context, not here.
+        """
+        rows = list(
+            (
+                await self.db.execute(
+                    select(MemoryRecord)
+                    .where(
+                        MemoryRecord.scope == SCOPE_CAMPAIGN,
+                        MemoryRecord.campaign_id == campaign_id,
+                    )
+                    .order_by(MemoryRecord.confidence.desc())
+                    .limit(12)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [{"content": r.content, "category": r.category, "confidence": r.confidence} for r in rows]
+
+    async def _global_facts(self, task: Task, *, limit: int) -> List[Dict[str, Any]]:
+        """General knowledge only: rows written at global scope and related to nothing else."""
+        rows = list(
+            (
+                await self.db.execute(
+                    select(MemoryRecord)
+                    .where(
+                        MemoryRecord.scope == SCOPE_GLOBAL,
+                        MemoryRecord.task_id.is_(None),
+                        MemoryRecord.campaign_id.is_(None),
+                    )
+                    .order_by(MemoryRecord.confidence.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return [{"content": r.content, "category": r.category, "confidence": r.confidence} for r in rows]
+
+    @staticmethod
+    async def _notify_context_changed(task: Task, summary: str) -> None:
+        """Tell the dashboard this task's context moved on.
+
+        A hint only: everything a client needs is already committed to the database
+        before this fires, so a dropped notification costs a refresh and never state. It
+        is wrapped because a websocket bus problem must never interrupt execution.
+        """
+        try:
+            from backend.app.inbox import events
+
+            await events.publish(
+                events.EV_TASK_CONTEXT_UPDATED,
+                task_id=task.task_id,
+                summary=summary[:200],
+            )
+        except Exception as exc:  # pragma: no cover - notification is best-effort
+            logger.debug("Context change notification failed for %s: %s", task.task_id, exc)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _touch(context: TaskContext) -> None:
+        context.revision = int(context.revision or 0) + 1
+        context.updated_at = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _refs_from(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Pick the reference-bearing keys out of a flat observation payload."""
+        return {
+            key: payload[key]
+            for key in _RESOURCE_KEYS
+            if key in payload and payload[key] not in (None, "")
+        }
+
+    @staticmethod
+    def _screened_dict(payload: Dict[str, Any], limit: int = 2000) -> Dict[str, Any]:
+        """Bound and secret-screen a dict before it is written to the context.
+
+        A value matching a secret pattern is replaced by a redaction marker rather than
+        dropped, so the record still says "there was something here" without storing it.
+        """
+        screened: Dict[str, Any] = {}
+        for key, value in (payload or {}).items():
+            if isinstance(value, str):
+                try:
+                    MemoryManager.assert_no_secrets(value)
+                    screened[str(key)[:80]] = value[:limit]
+                except SecretLeakError:
+                    screened[str(key)[:80]] = "[REDACTED: matched a secret pattern]"
+                continue
+            screened[str(key)[:80]] = _clip(value, limit)
+        return screened
+
+    async def _refresh_outstanding(self, task: Task) -> None:
+        """Keep the denormalised outstanding list equal to the authoritative rows."""
+        context = await self.get(task)
+        if context is None:
+            return
+        outstanding = await self.requirements(task, only_outstanding=True)
+        context.outstanding_requirements = [
+            {
+                "id": str(r.id),
+                "text": r.text,
+                "origin": r.origin,
+                "account_specific": r.is_account_specific,
+            }
+            for r in outstanding[:50]
+        ]
+        flag_modified(context, "outstanding_requirements")
+        self._touch(context)
+        await self.db.flush()
+
+    async def _satisfy_matching_requirements(
+        self, task: Task, observation: TaskObservation, action: str
+    ) -> None:
+        """Mark requirements this confirmed observation actually satisfies.
+
+        Matching is deliberately conservative: only outstanding requirements whose wording
+        overlaps the action that was just proven are closed. An unproven action closes
+        nothing, and an unrelated action closes nothing.
+        """
+        outstanding = await self.requirements(task, only_outstanding=True)
+        action_words = set(re.findall(r"[a-z0-9]{4,}", action.lower()))
+        for requirement in outstanding:
+            terms = set(re.findall(r"[a-z0-9]{4,}", requirement.text.lower()))
+            if terms and terms & action_words:
+                requirement.status = REQUIREMENT_SATISFIED
+                requirement.satisfied_by_observation_id = observation.id
+        await self.db.flush()
+        await self._refresh_outstanding(task)
+
+    # ------------------------------------------------------------------
+    async def count(self, task: Task) -> Tuple[int, int]:
+        """(observations, requirements) for this task only. Used by the status report."""
+        observations = await self.db.scalar(
+            select(func.count(TaskObservation.id)).where(TaskObservation.task_id == task.id)
+        )
+        requirements = await self.db.scalar(
+            select(func.count(TaskRequirement.id)).where(TaskRequirement.task_id == task.id)
+        )
+        return int(observations or 0), int(requirements or 0)
+
+
+__all__ = [
+    "ALLOWED_RESOURCE_REF_KEYS",
+    "ObservationRecord",
+    "ResolvedContext",
+    "TaskContextService",
+    "action_fingerprint",
+    "canonical_digest",
+    "normalize_requirement",
+]

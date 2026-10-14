@@ -40,6 +40,14 @@ INBOX_TABLES = (
 # Columns added to existing tables by the inbox revisions.
 INBOX_TASK_COLUMNS = ("owner_email", "operator_instructions")
 
+# The persistent execution-context tables, and the columns that give memory a scope.
+CONTEXT_TABLES = ("task_contexts", "task_observations", "task_requirements")
+CONTEXT_MEMORY_COLUMNS = ("scope", "task_id", "campaign_id")
+
+# The revision at the head of the chain. Pinned so a new revision that breaks the chain
+# is caught here rather than at deploy time.
+HEAD_REVISION = "6_task_context"
+
 
 def _run_alembic(db_path: Path, *args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
@@ -71,7 +79,7 @@ def migrated_db(tmp_path_factory) -> Path:
 class TestChainRunsOnSqlite:
     def test_upgrade_from_empty_reaches_head(self, migrated_db: Path):
         result = _run_alembic(migrated_db, "current")
-        assert "5_agent_inbox" in result.stdout, result.stdout
+        assert HEAD_REVISION in result.stdout, result.stdout
 
     def test_downgrade_to_base_is_supported(self, tmp_path_factory):
         db_path = tmp_path_factory.mktemp("downgrade") / "chain.db"
@@ -139,3 +147,50 @@ class TestInboxSchemaMatchesTheModels:
         finally:
             con.close()
         assert "ix_intervention_requests_request_id" in indexes
+
+
+class TestContextSchemaMatchesTheModels:
+    def _columns(self, db_path: Path, table: str) -> set:
+        con = sqlite3.connect(db_path)
+        try:
+            return {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        finally:
+            con.close()
+
+    def test_context_tables_exist(self, migrated_db: Path):
+        for table in CONTEXT_TABLES:
+            assert self._columns(migrated_db, table), f"{table} was not created"
+
+    def test_context_table_columns_match_the_orm(self, migrated_db: Path):
+        sys.path.insert(0, str(REPO))
+        try:
+            from backend.app.models import Base
+        finally:
+            sys.path.pop(0)
+
+        for table in Base.metadata.sorted_tables:
+            if table.name not in CONTEXT_TABLES:
+                continue
+            actual = self._columns(migrated_db, table.name)
+            declared = {c.name for c in table.columns}
+            assert declared <= actual, (
+                f"{table.name} is missing columns the model declares: "
+                f"{sorted(declared - actual)}"
+            )
+
+    def test_memory_scope_columns_exist(self, migrated_db: Path):
+        """Without these every memory is global and one task reads another's history."""
+        actual = self._columns(migrated_db, "memory_records")
+        for column in CONTEXT_MEMORY_COLUMNS:
+            assert column in actual, f"memory_records.{column} was never created by the chain"
+
+    def test_task_context_is_unique_per_task(self, migrated_db: Path):
+        """One isolated context per task. Two rows would mean two histories for one run."""
+        con = sqlite3.connect(migrated_db)
+        try:
+            indexes = {r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='task_contexts'"
+            )}
+        finally:
+            con.close()
+        assert "ix_task_contexts_task_id" in indexes

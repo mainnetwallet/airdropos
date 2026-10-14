@@ -385,7 +385,13 @@ async def task_execution_loop() -> None:
                 worker_state.polled(f"running {task.task_id}")
                 worker_state.task_claimed(task.task_id, task.title)
 
-                controller = AgentController(db, registry=registry)
+                # Bind the operator's authorization policy explicitly. The registry's
+                # own policy is used as a fallback inside `invoke`, but passing it here
+                # makes the controller's permission decisions explicit and identical to
+                # the ones the catalog and the planner were built from.
+                controller = AgentController(
+                    db, registry=registry, policy=registry.policy
+                )
                 report = await controller.execute_task(task)
                 await db.commit()
 
@@ -474,6 +480,7 @@ async def recover_interrupted_tasks() -> int:
     recorded as a status-transition event.
     """
     from backend.app.planning.planner import Planner
+    from backend.app.tools.registry import registry
 
     async with AsyncSessionLocal() as db:
         interrupted = list(
@@ -482,7 +489,10 @@ async def recover_interrupted_tasks() -> int:
             ).scalars().all()
         )
         manager = TaskManager(db)
-        planner = Planner(db)
+        # Bound to the real registry. A Planner built without one sees an empty tool
+        # catalog, so any replan it produced would have every tool reference dropped as
+        # "unregistered" and the recovered task would lose its tools.
+        planner = Planner(db, registry)
         queued = parked = failed = 0
         for task in interrupted:
             # The dead run's committed lease would otherwise block the retry for its full TTL.

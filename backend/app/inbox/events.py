@@ -38,6 +38,11 @@ EV_TASK_PROGRESS = "task.progress"
 EV_TASK_COMPLETED = "task.completed"
 EV_TASK_FAILED = "task.failed"
 EV_TASK_CANCELLED = "task.cancelled"
+# Emitted when a task's execution context materially changes: a requirement was
+# discovered, an action was proven, or a blocker was raised. The client refetches
+# /tasks/{id}/context on this hint, so the dashboard shows what the agent actually
+# learned rather than only that it is busy.
+EV_TASK_CONTEXT_UPDATED = "task.context_updated"
 
 EVENT_TYPES = frozenset(
     {
@@ -52,6 +57,7 @@ EVENT_TYPES = frozenset(
         EV_TASK_COMPLETED,
         EV_TASK_FAILED,
         EV_TASK_CANCELLED,
+        EV_TASK_CONTEXT_UPDATED,
     }
 )
 

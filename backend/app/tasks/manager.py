@@ -532,6 +532,12 @@ class TaskManager:
             if not any(c.get("id") == a.get("id") for c in (task.completed_actions or []))
         ]
 
+        # The task's own execution context: what it is working towards, what it has
+        # already proven, and what it discovered is still outstanding. Surfaced here so
+        # the operator sees the same facts the agent decides from, rather than a progress
+        # bar with no explanation behind it.
+        context_view = await self._execution_context_view(task)
+
         return {
             "task_id": task.task_id,
             "title": task.title,
@@ -592,7 +598,55 @@ class TaskManager:
                 }
                 for t in tx_rows
             ],
+            "context": context_view,
         }
+
+    async def _execution_context_view(self, task: Task) -> Dict[str, Any]:
+        """The task's persistent execution context, for the status report.
+
+        Read through the context service so this endpoint and the agent resolve context
+        by exactly the same rules. Returns an empty-but-present view for a task that has
+        not run yet, rather than null, so the UI has one shape to render.
+        """
+        from backend.app.agent.context import TaskContextService
+
+        try:
+            service = TaskContextService(self.db)
+            resolved = await service.resolve(task, observation_limit=50)
+            ctx = resolved.task_context
+            observations = resolved.observations
+            return {
+                "goal": ctx.goal if ctx else None,
+                "normalized_objective": ctx.normalized_objective if ctx else None,
+                "campaign_id": str(ctx.campaign_id) if ctx and ctx.campaign_id else None,
+                "next_step_rationale": ctx.next_step_rationale if ctx else None,
+                "current_step_index": ctx.current_step_index if ctx else None,
+                "external_state": ctx.external_state if ctx else {},
+                "resource_refs": ctx.resource_refs if ctx else {},
+                "human_intervention": ctx.human_intervention if ctx else {},
+                "authorization_state": ctx.authorization_state if ctx else {},
+                "unresolved_questions": ctx.unresolved_questions if ctx else [],
+                "outstanding_requirements": [
+                    {
+                        "text": r.text,
+                        "origin": r.origin,
+                        "account_specific": r.is_account_specific,
+                    }
+                    for r in resolved.outstanding_requirements()
+                ],
+                "proven_actions": [o.action for o in observations if o.proved_completion][-15:],
+                "unproven_attempts": [
+                    {"action": o.action, "outcome": o.outcome}
+                    for o in observations
+                    if o.outcome in ("attempted", "unverified")
+                ][-15:],
+                "observation_count": len(observations),
+                "campaign_facts": resolved.campaign_facts,
+                "global_fact_count": len(resolved.global_facts),
+            }
+        except Exception as exc:  # never let context rendering break the status report
+            logger.warning("Could not build context view for %s: %s", task.task_id, exc)
+            return {"error": "execution context unavailable"}
 
     async def find_duplicates(self, goal_id: Optional[str], title_fragment: str) -> List[Task]:
         """Detect near-duplicate tasks so the agent does not repeat itself."""

@@ -41,14 +41,57 @@ logger = logging.getLogger(__name__)
 class StepKind(str, Enum):
     RESEARCH = "research"          # Read-only information gathering.
     ANALYZE = "analyze"            # Deterministic computation over gathered data.
-    INTERACT = "interact"          # Web form/browser interaction.
+    INTERACT = "interact"          # Generic external interaction (kept for old plans).
     TRANSACT = "transact"          # On-chain value movement. Irreversible.
     NOTIFY = "notify"              # Report to the user.
     WAIT = "wait"                  # Time-based gate (deadline monitoring).
 
+    # --- Categories the execution engine must be able to distinguish --------
+    # A single "interact" bucket was the reason a Telegram join, a form fill and
+    # a CAPTCHA all looked identical to the controller, so it could not tell an
+    # ordinary action (continue) from one that needs a human (park).
+    NAVIGATE = "navigate"              # Go somewhere: open a bot/chat, load a URL.
+    TELEGRAM = "telegram"              # Telegram interaction (join, read, press).
+    BROWSER = "browser"                # Browser / Mini App interaction.
+    FORM = "form"                      # Fill and submit an ordinary form.
+    HUMAN_VERIFICATION = "human_verification"  # CAPTCHA / OTP / KYC gate.
+    VERIFY = "verify"                  # Evidence-based result verification.
+    USER_INTERVENTION = "user_intervention"    # Only a human can do this.
+    REPORT = "report"                  # Final evidence-based reporting.
+
     @property
     def is_irreversible(self) -> bool:
         return self is StepKind.TRANSACT
+
+    @property
+    def is_passive(self) -> bool:
+        """Steps that legitimately need no tool and produce no authoritative evidence.
+
+        Only these may complete without a tool call. Everything else with no tool
+        is a blocker that must be handed to the operator, never reported as done.
+        """
+        return self in (StepKind.ANALYZE, StepKind.NOTIFY, StepKind.REPORT, StepKind.WAIT)
+
+    @property
+    def requires_human(self) -> bool:
+        """Kinds that are, by definition, human-gated rather than automatable."""
+        return self in (
+            StepKind.HUMAN_VERIFICATION,
+            StepKind.USER_INTERVENTION,
+        )
+
+    @classmethod
+    def coerce(cls, raw: Any) -> "StepKind":
+        """Parse a persisted or model-supplied kind, tolerating unknown values.
+
+        Persisted plans and LLM output both feed this. An unrecognised kind must
+        not raise: it degrades to RESEARCH (the safest, read-only category) so an
+        old row or a hallucinated value can never silently become TRANSACT.
+        """
+        try:
+            return cls(str(raw or "research").strip().lower())
+        except ValueError:
+            return cls.RESEARCH
 
 
 class ReplanTrigger(str, Enum):
@@ -60,6 +103,10 @@ class ReplanTrigger(str, Enum):
     VERIFICATION_FAILURE = "VERIFICATION_FAILURE"
     DEPENDENCY_UNBLOCKED = "DEPENDENCY_UNBLOCKED"
     OPERATOR_REQUEST = "OPERATOR_REQUEST"
+    # Acting on a step taught the agent something the plan did not contain - a bot asked
+    # for a channel join, a page listed another task. This is progress, not a failure, so
+    # it is budgeted separately and must never consume the retry allowance.
+    DISCOVERY = "DISCOVERY"
 
 
 @dataclass
@@ -117,6 +164,21 @@ class PlanStep:
         }
 
 
+# Step statuses that satisfy a dependency for the NEXT step to run.
+#
+# `unverified` is included deliberately: it means "the action ran but we could not prove
+# it", which is a real state change that must unblock dependents. Treating it as
+# unsatisfied stranded every later step forever, so the workflow stopped after a single
+# action -- the reported "joins the group, then stops" defect.
+#
+# `unverified` is NOT counted as verified at finalization (AgentController
+# ._finalize_plan), so nothing unproven is ever reported as done.
+#
+# `failed` is deliberately ABSENT: a step that genuinely failed should keep blocking its
+# dependents until it is retried or replanned.
+_SATISFIED_STATUSES = ("completed", "skipped", "unverified")
+
+
 @dataclass
 class ExecutionPlanSpec:
     """An in-memory plan ready to be persisted or executed."""
@@ -138,9 +200,12 @@ class ExecutionPlanSpec:
     def step(self, index: int) -> Optional[PlanStep]:
         return next((s for s in self.steps if s.index == index), None)
 
+    # See `_SATISFIED_STATUSES` above for why `unverified` is included and `failed` is not.
+    _SATISFIED = _SATISFIED_STATUSES
+
     def ready_steps(self) -> List[PlanStep]:
         """Steps whose dependencies are all satisfied and prerequisites met."""
-        done = {s.index for s in self.steps if s.status in ("completed", "skipped")}
+        done = {s.index for s in self.steps if s.status in self._SATISFIED}
         return [
             s
             for s in self.steps
@@ -148,14 +213,20 @@ class ExecutionPlanSpec:
         ]
 
     def blocked_steps(self) -> List[PlanStep]:
-        done = {s.index for s in self.steps if s.status in ("completed", "skipped")}
+        done = {s.index for s in self.steps if s.status in self._SATISFIED}
         return [
             s for s in self.steps
             if s.status == "pending" and not set(s.depends_on).issubset(done)
         ]
 
     def is_complete(self) -> bool:
-        return all(s.status in ("completed", "skipped") for s in self.steps)
+        """True when no step is left to run.
+
+        A step may end as completed, skipped, unverified, failed or blocked. Only
+        `pending` and `running` represent remaining work; finalization decides
+        separately whether the objective was actually VERIFIED.
+        """
+        return all(s.status not in ("pending", "running") for s in self.steps)
 
     def total_cost(self) -> float:
         return sum(s.estimated_cost_usd for s in self.steps if s.status != "skipped")
@@ -187,7 +258,14 @@ class PlanConstraints:
     spent_already_usd: float = 0.0
     max_duration_minutes: int = 240
     deadline: Optional[datetime] = None
-    max_steps: int = 12
+    # A Telegram or Mini App airdrop workflow is genuinely multi-stage: open the
+    # bot, start it, read its instructions, join the group, verify membership,
+    # return to the bot, read the new message, act, verify, report. Twelve was
+    # below that, so `enforce_constraints` raised PlanningError and the whole task
+    # failed before a single tool ran. The ceiling is now derived from settings.
+    max_steps: int = field(
+        default_factory=lambda: max(12, int(getattr(settings, "MAX_PLAN_STEPS", 24) or 24))
+    )
     allow_transactions: bool = False
     allowed_networks: Set[str] = field(default_factory=lambda: {"ethereum", "arbitrum", "optimism", "base", "polygon", "sepolia"})
 
@@ -230,12 +308,29 @@ Hard rules:
    bypass limits, or claim unearned rewards.
 7. Never fabricate reward amounts, token prices, or eligibility. If unknown, estimate
    conservatively and mark the step for verification.
-8. Keep plans SHORT: at most 6 steps. Prefer one real tool call per step.
-9. If no catalog tool can perform a step (for example a Telegram bot, an OAuth login
-   or a CAPTCHA), set "tool" to null and kind to "interact". It will be handed to the
-   human operator, so describe exactly what the operator must do. Never pretend a
-   tool-less step is automated.
+8. PLAN THE WHOLE WORKFLOW, not just its first action. A Telegram or Mini App
+   airdrop is genuinely multi-stage. If the objective says "open the bot, join the
+   group, come back and finish", you MUST emit every stage as its own step, ending
+   with a verification step and a reporting step. Do NOT emit a vague step such as
+   "finish the airdrop". The step ceiling is stated in CONSTRAINTS; use it.
+   NEVER drop a required stage merely to keep the plan short.
+9. Use the MOST SPECIFIC "kind" for each step so the executor can handle it:
+     research, analyze, navigate, telegram, browser, form, interact,
+     human_verification, verify, user_intervention, wait, transact, notify, report
+   A Telegram action is kind "telegram", not "interact". A browser/Mini App action
+   is "browser". A form fill is "form". A CAPTCHA/OTP gate is "human_verification".
+   A step that checks whether an earlier action really worked is "verify".
+   The final evidence-based summary is "report".
+10. If the catalog contains Telegram tools, you MUST use them for Telegram work.
+    Never claim Telegram operations are unavailable when a telegram_* tool is listed.
+11. For a step no catalog tool can perform (a CAPTCHA, an OAuth login, an external
+    wallet signature), set "tool" to null, kind to "human_verification" or
+    "user_intervention", and describe exactly what the operator must do. The task
+    will PAUSE and ask the operator rather than fail or pretend it succeeded.
+12. Prefer one real tool call per step. A step that changes the world and a step
+    that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """
+
 
 REPLAN_SYSTEM_PROMPT = """You are the replanning engine of AirdropOS.
 
@@ -307,7 +402,7 @@ Produce EXACTLY this JSON shape:
   "steps": [
     {{
       "description": "<one line>",
-      "kind": "research|analyze|interact|transact|notify|wait",
+      "kind": "research|analyze|navigate|telegram|browser|form|interact|human_verification|verify|user_intervention|wait|transact|notify|report",
       "tool": "<exact tool name from the catalog, or null>",
       "parameters": {{}},
       "depends_on": [<0-based indexes>],
@@ -358,8 +453,8 @@ Produce EXACTLY this JSON shape:
                 continue
 
             try:
-                kind = StepKind(str(raw.get("kind", "research")).lower())
-            except ValueError:
+                kind = StepKind.coerce(raw.get("kind"))
+            except ValueError:  # pragma: no cover - coerce never raises
                 kind = StepKind.RESEARCH
 
             tool = raw.get("tool")
@@ -559,10 +654,10 @@ Produce EXACTLY this JSON shape:
 
         steps: List[PlanStep] = []
         for raw in (plan.steps or []):
-            try:
-                kind = StepKind(raw.get("kind", "research"))
-            except ValueError:
-                kind = StepKind.RESEARCH
+            # A persisted plan written before the kind vocabulary was extended must
+            # still load. `coerce` degrades an unknown value instead of raising,
+            # which is what previously made load_plan_spec unusable for old rows.
+            kind = StepKind.coerce(raw.get("kind", "research"))
             steps.append(
                 PlanStep(
                     index=int(raw.get("index", len(steps))),
@@ -630,11 +725,20 @@ Produce EXACTLY this JSON shape:
         trigger: ReplanTrigger,
         reason: str,
         constraints: Optional[PlanConstraints] = None,
+        context_notes: Optional[Sequence[str]] = None,
+        evidence: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> ExecutionPlanSpec:
-        """Revise a plan after failure, external change, or budget pressure.
+        """Revise a plan after failure, external change, budget pressure, or a discovery.
 
         Completed irreversible steps are never re-planned. This is enforced in
         deterministic code after the model responds, not merely requested.
+
+        `context_notes` carries what executing the previous plan actually learned - the
+        requirements an external system stated, the state it was observed in. Without it
+        the planner revises from the failure text alone and cannot see that the campaign
+        grew a step, which is the case the specification calls discovering requirements
+        while executing. `evidence` carries the proven actions so a revision never
+        re-proposes work that is already done.
         """
         constraints = constraints or PlanConstraints(
             spent_already_usd=task.actual_cost_usd,
@@ -664,7 +768,8 @@ STEPS THAT MUST NOT BE REPEATED (irreversible, already moved value):
 
 STEPS THAT FAILED OR REMAIN:
 {_json([{"index": s.index, "description": s.description, "kind": s.kind.value, "failure": s.failure_reason} for s in current_spec.steps if s.status not in ("completed", "skipped")])}
-
+{_section("REQUIREMENTS DISCOVERED WHILE EXECUTING (an external system stated these; your new plan MUST cover every one that is still outstanding, and MUST NOT claim any is already done)", list(context_notes or []))}
+{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}
 CONSTRAINTS (hard limits):
 {_json(constraints.to_dict())}
 
@@ -678,7 +783,7 @@ Produce EXACTLY this JSON shape:
   "steps": [
     {{
       "description": "<one line>",
-      "kind": "research|analyze|interact|transact|notify|wait",
+      "kind": "research|analyze|navigate|telegram|browser|form|interact|human_verification|verify|user_intervention|wait|transact|notify|report",
       "tool": "<exact tool name or null>",
       "parameters": {{}},
       "depends_on": [<0-based indexes within this NEW plan>],
@@ -976,6 +1081,19 @@ def _json(obj: Any) -> str:
         return json.dumps(obj, default=str)[:4000]
     except Exception:
         return str(obj)[:2000]
+
+
+def _section(heading: str, items: Sequence[str], *, limit: int = 20) -> str:
+    """A titled, bounded block for the replan prompt.
+
+    Rendered as literal text rather than JSON so an empty section disappears entirely
+    instead of showing an empty array the model may read as "nothing was discovered".
+    """
+    kept = [str(item).strip() for item in items if str(item or "").strip()][:limit]
+    if not kept:
+        return ""
+    lines = "\n".join(f"- {item}" for item in kept)
+    return f"\n{heading}:\n{lines}\n"
 
 
 def _task_context(task: Task) -> Dict[str, Any]:

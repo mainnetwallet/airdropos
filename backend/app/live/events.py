@@ -39,12 +39,45 @@ def safe_url(url: Optional[str]) -> str:
 
 
 def _redact(text: str) -> str:
-    try:  # reuse the worker's credential redactor when importable
-        from backend.app.scheduler.worker_status import redact
+    """Mask credential-looking values before an event is stored or shown.
 
-        return redact(text)
-    except Exception:  # pragma: no cover - defensive
-        return re.sub(r"(?i)(token|secret|password|api[_-]?key)\s*[=:]\s*\S+", r"\1=***", text)
+    IMPORTANT: this previously imported `worker_status.redact`, which does not exist.
+    The import therefore ALWAYS raised, silently degrading every event to the tiny
+    fallback regex below -- which matches only `key=value` forms. Telegram bot tokens,
+    private keys, seed phrases and Authorization headers all passed through into the
+    Live Broadcast log.
+
+    It now delegates to the one real redactor (`terminal.events.redact`) and adds the
+    categories this surface specifically needs: seed phrases and one-time codes.
+    """
+    try:
+        from backend.app.terminal.events import redact as _real_redact
+
+        text = _real_redact(str(text))
+    except Exception:  # pragma: no cover - terminal module unavailable
+        text = re.sub(r"(?i)(token|secret|password|api[_-]?key)\s*[=:]\s*\S+", r"\1=***", str(text))
+    try:
+        # A 12-24 word mnemonic, optionally quoted, is a seed phrase.
+        text = _MNEMONIC_RE.sub("***", text)
+        # A 4-8 digit code following an OTP-ish label is a one-time code.
+        text = _OTP_RE.sub(r"\1***", text)
+    except Exception:  # pragma: no cover - redaction must never raise
+        return "***"
+    return text
+
+
+# Word-only sequences of mnemonic length (12/15/18/21/24 words).
+_MNEMONIC_RE = re.compile(
+    r"(?:\b[a-z]{3,8}\b[\s,]+){11,23}\b[a-z]{3,8}\b", re.IGNORECASE
+)
+# `code: 123456`, `otp = 998877`, `verification code 4321`.
+# NOTE: `re.compile`'s third positional argument is FLAGS, so the replacement string
+# lives in `.sub(...)`, not here -- passing it to compile would silently be ignored.
+_OTP_RE = re.compile(
+    r"\b(one[-\s]?time(?:\s+code)?|otp|verification\s+code|sms\s+code|2fa|authenticator)"
+    r"(\s*[=:]\s*)\d{4,8}\b",
+    re.IGNORECASE,
+)
 
 
 def redact_text(text: Optional[str]) -> str:

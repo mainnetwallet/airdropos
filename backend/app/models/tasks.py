@@ -66,6 +66,11 @@ class Task(Base):
     events: Mapped[List["TaskEvent"]] = relationship("TaskEvent", back_populates="task", cascade="all, delete-orphan")
     evidence: Mapped[List["TaskEvidence"]] = relationship("TaskEvidence", back_populates="task", cascade="all, delete-orphan")
     transactions: Mapped[List["BlockchainTransaction"]] = relationship("BlockchainTransaction", back_populates="task")
+    # The task's own isolated execution context. uselist=False + a single row per task,
+    # so reaching `task.execution_context` can never return another task's history.
+    execution_context: Mapped[Optional["TaskContext"]] = relationship(
+        "TaskContext", back_populates="task", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class TaskExecution(Base):

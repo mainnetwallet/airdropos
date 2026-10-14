@@ -11,6 +11,17 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from backend.app.database.session import Base
 
 
+# Memory scopes. They are a strict hierarchy, not labels: a record written at TASK
+# scope is readable only by that task, a CAMPAIGN-scope record only by tasks linked to
+# that campaign, and only GLOBAL records are offered to any task as general knowledge.
+# Without this, one task's private history would be recalled into another's prompt.
+SCOPE_GLOBAL = "global"
+SCOPE_CAMPAIGN = "campaign"
+SCOPE_TASK = "task"
+
+MEMORY_SCOPES = (SCOPE_GLOBAL, SCOPE_CAMPAIGN, SCOPE_TASK)
+
+
 class MemoryRecord(Base):
     __tablename__ = "memory_records"
 
@@ -24,6 +35,25 @@ class MemoryRecord(Base):
     related_entities: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, default=dict)
     confidence: Mapped[float] = mapped_column(Float, default=0.7, nullable=False)
     is_inference: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # ------------------------------------------------------------------
+    # Context hierarchy. Defaults to the historical behaviour (an unscoped
+    # record is general knowledge) so rows written before this existed keep
+    # the meaning they had.
+    # ------------------------------------------------------------------
+    scope: Mapped[str] = mapped_column(String(20), default=SCOPE_GLOBAL, index=True, nullable=False)
+    # Populated only when scope is TASK. Cascade: a deleted task's private history
+    # goes with it rather than lingering as orphaned context another task could reach.
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("tasks.id", ondelete="CASCADE"),
+        index=True, nullable=True,
+    )
+    # Populated only when scope is CAMPAIGN. SET NULL: campaign facts outlive the
+    # task that discovered them, and lose their owner when the campaign is deleted.
+    campaign_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("airdrop_campaigns.id", ondelete="SET NULL"),
+        index=True, nullable=True,
+    )
 
     access_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

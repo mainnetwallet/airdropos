@@ -13,9 +13,11 @@ import logging
 
 from backend.app.blockchain.chains import known_networks
 from backend.app.tools.airdrop_tools import register_airdrop_tools
+from backend.app.tools.arithmetic_tools import VERIFICATION_TOOLS
 from backend.app.tools.blockchain_tools import register_blockchain_tools
 from backend.app.tools.browser_tools import register_browser_tools
 from backend.app.tools.diagnostic_tools import register_diagnostic_tools
+from backend.app.tools.miniapp_tools import MINIAPP_TOOLS
 from backend.app.tools.notification_tools import register_notification_tools
 from backend.app.tools.registry import AuthorizationPolicy, registry
 from backend.app.tools.task_tools import register_task_tools
@@ -54,6 +56,17 @@ def bootstrap_tools() -> None:
     register_airdrop_tools(registry)
     register_transfer_tools(registry)
     telegram_user_enabled = register_telegram_user_tools(registry)
+
+    # Deterministic verification helpers. Always available: they need no external
+    # dependency and are what stop an ordinary arithmetic question from being either
+    # guessed at or needlessly escalated to the operator.
+    registry.register_or_replace_many([tool() for tool in VERIFICATION_TOOLS])
+
+    # Mini App detection is read-only and needs no credentials, so it is registered
+    # unconditionally. `telegram_open_miniapp` additionally requires browser.navigate;
+    # if the operator has not granted that, the policy refuses the call at invoke time
+    # with a precise reason rather than the tool silently vanishing from the catalog.
+    registry.register_or_replace_many([tool() for tool in MINIAPP_TOOLS])
 
     # Read and analyse capabilities. These are what let the agent answer a question
     # about the system or its own records from chat instead of explaining how the

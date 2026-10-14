@@ -455,6 +455,97 @@ async def get_task(
     return report
 
 
+@router.get("/tasks/{task_id}/context", tags=["tasks"])
+async def get_task_context(
+    task_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    """The task's own execution context: goal, history, requirements, references.
+
+    Scoped to one task by construction. Nothing here can return another task's
+    execution history, and campaign facts are included only when this task is linked to
+    that campaign. General knowledge is reported as a count rather than dumped in, so a
+    large memory store cannot flood the panel.
+    """
+    enforce_rate_limit(request, "read")
+    manager = TaskManager(db)
+    task = await manager.get_by_task_id(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
+
+    from backend.app.agent.context import TaskContextService
+    from backend.app.airdrops.campaign_context import CampaignContextService
+
+    service = TaskContextService(db)
+    resolved = await service.resolve(task)
+    context = resolved.task_context
+
+    campaign_snapshot = None
+    if context is not None and context.campaign_id is not None:
+        campaign = await db.get(AirdropCampaign, context.campaign_id)
+        if campaign is not None:
+            campaign_snapshot = (await CampaignContextService(db).snapshot(campaign)).to_dict()
+
+    return {
+        "task_id": task.task_id,
+        "status": task.status,
+        "progress": task.progress,
+        "goal": context.goal if context else None,
+        "normalized_objective": context.normalized_objective if context else None,
+        "success_criteria": context.success_criteria if context else [],
+        "next_step_rationale": context.next_step_rationale if context else None,
+        "current_step_index": context.current_step_index if context else None,
+        "external_state": context.external_state if context else {},
+        "resource_refs": context.resource_refs if context else {},
+        "unresolved_questions": context.unresolved_questions if context else [],
+        "human_intervention": context.human_intervention if context else {},
+        "authorization_state": context.authorization_state if context else {},
+        "retry_summary": context.retry_summary if context else {},
+        "last_error": context.last_error if context else None,
+        "resumed_at": context.resumed_at.isoformat() if context and context.resumed_at else None,
+        "outstanding_requirements": [
+            {
+                "text": r.text,
+                "origin": r.origin,
+                "status": r.status,
+                "account_specific": r.is_account_specific,
+                "campaign_scoped": r.is_campaign_scoped,
+                "source": r.source_ref,
+            }
+            for r in resolved.outstanding_requirements()
+        ],
+        "requirements": [
+            {
+                "text": r.text,
+                "status": r.status,
+                "origin": r.origin,
+                "account_specific": r.is_account_specific,
+                "campaign_scoped": r.is_campaign_scoped,
+            }
+            for r in resolved.requirements
+        ],
+        "observations": [
+            {
+                "id": str(o.id),
+                "action": o.action,
+                "tool": o.tool,
+                "outcome": o.outcome,
+                "evidence_kind": o.evidence_kind,
+                "evidence_authoritative": o.evidence_authoritative,
+                "proved_completion": o.proved_completion,
+                "integration_ref": o.integration_ref,
+                "observed_state": o.observed_state,
+            }
+            for o in resolved.observations[-100:]
+        ],
+        "campaign": campaign_snapshot,
+        "campaign_facts": resolved.campaign_facts,
+        "global_fact_count": len(resolved.global_facts),
+    }
+
+
 @router.post("/tasks/{task_id}/cancel", tags=["tasks"])
 async def cancel_task(
     task_id: str,

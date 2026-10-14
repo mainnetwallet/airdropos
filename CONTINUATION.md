@@ -1,12 +1,52 @@
 # AirdropOS — Implementation Status & Continuation Document
 
-**Repository:** `C:\Users\mainw\vscode\airdropos\`
+**Repository:** `C:\Users\mainw\airdropos\`
 **Specification:** Master Specification Parts 1–42 (single source of truth)
 **Scale:** 78 Python files, 16 TypeScript files, 15 documentation files.
 
 ---
 
-## 0. STATUS UPDATE — Unified persistent Chrome & browser automation (2026-10-13)
+## 0. STATUS UPDATE — Persistent execution context (2026-10-14)
+
+**Read this section first for anything about context, memory or multi-step reasoning.**
+[`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) is the reference.
+
+The agent could not carry what it learned from one step to the next across a restart, a
+replan or a switch between integrations: the goal, the action history, the discovered
+requirements, the external resource references and the next-step rationale all existed
+only in the LLM context window. `MemoryManager.recall()` had no scoping at all, so any
+recall returned whatever any task had written.
+
+**Now implemented in the backend:**
+
+- `app/models/context.py` + migration `6_task_context` — `task_contexts`,
+  `task_observations`, `task_requirements`. One isolated context per task.
+- `memory_records` gains `scope` / `task_id` / `campaign_id`. The three levels are a
+  strict hierarchy enforced in `MemoryManager`, not a label: a "global" record carrying an
+  owner is refused.
+- `app/agent/context.py` — `TaskContextService`. Records observations, requirements,
+  references, external state, human-intervention and authorization state; answers
+  "is this action already proven?"; resolves the three levels without merging them.
+- `app/airdrops/campaign_context.py` — shared campaign facts with freshness and
+  provenance reporting. Account- and wallet-specific state is **refused** at campaign
+  level and read back only against an explicit wallet reference.
+- `app/agent/discovery.py` — deterministic structured requirement extraction, plus
+  bounded prose extraction under a hard per-run budget. Injection-shaped content is
+  refused, never sent to the model, and never becomes a step.
+- `AgentController` writes to the context after every meaningful action, records *why*
+  the next step is next, suppresses a non-idempotent action already proven, and revises
+  the plan under `ReplanTrigger.DISCOVERY` when executing it revealed requirements the
+  plan does not address.
+- `GET /api/v1/tasks/{id}/context`, a `context` block on the task status report, and a
+  `task.context_updated` live event.
+
+**Honest gaps:** the frontend does not yet render the context endpoint; a resumed run
+does not yet re-probe live external state to confirm recorded facts still hold; and a
+task is not automatically linked to a campaign during execution.
+
+---
+
+## 0b. STATUS UPDATE — Unified persistent Chrome & browser automation (2026-10-13)
 
 This document is the historical creation-phase record. Everything below it still describes
 how the project started. This section is the **current** status for the browser system and is
