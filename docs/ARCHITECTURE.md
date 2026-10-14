@@ -35,9 +35,11 @@ All critical operations are gated behind a deterministic authorization policy, w
 - The compaction model call is a dedicated internal path
   (`FixedLLMClient._compaction_summarize`) that skips the budget preflight, so compaction
   can never re-enter itself.
-- Chat history is bounded by **turn count only**. There is no character cap: an oversized
-  history reaches the context pipeline above, which can compact it, rather than being
-  thinned at the API boundary before anything could see it.
+- Chat history has **no application-level limit**. There is no turn count, no character cap
+  and no replacement bound of either kind: an oversized history reaches the context
+  pipeline above, which can compact it, rather than being thinned at the API boundary
+  before anything could see it. A long message can no longer be refused with a 422
+  either. Ordering, roles and the tool-call/tool-result relationships are preserved.
 
 ### 2. Deny-by-Default Authorization
 - **Scopes**: `read`, `tool_read`, `wallet_read`, `wallet_write`, `system_admin`, `emergency_stop`, etc.

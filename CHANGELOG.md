@@ -30,9 +30,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
   and summaries stay request-local (nothing new is persisted).
 - **`CHAT_HISTORY_MAX_CHARS` (16,000) is removed.** `POST /agent/chat` no longer thins a
   conversation by character count at the API boundary, which used to discard older turns
-  before the context pipeline could see them. History is bounded by turn count only, and
-  an oversized history is now compacted rather than pre-trimmed. The request model accepts
-  a longer transcript (a client sending its whole conversation no longer gets a 422).
+  before the context pipeline could see them.
+- **No application-level limit on chat history remains.** `CHAT_HISTORY_MAX_TURNS` (24), the
+  `max_length=200` on the history list, the `max_length=8000` on each historical turn and
+  the `max_length=8000` on the operator's own message are all gone. A long conversation is
+  no longer thinned at the boundary — as whole silently dropped turns or as an opaque 422 —
+  so the token-aware compaction pipeline receives the full transcript and decides what
+  matters. Message ordering, roles and the tool-call/tool-result relationships are
+  preserved, and a long message is no longer refused.
 - **Initial planning receives the resolved task and campaign context.**
   `AgentController._ensure_plan` resolves the task's context and passes it to
   `Planner.decompose(context=...)`, plus the matching campaign snapshot as

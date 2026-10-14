@@ -154,41 +154,41 @@ async def agent_info(
 
 class ChatTurn(BaseModel):
     role: Literal["user", "assistant"]
-    content: str = Field(max_length=8000)
+    # No character bound. A per-message cap here rejected or truncated valid
+    # conversation before the token-aware context pipeline could see it, which is
+    # the one component that can measure a request and compact instead of delete.
+    content: str
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(min_length=1, max_length=8000)
+    # No bound on the operator's own message: the user must never be refused the
+    # ability to submit a longer message because of a number chosen here.
+    message: str = Field(min_length=1)
     # Earlier turns of this conversation (oldest first), so the model remembers
     # what was already said and can continue instead of starting from zero.
     #
-    # The bound is a request-size guard, not a conversation limit: a client that sends
-    # its whole transcript is accepted and the server keeps the most recent turns. A
-    # tight bound here previously turned a long conversation into an opaque 422 the
-    # moment it grew past the limit.
-    history: List[ChatTurn] = Field(default_factory=list, max_length=200)
-
-
-# Remembered turns are bounded by COUNT only, never by characters.
-#
-# There is deliberately no CHAT_HISTORY_MAX_CHARS: a character cap here discarded
-# older turns BEFORE the token-aware context pipeline could see them, so a long,
-# information-rich conversation was silently thinned at the API boundary and
-# compaction never got the chance to decide what mattered. Ordering, roles and the
-# tool-call/tool-result relationships are preserved; an oversized history is now
-# handled by `llm.compaction` (which re-estimates and asks the fixed model for a
-# bounded, labelled summary) rather than by dropping valid messages on length.
-CHAT_HISTORY_MAX_TURNS = 24
+    # There is deliberately NO application-level limit on chat history: no turn
+    # count, no character total, and no replacement cap of either kind. Every such
+    # bound applied at this boundary discarded valid conversation BEFORE the token-
+    # aware context pipeline could see it — as an opaque 422, or as whole older
+    # turns silently thinned — so compaction never got the chance to decide what
+    # mattered. Ordering, roles and the tool-call/tool-result relationships are
+    # preserved; an oversized history is handled by `llm.compaction` (which
+    # re-estimates and asks the fixed model for a bounded, labelled summary)
+    # rather than by dropping messages on length.
+    history: List[ChatTurn] = Field(default_factory=list)
 
 
 def _trim_history(history: List["ChatTurn"]) -> List["ChatTurn"]:
-    """Most recent turns: empty ones dropped, recent ones kept whole.
+    """Structural normalisation only: empty turns dropped, everything else kept.
 
-    No length-based reduction happens here. A message is never removed because the
-    conversation is long; that decision belongs to the context budget, which can
-    actually see token counts and can compact instead of deleting.
+    No length-based reduction happens here — not by turn count and not by
+    characters. A message is never removed because the conversation is long; that
+    decision belongs to the context budget, which can actually see token counts
+    and can compact instead of deleting. Order and roles are untouched, so a
+    tool call is never separated from the tool result that answers it.
     """
-    recent = [t for t in history if t.content and t.content.strip()][-CHAT_HISTORY_MAX_TURNS:]
+    recent = [t for t in history if t.content and t.content.strip()]
     # Providers expect the conversation to start with a user turn.
     while recent and recent[0].role != "user":
         recent.pop(0)
