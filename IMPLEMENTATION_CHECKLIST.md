@@ -1,7 +1,7 @@
 # AirdropOS Implementation Checklist
 
 **Status as of 2026-10-14 (review fixes):** the backend suite passes at
-**385 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
+**406 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
 and the frontend at **26**, with `npm run lint` (0 errors) and
 `npm run build` both clean. See
 [`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
@@ -267,6 +267,18 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
 - [x] Screening also covers mapping **keys**, bounds the **root** container, and
       covers `integration_ref` (a browser profile today, but it is free text from
       tool output).
+- [x] **Keys are screened at every nesting level**, not only at the root. A secret one
+      level down — `{"metadata": {"api_key: sk-live-...": ...}}` — was written verbatim.
+- [x] **An attempt is not an outcome.** The submitted parameters no longer count as
+      proof, so `{"amount": "100 tokens"}` can no longer satisfy *hold 100 tokens* when
+      the observed balance reads `50`. Proof is only what the external system reported.
+- [x] **Decimal amounts are read exactly as written.** A thousands-separator heuristic
+      read `0.500 tokens` as **500**, letting 0.5 tokens satisfy *hold 100 tokens*. It is
+      removed rather than refined: crypto balances are fractional and no rule gets both
+      readings right.
+- [x] A handle matches with or without its `@`, and a target named only by a field — a
+      tool result's `"username": "examplechannel"` — is recognised. Without this a genuine
+      successful join could never close its own requirement.
 - [x] Memory scope validation lives in `remember`, not only `remember_scoped`, and
       `extra=` is restricted to `{scope, task_id, campaign_id}` so it cannot write
       unscreened `content`/`source`. A record naming both a task and a campaign is

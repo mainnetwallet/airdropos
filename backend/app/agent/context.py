@@ -179,19 +179,35 @@ def _extract_quantities(text: str) -> List[Tuple[float, str]]:
     """
     found: List[Tuple[float, str]] = []
     for raw_number, unit in _QUANTITY_RE.findall(str(text or "").lower()):
+        # Read the number exactly as written. A previous version treated a trailing group
+        # of three digits after a point as a thousands separator, which read `0.500
+        # tokens` as 500 and `1.250 tokens` as 1250 - inflating a wallet's balance a
+        # thousandfold and letting 0.5 tokens satisfy "hold 100 tokens".
+        #
+        # The heuristic is removed rather than refined. Crypto amounts are fractional by
+        # nature and `0.500` is overwhelmingly a value, not a malformed thousands
+        # separator; there is no rule that gets both readings right, so there is no rule.
         cleaned = raw_number.replace(",", "").replace("_", "")
-        if "." in cleaned:
-            head, _, tail = cleaned.rpartition(".")
-            # "100.000" is locale-ambiguous; treat a trailing group of three as a
-            # thousands separator, which is how such figures are written in practice.
-            if len(tail) == 3 and head.isdigit():
-                cleaned = head + tail
         try:
             value = float(cleaned)
         except ValueError:
             continue
         found.append((value, unit[:-1] if unit.endswith("s") else unit))
     return found
+
+
+# A tool result reports a resolved target by FIELD NAME, and the value is often a bare
+# name: telegram_join_chat returns `{"username": "examplechannel", "chat_id": 4242}`.
+# A bare name matches none of the syntactic patterns above, so without this a genuinely
+# successful join could never close the requirement that asked for it.
+#
+# Scoped to an explicit list of identifier-bearing field names rather than "any bare
+# word", which would match every word in the payload and make the check meaningless.
+_NAMED_TARGET_RE = re.compile(
+    r'"(?:username|user_name|handle|bot_username|chat|chat_username|channel|'
+    r'contract_address|token_address)"\s*:\s*"([^"]{2,120})"',
+    re.IGNORECASE,
+)
 
 
 def _quantities_met(required: List[Tuple[float, str]], proved: List[Tuple[float, str]]) -> bool:
@@ -219,13 +235,28 @@ def _extract_identifiers(text: str) -> List[str]:
     """
     found: List[str] = []
     lowered = str(text or "").lower()
+
     for pattern in _IDENTIFIER_PATTERNS:
         for match in pattern.findall(lowered):
             if isinstance(match, tuple):
                 match = "".join(match)
             cleaned = match.strip().strip(".,;:!?)]}'\"").rstrip("/")
+            # Drop a handle's leading `@`. A requirement says "@examplechannel" while a
+            # Telegram tool reports `username: examplechannel`; without this a genuine,
+            # successful join would never close its own requirement. The `@` is a sigil on
+            # the name, not part of it.
+            if cleaned.startswith("@"):
+                cleaned = cleaned[1:]
             if cleaned:
                 found.append(cleaned)
+
+    for match in _NAMED_TARGET_RE.findall(lowered):
+        cleaned = match.strip().strip(".,;:!?)]}'\"").rstrip("/")
+        if cleaned.startswith("@"):
+            cleaned = cleaned[1:]
+        if cleaned and not cleaned.isdigit():
+            found.append(cleaned)
+
     return found
 
 
@@ -257,7 +288,12 @@ def _screen_value(value: Any, *, limit: int, depth: int = 0) -> Any:
     if isinstance(value, dict):
         screened: Dict[str, Any] = {}
         for key, item in list(value.items())[:MAX_SCREEN_ITEMS]:
-            screened[str(key)[:80]] = _screen_value(item, limit=limit, depth=depth + 1)
+            # Keys are screened at every level, not only at the root. Applying it only in
+            # `_screened_dict` left `{"metadata": {"api_key: sk-live-...": ...}}` written
+            # verbatim one level down, which is the shape most real payloads have.
+            screened[_screen_mapping_key(key)] = _screen_value(
+                item, limit=limit, depth=depth + 1
+            )
         return screened
 
     if isinstance(value, (list, tuple, set)):
@@ -574,9 +610,20 @@ class TaskContextService:
         await self.db.flush()
 
         if outcome == OUTCOME_CONFIRMED and evidence.get("authoritative"):
-            # Proof is what was SUBMITTED and what came back. The action description is
-            # deliberately excluded: it is the planner's intent, and including it lets a
-            # well-worded step satisfy a requirement it never actually performed.
+            # Proof is what the external system REPORTED. The action description and the submitted
+            # parameters are both excluded.
+            #
+            # The description is the planner's intent. The parameters are an attempt -
+            # and an attempt is not an outcome. Including them let a requirement be
+            # satisfied by the intent that failed:
+            #
+            #     requirement  hold 100 tokens
+            #     submitted    {"amount": "100 tokens"}   <- what was tried
+            #     observed     {"balance": "50 tokens"}    <- what is true
+            #
+            # The concatenation contained 100 tokens, so the requirement closed and the
+            # agent reported a holding requirement met on a wallet holding 50. Only the
+            # observed state and the returned result can prove anything happened.
             await self._satisfy_matching_requirements(
                 task,
                 observation,
@@ -584,7 +631,6 @@ class TaskContextService:
                     [
                         json.dumps(safe_state, default=str),
                         json.dumps(safe_result, default=str),
-                        json.dumps(parameters or {}, default=str),
                     ]
                 ),
             )

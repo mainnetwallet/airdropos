@@ -156,7 +156,9 @@ Screening is now recursive and bounded (`MAX_SCREEN_DEPTH`, `MAX_SCREEN_ITEMS`),
 `[REDACTED: matched a secret pattern]` rather than being dropped, so the record still
 shows something was there.
 
-Screening also covers the **keys** of a mapping, not only its values, and the root level
+Screening also covers the **keys** of a mapping at **every** level, not only at the root -
+`{"metadata": {"api_key: sk-live-...": ...}}` was written verbatim before that was fixed,
+and nested is exactly the shape most real payloads have. The root level
 is bounded by `MAX_SCREEN_ITEMS` like every nested level. Both were open: keys were
 coerced straight to `str(...)`, and only nested containers were capped, so a flat dict
 with thousands of keys was screened - and stored - in full.
@@ -191,12 +193,29 @@ parameters    {"chat": "@otherchannel"}                  <- what happened
 ```
 
 The union contains `@examplechannel`, so the requirement closed and the agent believed it
-had joined a channel it never touched. **The description is no longer part of the proof
-at all.** Proof is the submitted parameters plus what the external system returned.
+had joined a channel it never touched.
+
+**Third: the submitted parameters counted as proof.** An attempt is not an outcome.
+Merging the arguments back in meant the intent could supply the number the outcome denied:
+
+```
+requirement  hold 100 tokens
+submitted    {"amount": "100 tokens"}   <- what was tried
+observed     {"balance": "50 tokens"}    <- what is true
+```
+
+The concatenation contained 100 tokens, so the requirement closed on a wallet holding 50.
+**Neither the description nor the parameters are proof.** Proof is only what the external
+system reported: the observed state and the returned result.
 
 A requirement now closes only when, against that proof:
 
-* every **identifier** it names - a `@handle`, an address, a URL, a domain - is present;
+* every **identifier** it names - a `@handle`, an address, a URL, a domain - is present.
+
+  A handle matches with or without its `@`, and a target named only by a field - a tool
+  result's `"username": "examplechannel"` - is recognised too. Without both, a genuinely
+  successful join would never close the requirement that asked for it, and the strict
+  rule would quietly become "nothing ever satisfies";
   **and**
 * every **quantity** it names is met: same unit, amount at least as large.
 
@@ -204,6 +223,12 @@ Quantities are compared numerically rather than string-matched, because *hold 10
 is satisfied by holding 150 and emphatically not by holding 50. With neither identifiers
 nor quantities to go on, the rule falls back to ordinary wording and demands real
 overlap.
+
+The number is read **exactly as written**. A thousands-separator heuristic was tried and
+removed: it read `0.500 tokens` as 500 and `1.250 tokens` as 1250, inflating a wallet's
+balance a thousandfold and letting 0.5 tokens satisfy *hold 100 tokens*. Crypto balances
+are fractional by nature and `0.500` is overwhelmingly a value, not a malformed
+separator - there is no rule that gets both readings right, so there is no rule.
 
 Anything ambiguous stays outstanding. A false completion is worse than an unfinished one:
 the operator is told work is done that was never done.
@@ -264,6 +289,9 @@ campaign. It inherits none of the first task's history.
   concurrent tasks, cascade on delete, attempted ≠ confirmed, repeat recognition,
   requirement lifecycle, secret refusal, persistence across a fresh session, the resume
   marker, the memory hierarchy, and the three memory-scope bypass paths.
+* `backend/tests/test_context_edge_cases.py` - nested keys, an attempt counted as an
+  outcome, and decimal amounts. `0.500 tokens` parsing as 500 is the sharpest of these:
+  a thousandfold inflation of a balance that then satisfies a holding requirement.
 * `backend/tests/test_intent_is_not_proof.py` - intent is not evidence. A correctly
   worded step aimed at the right channel must not satisfy a requirement when the call
   was actually made against a different one, and a description alone proves nothing.

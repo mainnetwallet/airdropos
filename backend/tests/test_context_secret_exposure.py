@@ -308,8 +308,41 @@ class TestRequirementSatisfactionNeedsMatchingTargets:
                 tool="telegram_join_chat",
                 parameters={"chat": "@examplechannel"},
                 evidence={"authoritative": True, "kind": "membership_verified"},
+                # What telegram_join_chat actually returns: the chat it acted on.
+                result_digest={"chat": "@examplechannel", "chat_id": 4242},
             )
             await db.commit()
             outstanding = await service.requirements(task, only_outstanding=True)
 
         assert outstanding == [], "the matching action must close the requirement"
+
+    @pytest.mark.asyncio
+    async def test_a_parameter_alone_cannot_prove_an_outcome(self, factory):
+        """Submitting something is not the same as it having happened.
+
+        The tool reported nothing back, so there is no evidence the join took effect.
+        A requirement the operator can see stays open rather than being closed by the
+        fact that the agent tried.
+        """
+        task_id = await _task(factory, "Attempted, never reported")
+        async with factory() as db:
+            task = await _row(db, task_id)
+            service = TaskContextService(db)
+            await service.record_requirement(
+                task, "Join Telegram channel @examplechannel"
+            )
+            await db.commit()
+            await service.record_observation(
+                task,
+                action="Join Telegram channel @examplechannel",
+                outcome="confirmed",
+                tool="telegram_join_chat",
+                parameters={"chat": "@examplechannel"},
+                evidence={"authoritative": True, "kind": "membership_verified"},
+            )
+            await db.commit()
+            outstanding = await service.requirements(task, only_outstanding=True)
+
+        assert [r.text for r in outstanding] == ["Join Telegram channel @examplechannel"], (
+            "an attempt that reported nothing back is not proof the join happened"
+        )
