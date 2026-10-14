@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from backend.app.core.logging_setup import configure_logging
+from backend.app.database import schema_sync
 from backend.app.database.session import AsyncSessionLocal, Base, engine
 from backend.app.models import SystemSetting
 from backend.app.terminal.events import publish_success
@@ -64,6 +65,24 @@ async def main() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Tables created.")
+
+    # create_all never alters an existing table, so a database made by an older version can lack
+    # columns the models now declare (-> "no such column"). Add them, SQLite only, additively.
+    if schema_sync.is_sqlite():
+        async with engine.connect() as conn:
+            missing = await conn.run_sync(schema_sync.find_missing)
+        if missing:
+            backup = schema_sync.backup_sqlite_file()
+            if backup:
+                logger.info("Database backup before schema update: %s", backup)
+            async with engine.begin() as conn:
+                await conn.run_sync(schema_sync.apply_missing, missing)
+            logger.info(
+                "Added %d missing column(s): %s",
+                len(missing), ", ".join(f"{t}.{c}" for t, c, _ in missing),
+            )
+        else:
+            logger.info("Database schema is up to date.")
 
     async with AsyncSessionLocal() as db:
         for spec in DEFAULT_SETTINGS:

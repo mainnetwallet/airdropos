@@ -150,7 +150,7 @@ py run.py --update
 |---|---|
 | Telegram user login (one time) | `.\.venv\Scripts\python.exe scripts\telegram_login.py`, then set `TELEGRAM_USER_ENABLED=true` in `.env` |
 | Change dashboard password | `py run.py --set-password` |
-| Fix `no such column` (SQLite, after an update) | stop the server, then `.\.venv\Scripts\python.exe scripts\sqlite_add_missing_columns.py` (dry run), then add `--apply` |
+| Check for missing DB columns (SQLite; startup already fixes them) | stop the server, then `.\.venv\Scripts\python.exe scripts\sqlite_add_missing_columns.py` (dry run), then add `--apply` |
 | Run without the dashboard | `py run.py --no-frontend` |
 | Back up | copy `.env`, the `data` folder, and `airdropos.db` (if SQLite) |
 
@@ -258,7 +258,7 @@ If `git pull` refuses because of local changes: `git stash`, then pull again.
 |---|---|
 | Telegram user login (one time) | `.venv\Scripts\python.exe scripts\telegram_login.py` |
 | Change dashboard password | `py run.py --set-password` |
-| Fix `no such column` (SQLite, after an update) | stop the server, then `.venv\Scripts\python.exe scripts\sqlite_add_missing_columns.py` (dry run), then add `--apply` |
+| Check for missing DB columns (SQLite; startup already fixes them) | stop the server, then `.venv\Scripts\python.exe scripts\sqlite_add_missing_columns.py` (dry run), then add `--apply` |
 | Backup | copy `.env`, the `data` folder, and `airdropos.db` (if SQLite) |
 
 ---
@@ -395,7 +395,7 @@ Then open http://localhost:5173 on your PC.
 |---|---|
 | Telegram user login (one time) | `.venv/bin/python scripts/telegram_login.py` |
 | Change dashboard password | `python3 run.py --set-password` |
-| Fix `no such column` (SQLite, after an update) | stop the server, then `.venv/bin/python scripts/sqlite_add_missing_columns.py` (dry run), then add `--apply` |
+| Check for missing DB columns (SQLite; startup already fixes them) | stop the server, then `.venv/bin/python scripts/sqlite_add_missing_columns.py` (dry run), then add `--apply` |
 | Backup | copy `.env`, the `data/` folder, and `airdropos.db` (if SQLite) |
 
 ---
@@ -630,7 +630,7 @@ python -m pytest backend/tests/ -q
 | `Node.js/npm not found` or Node older than 20 | Install Node.js 20+ from https://nodejs.org (Ubuntu: step 3.1), or use `--no-frontend`. |
 | `Docker could not start PostgreSQL` / `Cannot reach the database` | Start Docker Desktop and wait for "Engine running", or use `--sqlite`. |
 | Cannot log in / bootstrap returns 503 | Run `run.py --set-password` (Docker: set `OPERATOR_PASSWORD_HASH` in `.env`). |
-| Task stuck in `RETRYING`, worker log says `no such column: ...` | Your SQLite file was made by an older version: startup only creates missing tables, it never adds columns to existing ones. Stop the server, run `python scripts/sqlite_add_missing_columns.py` to list what is missing, then `--apply` (it backs up the database first and only adds columns), start again, and press Retry on the task. PostgreSQL: use Alembic (`alembic upgrade head`). |
+| Task stuck in `RETRYING`/`FAILED`, worker log says `no such column: ...` | Your SQLite file was made by an older version. `py run.py` now adds missing columns automatically at startup (it backs up `airdropos.db` first and only adds columns), so `git pull` then `py run.py` is enough. Then create the task again or press Retry (a task that already hit its retry limit is `FAILED`). PostgreSQL: `alembic upgrade head`. To only check, run `python scripts/sqlite_add_missing_columns.py`. |
 | `ModuleNotFoundError: backend` | Run from the repository root (the folder with `run.py`). |
 | `WALLET_VAULT_MASTER_KEY must be exactly 64 hex characters` | Use `openssl rand -hex 32` or `py -c "import secrets; print(secrets.token_hex(32))"`. |
 | Port 8000 / 5173 / 3000 already in use | Stop the other program, or change the port. |

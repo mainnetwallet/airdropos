@@ -22,18 +22,14 @@ verify host, port, and credentials.
 Tables were never created: `python -m backend.app.services.init_db`.
 
 **`no such column: <table>.<column>` (SQLite), task stuck in `RETRYING`**
-The database file was created by an older version. Startup (`create_all`) only creates missing
-tables; it never adds columns to a table that already exists, so a model that gained a column
-(for example `memory_records.scope`) fails on the first query. Stop the backend and worker, then:
-
-```
-python scripts/sqlite_add_missing_columns.py          # dry run: lists missing columns
-python scripts/sqlite_add_missing_columns.py --apply  # backs up the file, then adds them
-```
-
-It only issues `ADD COLUMN`; no row, table or column is dropped or rewritten. Restart, then
-press Retry on the task. On PostgreSQL use `alembic upgrade head` instead (see
-`MIGRATION_DRIFT.md` for known gaps in the migration chain).
+The database file was created by an older version. `create_all` only creates missing tables, never
+columns on existing ones, so a model that gained a column (for example `memory_records.scope`) fails
+on the first query. `py run.py` now repairs this at startup: it copies `airdropos.db` to
+`airdropos.db.bak-<time>` and then only runs `ADD COLUMN` (no row, table or column is dropped or
+rewritten). So `git pull` then `py run.py` is enough. A task that already used all its retries is
+`FAILED`; create it again. To only list what is missing: `python scripts/sqlite_add_missing_columns.py`
+(add `--apply` to fix without starting the app). PostgreSQL: `alembic upgrade head` (see
+`MIGRATION_DRIFT.md`).
 
 **`too many connections`**
 Lower `DB_POOL_SIZE` and `DB_MAX_OVERFLOW` in `.env`, or raise `max_connections` in
