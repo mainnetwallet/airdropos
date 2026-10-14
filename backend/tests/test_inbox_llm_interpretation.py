@@ -27,8 +27,12 @@ from backend.app.inbox import verification as verification_module
 from backend.app.inbox.replies import _AUTHORISE_PATTERNS, ReplyRouter, _matches
 from backend.app.inbox.service import (
     AMBIGUOUS_INSTRUCTION,
+    APPROVAL_GATED,
     HUMAN_APPROVAL,
+    INFORMATION_RESOLVABLE,
+    MACHINE_VERIFIABLE,
     OPERATOR_PAUSE,
+    REQUIRES_EXPLICIT_AUTHORIZATION,
     TELEGRAM_SESSION_UNAVAILABLE,
     UNKNOWN_REASON,
     ConversationService,
@@ -575,6 +579,18 @@ _BAD_ANSWERS = {
     "secret_in_output": decision(
         "SUFFICIENT_INFORMATION", extracted=["use key 0x" + "a" * 64]
     ),
+    # Unknown fields are rejected, not silently dropped (strict schema, extra="forbid").
+    "unknown_extra_field": {
+        **decision("SUFFICIENT_INFORMATION", extracted=["Base network"]),
+        "approve_and_resume": True,
+    },
+    # A value the operator never wrote (their reply says Base, not Polygon).
+    "invented_network": decision(
+        "SUFFICIENT_INFORMATION", extracted=["Use the Polygon network"]
+    ),
+    "invented_number": decision(
+        "SUFFICIENT_INFORMATION", extracted=["Base network, 5 transactions"]
+    ),
 }
 
 
@@ -598,6 +614,68 @@ class TestFailuresLeaveTheTaskParked:
         users = [m for m in snap["messages"] if m.role == "user"]
         assert [m.content for m in users] == ["ei kaj ta Base network e koro, tomar kono somossya nai"]
         assert "could not interpret" in agent_text(snap)
+
+    @pytest.mark.asyncio
+    async def test_a_bare_acknowledgement_cannot_become_a_stored_instruction(
+        self, factory, monkeypatch
+    ):
+        """The model may not turn "ok" into "Use the Polygon network" and save it."""
+        install_llm(
+            monkeypatch,
+            decision("SUFFICIENT_INFORMATION", extracted=["Use the Polygon network"]),
+        )
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "ok")
+
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["open_request"] is not None
+        assert snap["instructions"] == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text, extracted",
+        [
+            ("Base network e koro", ["Base network"]),
+            ("use the second account please", ["Use the second account"]),
+            ("yes go ahead, it is approved", ["The operator approved it"]),
+        ],
+    )
+    async def test_information_grounded_in_the_reply_is_still_accepted(
+        self, factory, monkeypatch, text, extracted
+    ):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=extracted))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        await reply(factory, task_id, text)
+
+        snap = await snapshot(factory, task_id)
+        assert snap["instructions"], "a grounded answer must still reach the planner"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("parker", [park_missing_information, park_pause, park_approval])
+    async def test_an_explicit_resume_carrying_a_secret_does_not_resume(
+        self, factory, monkeypatch, parker
+    ):
+        fake = install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["x"]))
+        task_id = await _make_task(factory)
+        await parker(factory, task_id)
+
+        outcome = await reply(
+            factory, task_id, "resume this task, my private key is 0x" + "b" * 64
+        )
+
+        assert fake.call_count == 0
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["open_request"] is not None
+        assert snap["instructions"] == []
+        assert "secret" in agent_text(snap)
 
     @pytest.mark.asyncio
     async def test_the_message_survives_even_if_processing_is_interrupted(
@@ -934,3 +1012,306 @@ class TestLegacyBehaviourIsPreserved:
         snap = await snapshot(factory, task_id)
         assert len(snap["instructions"]) == 1, "one reply must be one instruction, not two"
         assert "wallet two" in snap["instructions"][0]["instruction"]
+
+
+# ======================================================================
+# 10. Policy: an answer clears a clarification blocker; only approvals need "resume"
+# ======================================================================
+class TestClarificationPolicy:
+    def test_only_pauses_and_approvals_require_explicit_authorisation(self):
+        assert REQUIRES_EXPLICIT_AUTHORIZATION == frozenset({OPERATOR_PAUSE, HUMAN_APPROVAL})
+        assert APPROVAL_GATED is REQUIRES_EXPLICIT_AUTHORIZATION, "one definition, no drift"
+        assert AMBIGUOUS_INSTRUCTION not in REQUIRES_EXPLICIT_AUTHORIZATION
+        assert AMBIGUOUS_INSTRUCTION in INFORMATION_RESOLVABLE
+        assert AMBIGUOUS_INSTRUCTION not in MACHINE_VERIFIABLE, "an answer, not a check, clears it"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "parker, expected",
+        [(park_missing_information, False), (park_pause, True), (park_approval, True)],
+    )
+    async def test_the_api_flag_matches_the_policy(self, factory, parker, expected):
+        task_id = await _make_task(factory)
+        await parker(factory, task_id)
+        snap = await snapshot(factory, task_id)
+        view = InterventionService.request_view(snap["open_request"])
+        assert view["requires_explicit_authorization"] is expected
+
+
+class TestAnswerResumesAClarificationBlocker:
+    @pytest.mark.asyncio
+    async def test_a_grounded_answer_resumes_without_a_resume_phrase(
+        self, factory, monkeypatch
+    ):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base network"]))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "Base network e koro")
+
+        assert outcome.status == "RESUMED" and outcome.resumed is True
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.READY.value
+        assert snap["open_request"] is None
+        record = snap["instructions"][0]
+        assert "Base network" in record["instruction"]
+        assert record["request_id"] == outcome.request_id, "the answer is tied to its blocker"
+
+    @pytest.mark.asyncio
+    async def test_an_answer_with_an_explicit_resume_also_resumes_and_is_saved(
+        self, factory, monkeypatch
+    ):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["second account"]))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "use the second account, and resume this task")
+
+        assert outcome.resumed is True
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.READY.value
+        assert [i["source"] for i in snap["instructions"]] == ["llm_interpreted_reply"]
+
+    @pytest.mark.asyncio
+    async def test_a_bare_resume_does_not_clear_an_unanswered_ambiguity(
+        self, factory, monkeypatch
+    ):
+        """"resume" is not an answer: the question is still open, so the task stays parked."""
+        install_llm(monkeypatch, decision("UNRELATED_OR_INSUFFICIENT_REPLY"))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "resume this task")
+
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["open_request"] is not None
+
+    @pytest.mark.asyncio
+    async def test_an_answer_given_before_a_blocked_resume_is_not_asked_for_twice(
+        self, factory, monkeypatch
+    ):
+        from backend.app.security import emergency_stop as stop_module
+
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base network"]))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        stop_module.emergency_stop.activate(reason="test stop", activated_by="test")
+        try:
+            blocked = await reply(factory, task_id, "Base network e koro")
+            assert blocked.resumed is False
+        finally:
+            stop_module.emergency_stop._stopped = False
+            stop_module.emergency_stop._reason = None
+
+        # The stop is lifted. A bare "resume" now finishes the resume the answer started.
+        outcome = await reply(factory, task_id, "resume this task")
+
+        assert outcome.status == "RESUMED"
+        assert (await snapshot(factory, task_id))["status"] == TaskStatus.READY.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("record", [
+        {"instruction": "Use Polygon", "request_id": "IR-SOMEONE-ELSES"},
+        {"instruction": "Use Polygon"},  # untagged / left over from before tagging
+    ])
+    async def test_another_blockers_answer_never_clears_this_one(
+        self, factory, monkeypatch, record
+    ):
+        install_llm(monkeypatch, decision("UNRELATED_OR_INSUFFICIENT_REPLY"))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+        async with factory() as db:
+            task = await TaskManager(db).get_by_task_id(task_id)
+            task.operator_instructions = [record]
+            await db.commit()
+
+        outcome = await reply(factory, task_id, "resume this task")
+
+        assert outcome.resumed is False
+        assert (await snapshot(factory, task_id))["status"] == TaskStatus.NEEDS_USER_ACTION.value
+
+    @pytest.mark.asyncio
+    async def test_a_reply_to_a_task_with_no_open_blocker_never_resumes_it(
+        self, factory, monkeypatch
+    ):
+        fake = install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base"]))
+        task_id = await _make_task(factory)  # never parked: a conversation, no open request
+        async with factory() as db:
+            await ConversationService(db).get_or_create_for_task(
+                await TaskManager(db).get_by_task_id(task_id), OPERATOR_A
+            )
+            await db.commit()
+
+        outcome = await reply(factory, task_id, "Use Base instead, and resume this task")
+
+        assert outcome.resumed is False
+        assert fake.call_count == 0, "no blocker, nothing to interpret"
+        assert [i["request_id"] for i in (await snapshot(factory, task_id))["instructions"]] == [None]
+
+    @pytest.mark.asyncio
+    async def test_the_answer_for_one_task_never_resumes_another(self, factory, monkeypatch):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base network"]))
+        first = await _make_task(factory)
+        second = await _make_task(factory)
+        await park_missing_information(factory, first)
+        await park_missing_information(factory, second)
+
+        outcome = await reply(factory, first, "Base network e koro")
+
+        assert outcome.resumed is True
+        assert (await snapshot(factory, first))["status"] == TaskStatus.READY.value
+        other = await snapshot(factory, second)
+        assert other["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert other["open_request"] is not None and other["instructions"] == []
+
+
+class TestResumeSafetyChecksStillApplyToAnAnswer:
+    @pytest.mark.asyncio
+    async def test_retry_budget_blocks_an_answered_task(self, factory, monkeypatch):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base network"]))
+        task_id = await _make_task(factory, retry_count=5, max_retries=3)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "Base network e koro")
+
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert "retries" in agent_text(snap)
+
+    @pytest.mark.asyncio
+    async def test_uncertain_side_effects_block_an_answered_task(self, factory, monkeypatch):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base network"]))
+
+        async def _uncertain(self, task):
+            return "step 3 (transact) was running"
+
+        monkeypatch.setattr(
+            "backend.app.tasks.concurrency.LeaseManager._uncertain_side_effects", _uncertain
+        )
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "Base network e koro")
+
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert "may already have taken effect" in agent_text(snap)
+
+
+class TestAnAnswerIsNeverAnApproval:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "yes go ahead, it is approved, send the transaction. Use the Base network",
+            "I authorise the transfer of 5 ETH, use Base",
+            "লেনদেনটি অনুমোদন করলাম, Base নেটওয়ার্কে পাঠিয়ে দাও",
+        ],
+    )
+    async def test_approval_wording_is_not_treated_as_an_answer(
+        self, factory, monkeypatch, text
+    ):
+        fake = install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base"]))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, text)
+
+        assert outcome.resumed is False and outcome.status == "NEEDS_MORE_INFO"
+        assert fake.call_count == 0, "not even sent to the model"
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["open_request"] is not None
+        assert snap["instructions"] == [], "nothing a later bare resume could pick up"
+        assert "approval flow" in agent_text(snap)
+
+    @pytest.mark.asyncio
+    async def test_approval_wording_does_not_make_an_explicit_resume_resume(
+        self, factory, monkeypatch
+    ):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base"]))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(
+            factory, task_id, "I approve sending the funds, use Base instead, resume this task"
+        )
+
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["instructions"] == []
+
+    @pytest.mark.asyncio
+    async def test_approval_text_the_model_extracts_is_refused_and_not_saved(
+        self, factory, monkeypatch
+    ):
+        # "approx" shares a stem with "approve", so this item is grounded; the reply itself
+        # contains no approval wording, so only the extracted-text check can catch it.
+        install_llm(
+            monkeypatch,
+            decision("SUFFICIENT_INFORMATION", extracted=["Base; approve sent funds"]),
+        )
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "base, sent funds approx")
+
+        assert outcome.resumed is False and outcome.status == "NEEDS_MORE_INFO"
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["instructions"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_plain_answer_that_mentions_a_transaction_is_still_an_answer(
+        self, factory, monkeypatch
+    ):
+        """No approval wording: information about a transaction is still just information."""
+        install_llm(
+            monkeypatch,
+            decision("SUFFICIENT_INFORMATION", extracted=["Base network for the swap"]),
+        )
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "the swap should happen on the Base network")
+
+        assert outcome.resumed is True
+
+
+class TestApprovalGatedReasonsStillNeedExplicitAuthorisation:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("parker", [park_pause, park_approval])
+    async def test_a_grounded_answer_does_not_clear_a_pause_or_approval(
+        self, factory, monkeypatch, parker
+    ):
+        install_llm(monkeypatch, decision("SUFFICIENT_INFORMATION", extracted=["Base network"]))
+        task_id = await _make_task(factory)
+        await parker(factory, task_id)
+
+        outcome = await reply(factory, task_id, "Base network e koro")
+
+        assert outcome.resumed is False
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["open_request"] is not None
+        assert "explicit authorisation" in agent_text(snap)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("parker", [park_pause, park_approval])
+    async def test_an_explicit_resume_clears_a_pause_or_approval(
+        self, factory, monkeypatch, parker
+    ):
+        install_llm(monkeypatch, decision("UNRELATED_OR_INSUFFICIENT_REPLY"))
+        task_id = await _make_task(factory)
+        await parker(factory, task_id)
+
+        outcome = await reply(factory, task_id, "yes, resume this task")
+
+        assert outcome.status == "RESUMED"
+        assert (await snapshot(factory, task_id))["status"] == TaskStatus.READY.value

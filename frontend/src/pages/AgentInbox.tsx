@@ -350,7 +350,7 @@ function OpenRequestCard({ detail }: { detail: InboxConversationDetail }) {
       )}
       {request.requires_explicit_authorization && (
         <p className="mt-2 text-xs font-medium text-status-warning">
-          This one needs an explicit instruction — an ordinary reply will not restart it.
+          This is a pause or an approval — only an explicit instruction (for example “resume this task”) restarts it, not an ordinary reply.
         </p>
       )}
     </div>

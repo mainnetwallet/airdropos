@@ -80,22 +80,25 @@ MACHINE_VERIFIABLE = frozenset(
     }
 )
 
-# Reasons that must never be cleared by a merely informational reply.
-REQUIRES_EXPLICIT_AUTHORIZATION = frozenset(
-    {
-        OPERATOR_PAUSE,
-        HUMAN_APPROVAL,
-        AMBIGUOUS_INSTRUCTION,
-    }
-)
+# Reasons that are a deliberate human decision: an operator pause or an approval. Only an
+# explicit instruction ("resume this task") given through the authorisation flow clears one.
+# No reply that merely supplies information -- however well an LLM understands it, and however
+# grounded it is -- can clear one of these.
+#
+# AMBIGUOUS_INSTRUCTION is deliberately NOT here. An ambiguity is resolved by the operator
+# answering the question, so a grounded answer clears it without a "resume" phrase (see
+# INFORMATION_RESOLVABLE). That answer is information, never approval: it cannot authorise a
+# transaction or a spend, which stay behind HUMAN_APPROVAL.
+REQUIRES_EXPLICIT_AUTHORIZATION = frozenset({OPERATOR_PAUSE, HUMAN_APPROVAL})
 
-# The subset of the above that is a *deliberate human decision*: an operator pause or an
-# approval. No reply that merely supplies information, however well an LLM understands it,
-# can clear one of these -- only the explicit authorisation flow can.
-APPROVAL_GATED = frozenset({OPERATOR_PAUSE, HUMAN_APPROVAL})
+# The same set under the name the routing code uses. One definition, so the API flag
+# `requires_explicit_authorization` and the router can never disagree.
+APPROVAL_GATED = REQUIRES_EXPLICIT_AUTHORIZATION
 
 # Reasons whose blocker is missing *information* rather than a session, credential or human
-# control. When no automatic check exists, an operator's substantive answer may clear these.
+# control. When no automatic check exists, an operator's substantive, grounded answer clears
+# these and the task resumes on its own -- after the usual resume checks (Emergency Stop, retry
+# budget, uncertain side effects) -- without a separate "resume" phrase.
 # Session / authentication / CAPTCHA reasons are deliberately absent: "I logged in" is a claim,
 # not proof, and only a real check may satisfy them.
 INFORMATION_RESOLVABLE = frozenset({AMBIGUOUS_INSTRUCTION, MISSING_CONFIGURATION, UNKNOWN_REASON})

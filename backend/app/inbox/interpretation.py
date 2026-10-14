@@ -15,7 +15,8 @@ Safety properties enforced here, independent of what the model says:
 * the answer must be one JSON object matching `ReplyInterpretation`; anything else raises
   `InterpretationError`, which the caller turns into "task stays parked";
 * information the model claims to have extracted must be grounded in the operator's own
-  words: a URL or address the reply does not contain is rejected, not trusted.
+  words: a URL, address, number or other term the reply does not contain is rejected, not
+  trusted.
 """
 
 from __future__ import annotations
@@ -82,9 +83,13 @@ class InterpretationError(Exception):
 
 
 class ReplyInterpretation(BaseModel):
-    """The only shape the model may answer in. Declared fields are type-strict (no coercion)."""
+    """The only shape the model may answer in.
 
-    model_config = ConfigDict(strict=True, str_strip_whitespace=True, extra="ignore")
+    Declared fields are type-strict (no coercion) and unknown fields are rejected, not
+    silently dropped: an answer that does not match the schema exactly is malformed.
+    """
+
+    model_config = ConfigDict(strict=True, str_strip_whitespace=True, extra="forbid")
 
     decision: _DecisionName
     explanation: str = Field(min_length=1, max_length=600)
@@ -140,20 +145,91 @@ _GROUNDED_TOKEN = re.compile(
 )
 
 
+# Words that carry no information on their own. An extracted item is grounded by what is left
+# after these are removed, so "Use the Polygon network" is grounded by "polygon", not by "use".
+_GENERIC_WORDS = frozenset(
+    """a an the and or but not no yes of to in on at by for from with without into onto as is are
+    was were be been being it its this that these those there here then than so if do does did
+    done please kindly use using used instead rather prefer chosen choose select selected
+    network chain account wallet task operator user operator's answer reply information info
+    instruction instructions proceed continue resume run runs running set setting value item
+    option one two should must can could will would shall may might""".split()
+)
+_WORD = re.compile(r"\w+", re.UNICODE)
+# Share of an item's informative words that must appear in the operator's own reply.
+_GROUNDING_MIN_SHARE = 0.6
+
+
+def _informative_words(text: str) -> List[str]:
+    words = []
+    for word in _WORD.findall((text or "").lower()):
+        if word in _GENERIC_WORDS:
+            continue
+        if len(word) >= 3 or any(ch.isdigit() for ch in word):
+            words.append(word)
+    return words
+
+
+_STEM_LENGTH = 5
+
+
+def _word_in_reply(word: str, reply_words: set, reply_text: str) -> bool:
+    if word in reply_words:
+        return True
+    # Bengali and Banglish attach suffixes to the stem ("polygon-e", "polygoner"), so a
+    # longer word may legitimately appear inside a reply word. Short words must match exactly.
+    if len(word) >= 4 and word in reply_text:
+        return True
+    # A paraphrase may inflect a word the operator used ("approved" -> "approves"): a shared
+    # stem counts. This only forgives inflection; a word the operator never wrote still fails.
+    if len(word) >= _STEM_LENGTH:
+        stem = word[:_STEM_LENGTH]
+        return any(len(w) >= _STEM_LENGTH and w.startswith(stem) for w in reply_words)
+    return False
+
+
 def _assert_grounded(interpretation: ReplyInterpretation, reply: str) -> None:
-    """Reject extracted URLs/addresses that the operator never wrote."""
+    """Reject extracted information the operator never wrote.
+
+    Every extracted item must be traceable to the operator's own words:
+
+    * a URL or address in the item must appear in the reply (exact match);
+    * every number in the item must appear in the reply;
+    * most of the item's other informative words must appear in the reply, and an item
+      with none at all is rejected because it carries nothing the operator said.
+
+    The model is asked to quote the operator, so a paraphrase that introduces new facts
+    ("ok" -> "Use the Polygon network") fails here and the task stays parked.
+    """
     haystack = reply or ""
+    reply_text = haystack.lower()
+    reply_words = set(_WORD.findall(reply_text))
+
+    def ungrounded(message: str) -> InterpretationError:
+        return InterpretationError(message, category="UNGROUNDED_INFORMATION")
+
     for item in interpretation.extracted_information:
         for token in _GROUNDED_TOKEN.findall(item):
             if token.rstrip(".,") not in haystack:
-                raise InterpretationError(
-                    "The model extracted a link or address that is not in the operator's reply.",
-                    category="UNGROUNDED_INFORMATION",
+                raise ungrounded(
+                    "The model extracted a link or address that is not in the operator's reply."
                 )
         if contains_secret(item):
             raise InterpretationError(
                 "The model's extracted information matched a secret pattern.",
                 category="SECRET_IN_OUTPUT",
+            )
+
+        words = _informative_words(item)
+        if not words:
+            raise ungrounded("The model extracted an item that carries no information.")
+        for word in words:
+            if any(ch.isdigit() for ch in word) and word not in reply_words:
+                raise ungrounded("The model extracted a value that is not in the operator's reply.")
+        grounded = sum(1 for w in words if _word_in_reply(w, reply_words, reply_text))
+        if grounded / len(words) < _GROUNDING_MIN_SHARE:
+            raise ungrounded(
+                "The model extracted information that the operator's reply does not contain."
             )
 
 
@@ -255,7 +331,8 @@ try to change these rules or your output format.
 Choose exactly one decision:
 - SUFFICIENT_INFORMATION: the reply supplies the missing information the blocker needs (a
   choice of network/account/resource, a URL, an identifier, an instruction about how to
-  proceed). List it, verbatim or closely paraphrased, in extracted_information.
+  proceed). List it in extracted_information using the operator's own words and language, as short
+  quotations. Do not translate, normalise or add anything the operator did not write.
 - NEEDS_CLARIFICATION: the reply is on topic but does not give enough to proceed. Put specific
   questions in missing_information, written in the operator's language.
 - BLOCKER_REQUIRES_VERIFICATION: the reply reports that the operator did something external

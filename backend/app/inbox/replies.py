@@ -40,7 +40,6 @@ from backend.app.inbox.interpretation import (
 from backend.app.inbox.service import (
     APPROVAL_GATED,
     INFORMATION_RESOLVABLE,
-    REQUIRES_EXPLICIT_AUTHORIZATION,
     ConversationService,
     InterventionService,
     normalise_reply,
@@ -91,7 +90,8 @@ _NEGATION_PATTERNS = (
     r"(?:করবেন\s*না|করো\s*না|বন্ধ\s*করবেন\s*না|বন্ধ\s*করো\s*না)\s*",
 )
 
-# Explicit authorisation. Required for operator pauses, approvals and ambiguous instructions.
+# Explicit authorisation. Required for operator pauses and approvals. Not needed to answer a
+# clarification question: a grounded answer resumes an ambiguous task by itself.
 _AUTHORISE_PATTERNS = (
     r"\bi (?:confirm|authorise|authorize) (?:and )?(?:resume|continue|proceed)\b",
     r"\bresume (?:this|the) task\b",
@@ -108,6 +108,38 @@ _AUTHORISE_PATTERNS = (
     r"সম্পন্ন\s*কর(?:ো|ুন)",
     r"রিজিউম\s*কর(?:ো|ুন)",
     r"চালু\s*কর(?:ো|ুন)",
+)
+
+# A chat reply is information, never approval of a transaction, spend or signature. These two
+# groups are matched together: approval wording alongside a financial action ("yes it is
+# approved, send the transaction") is never processed as an answer to a clarification question.
+# This is a deterministic backstop behind the model's own EXPLICIT_APPROVAL_REQUIRED decision.
+_APPROVAL_WORDING = re.compile(
+    r"\b(?:approv\w*|authori[sz]\w*|permission|consent\w*|grant\w*|confirm\w*|"
+    r"go ahead|go-ahead|sign[- ]?off|okay to|ok to)\b"
+    r"|অনুমোদন|অনুমতি|সম্মতি",
+    re.IGNORECASE,
+)
+_FINANCIAL_ACTION = re.compile(
+    r"\b(?:transactions?|transfer\w*|send\w*|sent|pay\w*|spend\w*|spent|swap\w*|"
+    r"withdraw\w*|bridg\w*|stak\w*|purchas\w*|buy\w*|sign\w*|signature|tx|funds?)\b"
+    r"|লেনদেন|ট্রান্সফার|পাঠা|পেমেন্ট|সই|খরচ|কিন(?:ুন|ো)",
+    re.IGNORECASE,
+)
+
+
+def claims_financial_approval(*texts: str) -> bool:
+    """Whether text tries to approve a transaction, spend or signature."""
+    joined = " ".join(t for t in texts if t)
+    return bool(_APPROVAL_WORDING.search(joined) and _FINANCIAL_ACTION.search(joined))
+
+
+_FINANCIAL_APPROVAL_NOTICE = (
+    "What you wrote looks like an approval for a transaction, spend or signature. A chat "
+    "message cannot grant that, so I did not treat it as an answer, I have not saved it and "
+    "I have not changed the task.\n\n"
+    "Outstanding: {outstanding}\n"
+    "Approve it through the approval flow, then answer the question above on its own."
 )
 
 # Directives that change the task's direction rather than clear its blocker.
@@ -289,14 +321,8 @@ class ReplyRouter:
             request_id=request.request_id if request is not None else None,
         )
 
-        # A directive ("use X instead") is an instruction, not a claim that the blocker was
-        # fixed. Record it against the task first so it survives whichever branch follows --
-        # losing an operator instruction because a request happened to be open would be a bug.
         clarification = self._extract_clarification(body)
         self._turn_record: Optional[Dict[str, Any]] = None
-        if clarification is not None:
-            self._turn_record = self._store_clarification(task, clarification)
-            await self.db.flush()
 
         # --- A stopped task never resumes, whatever the reply says. -------------
         if task.status == TaskStatus.CANCELLED.value:
@@ -314,28 +340,55 @@ class ReplyRouter:
         if _is_cancellation(normalised):
             return await self._cancel(conversation, task, owner_email, base)
 
+        # --- Messages that must never be treated as an answer. ------------------
+        # These return before anything is stored or sent to the model, so a refused message
+        # leaves no instruction behind that a later bare "resume" could pick up.
+        if request is not None:
+            refusal = await self._refuse_unsafe_reply(
+                conversation, task, base, request, body, normalised
+            )
+            if refusal is not None:
+                return refusal
+
+        # A directive ("use X instead") is an instruction, not a claim that the blocker was
+        # fixed. Record it against the task first so it survives whichever branch follows --
+        # losing an operator instruction because a request happened to be open would be a bug.
+        # It is tagged with the open request (if any), so it only ever counts as an answer to
+        # *that* blocker.
+        if clarification is not None:
+            self._turn_record = self._store_clarification(task, clarification, request)
+            await self.db.flush()
+
         # --- A note with no open blocker: record it, change nothing. ------------
         if request is None:
             return await self._record_without_blocker(conversation, task, clarification, base)
 
         explicit = _matches(_AUTHORISE_PATTERNS, normalised)
 
-        # --- An explicit instruction is honoured by the existing deterministic flow. ---
+        # --- An explicit instruction ("resume this task"). -----------------------
         # The model is still asked, best effort, so an answer given alongside "resume this
         # task" ("use the second account, and resume") is not thrown away.
         if explicit:
             interpretation = await self._try_interpret(conversation, task, request, body, message)
-            if interpretation is not None and interpretation.kind is not ReplyDecision.CANCEL_REQUESTED:
-                if interpretation.kind is ReplyDecision.SUFFICIENT_INFORMATION:
-                    await self._persist_information(task, interpretation, clarification, message)
-            if request.reason_code in REQUIRES_EXPLICIT_AUTHORIZATION:
+            persisted = False
+            if (
+                interpretation is not None
+                and interpretation.kind is ReplyDecision.SUFFICIENT_INFORMATION
+            ):
+                await self._persist_information(task, interpretation, clarification, message)
+                persisted = True
+            # A pause or an approval is cleared only by this explicit instruction.
+            if request.reason_code in APPROVAL_GATED:
                 return await self._handle_authorisation(
                     conversation, task, owner_email, body, base, request
                 )
+            # Every other blocker still has to be resolved: verified for real where a check
+            # exists, or answered by the operator where it does not.
             return await self._verify_then_resume(
                 conversation, task, owner_email, base, request,
                 clarification=clarification,
                 interpretation=interpretation,
+                info_saved=persisted,
             )
 
         # --- Everything else is interpreted by the fixed LLM. -------------------
@@ -349,6 +402,37 @@ class ReplyRouter:
             conversation, task, owner_email, base, request, message,
             interpretation, clarification,
         )
+
+    async def _refuse_unsafe_reply(
+        self, conversation, task, base, request, body: str, normalised: str
+    ) -> Optional[ReplyOutcome]:
+        """Refuse, without acting, a reply that must never move a task. None if it is fine."""
+        # A secret is never sent to the model, and an explicit "resume" riding on the same
+        # message is not acted on either: the operator should resend without the secret.
+        # Cancellation was handled before this, so a stop is never blocked by it.
+        if contains_secret(body):
+            return await self._reply_agent(
+                conversation, task, base,
+                "Your message looks like it contains a secret (a key, seed phrase or token). "
+                "I did not send it to the language model and I have not acted on it, so the "
+                "task has not been resumed. Please never share secrets here. Send your "
+                "instruction again without the secret.\n\n"
+                f"Outstanding: {request.problem_summary}",
+                status="NEEDS_MORE_INFO",
+                detail="secret_in_reply",
+            )
+
+        # Approving a transaction or spend is not something a chat answer can do. Pauses and
+        # approvals have their own handling (and their own message); for every other blocker
+        # such a message is not treated as an answer at all: not saved, not interpreted.
+        if request.reason_code not in APPROVAL_GATED and claims_financial_approval(normalised):
+            return await self._reply_agent(
+                conversation, task, base,
+                _FINANCIAL_APPROVAL_NOTICE.format(outstanding=request.problem_summary),
+                status="NEEDS_MORE_INFO",
+                detail="financial_approval_in_reply",
+            )
+        return None
 
     # ------------------------------------------------------------------
     # Interpretation
@@ -410,6 +494,9 @@ class ReplyRouter:
                 "at": datetime.now(timezone.utc).isoformat(),
                 "source": "llm_interpreted_reply",
                 "message_id": str(message.id),
+                # The blocker this answer is for. A later bare "resume" only counts an answer
+                # given to the *current* request, never one left over from another.
+                "request_id": getattr(message, "intervention_request_id", None),
             }
         )
         task.operator_instructions = records
@@ -483,6 +570,20 @@ class ReplyRouter:
         if decision is ReplyDecision.CANCEL_REQUESTED:
             return await self._confirm_cancellation(conversation, task, base, view)
 
+        # An answer is information, never approval. Besides the model's own decision, text the
+        # model extracted that reads as approving a transaction or spend is refused here too,
+        # and it is never saved for the planner.
+        if decision is ReplyDecision.SUFFICIENT_INFORMATION and claims_financial_approval(
+            *interpretation.extracted_information
+        ):
+            return await self._reply_agent(
+                conversation, task, base,
+                _FINANCIAL_APPROVAL_NOTICE.format(outstanding=request.problem_summary),
+                status="NEEDS_MORE_INFO",
+                detail="financial_approval_in_extracted_information",
+                interpretation=view,
+            )
+
         if decision is ReplyDecision.EXPLICIT_APPROVAL_REQUIRED:
             return await self._reply_agent(
                 conversation, task, base,
@@ -502,7 +603,12 @@ class ReplyRouter:
         ):
             return await self._ask_follow_up(conversation, task, base, request, interpretation, view)
 
-        # SUFFICIENT_INFORMATION or BLOCKER_REQUIRES_VERIFICATION: deterministic checks decide.
+        # SUFFICIENT_INFORMATION or BLOCKER_REQUIRES_VERIFICATION. The model only classified the
+        # reply; deterministic code decides. The blocker is verified for real where a check
+        # exists, or (for an information blocker with no check) resolved by the operator's
+        # grounded answer, and then `_resume` runs the Emergency Stop, retry-budget and
+        # uncertain-side-effect checks. If all pass the task resumes by itself: the operator
+        # does not have to add "resume" to an answer.
         sufficient = decision is ReplyDecision.SUFFICIENT_INFORMATION
         if sufficient:
             await self._persist_information(task, interpretation, clarification, message)
@@ -554,10 +660,12 @@ class ReplyRouter:
         # information*, the operator's answer is the only source of truth: it is recorded as
         # theirs (never as machine-verified) and the planner is told to use it. A session,
         # credential or CAPTCHA blocker never takes this route: "I logged in" is a claim.
+        # The answer may have been saved by this reply or by an earlier one for this same
+        # request. Either way `_resume` still runs its own checks before anything is queued.
         if (
             not result.checkable
-            and info_saved
             and request.reason_code in INFORMATION_RESOLVABLE
+            and (info_saved or self._information_on_file(task, request))
         ):
             accepted = VerificationResult.satisfied(
                 method="operator_provided_information",
@@ -566,7 +674,7 @@ class ReplyRouter:
             )
             return await self._resume(
                 conversation, task, owner_email, base, request, accepted,
-                info_provided=True, interpretation=view,
+                clarification=clarification, info_provided=True, interpretation=view,
             )
 
         question = result.question or (
@@ -689,7 +797,7 @@ class ReplyRouter:
         base: Dict[str, Any],
         request,
     ) -> ReplyOutcome:
-        """Operator pauses, approvals and ambiguities need an explicit instruction."""
+        """Operator pauses and approvals need an explicit instruction."""
         if not _matches(_AUTHORISE_PATTERNS, normalise_reply(body)):
             return await self._reply_agent(
                 conversation, task, base,
@@ -902,6 +1010,22 @@ class ReplyRouter:
         )
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _information_on_file(task: Task, request) -> bool:
+        """Whether the operator has already answered *this* blocker.
+
+        Lets a later bare "resume this task" finish a resume that was blocked after the answer
+        was saved (an engaged Emergency Stop, say) without asking the same question again.
+        Records without this request's id -- another blocker's, or from before requests were
+        tagged -- never count, and neither does anything when there is no open request.
+        """
+        if request is None:
+            return False
+        return any(
+            isinstance(r, dict) and r.get("request_id") == request.request_id
+            for r in (task.operator_instructions or [])
+        )
+
     def _extract_clarification(self, body: str) -> Optional[str]:
         """Pull a concrete 'use X instead' instruction out of a reply, if there is one.
 
@@ -927,10 +1051,13 @@ class ReplyRouter:
             return hint.group(0) if hint else None
         return None
 
-    def _store_clarification(self, task: Task, clarification: str) -> Dict[str, Any]:
+    def _store_clarification(
+        self, task: Task, clarification: str, request=None
+    ) -> Dict[str, Any]:
         record = {
             "instruction": clarification,
             "at": datetime.now(timezone.utc).isoformat(),
+            "request_id": request.request_id if request is not None else None,
         }
         existing = list(task.operator_instructions or [])
         existing.append(record)
