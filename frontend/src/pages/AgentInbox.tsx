@@ -518,7 +518,10 @@ function ConversationPane({
   // The server refuses to delete a conversation that is still waiting on the operator while its
   // task is unfinished, because that would strand the task. Mirror it so the button explains
   // itself instead of failing.
-  const waitingOnYou = detail.requires_reply && !(status && TERMINAL_STATUSES.has(status))
+  // An orphaned conversation (its task was deleted, so there is no task id) strands nothing,
+  // and the server allows deleting it, so only block when a live task is actually linked.
+  const waitingOnYou =
+    Boolean(detail.task_id) && detail.requires_reply && !(status && TERMINAL_STATUSES.has(status))
 
   const handleDelete = () => {
     if (waitingOnYou || remove.isPending) return
