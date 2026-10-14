@@ -1,9 +1,9 @@
 # AirdropOS Implementation Checklist
 
-**Status as of 2026-10-14 (review fixes):** the backend suite has **457 tests**. Verified
-on Linux / Python 3.13 after the quantity-evidence fix: **456 passed, 1 failed**. The one
+**Status as of 2026-10-14 (review fixes):** the backend suite has **489 tests**. Verified
+on Linux / Python 3.13 after the unsettled-evidence fix: **488 passed, 1 failed**. The one
 failure, `test_agent_inbox.py::...::test_verifier_never_constructs_a_second_telethon_client`,
-fails identically before the fix (423 tests: 422 passed, 1 failed). The 17 terminal-layout
+fails identically before any of these fixes (423 tests: 422 passed, 1 failed). The 17 terminal-layout
 failures recorded in the previous run did **not** reproduce there — all 68 tests in
 `test_terminal_layout.py` and `test_terminal_logs.py` pass — see *Known gaps*.
 The frontend is at **26** (not re-run in this fix), with `npm run lint` (0 errors) and
@@ -301,6 +301,16 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       source not marked pending or failed. Conflicting or missing evidence leaves the
       requirement outstanding. Limitation: a quantity must carry its unit in the same string
       (`"150 tokens"`); a bare numeric `balance` with the symbol in another field is not read.
+- [x] **An unsettled source proves nothing - a balance included.** The first version
+      dropped pending/failed *transfer* amounts but still accepted a balance key beside
+      `"status": "failed"`, and read only the top-level `status`. Now the status of any
+      object covers everything **inside** it (`status` / `state` / `tx_status` /
+      `transaction_status`, a status given as an object, `"success": false`,
+      `"pending": true`, a non-empty `error`), at any depth and inside lists, and covers
+      nothing **beside** it: `{"transaction": {"status": "pending", ...}, "balance":
+      "150 tokens"}` keeps the independent balance, while `{"status": "failed",
+      "wallet": {"balance": ...}}` loses it. An unsettled reading is dropped before it is
+      classified, so it can neither satisfy a holding nor create a conflict.
 - [x] A handle matches with or without its `@`, and a target named only by a field — a
       tool result's `"username": "examplechannel"` — is recognised. Without this a genuine
       successful join could never close its own requirement.
@@ -315,8 +325,9 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       next, outstanding requirements, proven actions, and attempted-but-unverified actions
       as three separate lists. It never renders an unproven action as a success.
 - [x] `test_task_context_isolation.py` (31), `test_campaign_context.py` (15),
-      `test_context_aware_execution.py` (31), `test_quantity_evidence.py` (34; 17 of them
-      fail against `e3a655a`), plus context assertions in `test_migrations_sqlite.py`.
+      `test_context_aware_execution.py` (31), `test_quantity_evidence.py` (66; 17 of the
+      first 34 fail against `e3a655a`, 19 of the later 32 fail against `77d4d1b`), plus
+      context assertions in `test_migrations_sqlite.py`.
 - [x] **Recovery replans are budgeted separately from discovery replans.** Both advance
       the same revision counter, so the recovery cap is now read from the persisted
       revision history counting only recovery triggers. Without this, a task that

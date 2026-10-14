@@ -30,6 +30,7 @@ from sqlalchemy.pool import StaticPool
 
 from backend.app.agent.context import (
     TaskContextService,
+    _collect_quantity_evidence,
     _extract_quantities,
     _quantities_met,
 )
@@ -339,5 +340,242 @@ class TestThresholdBoundaries:
     async def test_a_fractional_balance_on_the_boundary_closes_the_requirement(self, factory):
         outstanding = await _outstanding_after(
             factory, "hold 0.1 eth", observed_state={"balance": "0.1000 eth"}
+        )
+        assert outstanding == []
+
+
+# ======================================================================
+# Follow-up to 77d4d1b - an unsettled source proves nothing, balance included
+# ======================================================================
+# 77d4d1b dropped pending/failed sources from the *transfer* evidence but let a balance
+# key through regardless, and it read only the top-level `status`. So
+#
+#     {"status": "failed", "balance": "150 tokens"}
+#
+# still verified "hold 100 tokens", and `{"transaction": {"status": "pending", ...}}` was
+# not looked at at all. The status of an object now covers what is *inside* it - and
+# nothing beside it.
+class TestAnUnsettledSourceDoesNotVerifyAHolding:
+    @pytest.mark.asyncio
+    async def test_failed_status_with_a_large_balance_is_not_satisfied(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={"status": "failed", "balance": "150 tokens"},
+        )
+        assert outstanding == ["hold 100 tokens"], (
+            "a balance reported by a failed call was accepted as a verified holding"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pending_status_with_a_large_balance_is_not_satisfied(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={"status": "pending", "balance": "150 tokens"},
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status", ["pending", "failed", "rejected", "reverted", "processing", "Awaiting Confirmation"]
+    )
+    async def test_every_unsettled_status_blocks_an_observed_balance(self, factory, status):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            observed_state={"status": status, "balance": "150 tokens"},
+        )
+        assert outstanding == ["hold 100 tokens"], f"status {status!r} did not block the balance"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "marker", [{"success": False}, {"confirmed": False}, {"pending": True}, {"error": "rpc timeout"}]
+    )
+    async def test_a_flag_that_says_unfinished_blocks_the_balance_too(self, factory, marker):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={**marker, "balance": "150 tokens"},
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    async def test_a_status_given_as_an_object_blocks_the_balance(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={"status": {"state": "pending"}, "balance": "150 tokens"},
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    async def test_a_balance_inside_an_unsettled_object_is_not_satisfied(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={"transaction": {"status": "pending", "balance": "150 tokens"}},
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    async def test_a_nested_balance_under_a_failed_root_is_not_satisfied(self, factory):
+        """The verdict flows down: the root failed, so what is under it goes with it."""
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={"status": "failed", "wallet": {"balance": "150 tokens"}},
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["confirmed", "success", "completed", "active", "finalized"])
+    async def test_each_settled_status_still_verifies_a_balance(self, factory, status):
+        """The fix must not turn every status field into a veto."""
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            observed_state={"status": status, "balance": "150 tokens"},
+        )
+        assert outstanding == []
+
+
+class TestNestedTransactionsAreNotProofOfTransfer:
+    @pytest.mark.asyncio
+    async def test_a_nested_pending_transaction_amount_is_not_a_completed_transfer(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "send 100 tokens",
+            result_digest={"transaction": {"status": "pending", "amount": "100 tokens"}},
+        )
+        assert outstanding == ["send 100 tokens"], (
+            "the amount sits inside a pending transaction and proves nothing was sent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_nested_failed_transaction_in_a_list_is_not_a_completed_transfer(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "send 100 usdt",
+            result_digest={"transfers": [{"status": "failed", "amount": "100 usdt"}]},
+        )
+        assert outstanding == ["send 100 usdt"]
+
+    @pytest.mark.asyncio
+    async def test_a_nested_settled_transaction_is_proof_of_transfer(self, factory):
+        """Control: the same shape with a settled status does satisfy it."""
+        outstanding = await _outstanding_after(
+            factory,
+            "send 100 tokens",
+            result_digest={"transaction": {"status": "confirmed", "amount": "100 tokens"}},
+        )
+        assert outstanding == []
+
+    @pytest.mark.asyncio
+    async def test_one_pending_transaction_does_not_cancel_a_settled_one_beside_it(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "send 100 usdt",
+            result_digest={
+                "transfers": [
+                    {"status": "pending", "amount": "40 usdt"},
+                    {"status": "confirmed", "amount": "100 usdt"},
+                ]
+            },
+        )
+        assert outstanding == []
+
+
+class TestAnIndependentBalanceKeepsItsScope:
+    @pytest.mark.asyncio
+    async def test_an_independent_authoritative_balance_satisfies_the_holding(self, factory):
+        outstanding = await _outstanding_after(
+            factory, "hold 100 tokens", observed_state={"balance": "150 tokens"}
+        )
+        assert outstanding == []
+
+    @pytest.mark.asyncio
+    async def test_a_pending_transaction_beside_the_balance_does_not_invalidate_it(self, factory):
+        """The balance is the transaction's sibling, not its child."""
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={
+                "transaction": {"status": "pending", "amount": "100 tokens"},
+                "balance": "150 tokens",
+            },
+        )
+        assert outstanding == [], (
+            "a transfer in flight beside an independent wallet reading must not veto the reading"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_pending_transaction_beside_a_nested_wallet_balance_keeps_it(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={
+                "transaction": {"status": "pending", "amount": "100 tokens"},
+                "wallet": {"status": "active", "balance": "150 tokens"},
+            },
+        )
+        assert outstanding == []
+
+    @pytest.mark.asyncio
+    async def test_a_balance_that_is_too_small_still_fails_beside_a_pending_transaction(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={
+                "transaction": {"status": "pending", "amount": "100 tokens"},
+                "balance": "50 tokens",
+            },
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    def test_the_scope_is_visible_in_the_collected_evidence(self):
+        evidence = _collect_quantity_evidence(
+            {
+                "transaction": {"status": "pending", "amount": "100 tokens", "balance": "999 tokens"},
+                "balance": "150 tokens",
+            }
+        )
+        assert evidence.balances == {"token": [Decimal("150")]}, (
+            "only the independent reading survives; the one inside the pending object is dropped"
+        )
+        assert evidence.settled == [], "the pending amount is not settled evidence"
+
+
+class TestConflictingBalanceReadingsStillBlock:
+    @pytest.mark.asyncio
+    async def test_two_settled_readings_that_disagree_keep_it_outstanding(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            observed_state={"balance": "150 tokens"},
+            result_digest={"balance": "50 tokens"},
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    async def test_disagreeing_nested_wallet_readings_keep_it_outstanding(self, factory):
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            result_digest={
+                "wallet_a": {"balance": "150 tokens"},
+                "wallet_b": {"balance": "50 tokens"},
+            },
+        )
+        assert outstanding == ["hold 100 tokens"]
+
+    @pytest.mark.asyncio
+    async def test_an_unsettled_reading_is_not_evidence_and_does_not_create_a_conflict(self, factory):
+        """A pending 50 is not a reading, so it cannot contradict the settled 150."""
+        outstanding = await _outstanding_after(
+            factory,
+            "hold 100 tokens",
+            observed_state={"balance": "150 tokens"},
+            result_digest={"status": "pending", "balance": "50 tokens"},
         )
         assert outstanding == []

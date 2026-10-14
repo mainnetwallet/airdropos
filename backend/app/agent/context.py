@@ -311,45 +311,89 @@ def _is_balance_path(path: Tuple[str, ...]) -> bool:
     return any(_BALANCE_KEY_RE.search("_".join(_key_words(key))) for key in path)
 
 
+# Flags that say the same thing without a status word: `"success": false`, `"pending": true`.
+_FALSE_MEANS_UNSETTLED = frozenset(
+    {"success", "succeeded", "confirmed", "settled", "completed", "ok"}
+)
+_TRUE_MEANS_UNSETTLED = frozenset(
+    {"pending", "failed", "rejected", "reverted", "unconfirmed"}
+)
+
+
+def _status_value_is_unsettled(value: Any) -> bool:
+    if isinstance(value, str):
+        return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_") in _UNSETTLED_STATUSES
+    if isinstance(value, Mapping):
+        # `{"status": {"state": "pending"}}`
+        return any(_status_value_is_unsettled(value.get(key)) for key in _STATUS_KEYS)
+    return False
+
+
+def _node_is_unsettled(node: Mapping[str, Any]) -> bool:
+    """Does this one object say that the thing it describes is not done?
+
+    Reads only the object's own direct keys. Whether that verdict reaches a given number
+    is decided by `_walk_text_leaves`, which applies it to the object's descendants and to
+    nothing beside it.
+    """
+    for key in _STATUS_KEYS:
+        if _status_value_is_unsettled(node.get(key)):
+            return True
+    for raw_key, value in node.items():
+        name = "_".join(_key_words(raw_key))
+        if value is False and name in _FALSE_MEANS_UNSETTLED:
+            return True
+        if value is True and name in _TRUE_MEANS_UNSETTLED:
+            return True
+        if name == "error" and isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
 def _walk_text_leaves(
-    node: Any, path: Tuple[str, ...] = (), depth: int = 0
-) -> Iterator[Tuple[Tuple[str, ...], str]]:
-    """Every string value in a bounded walk, with the dictionary keys leading to it."""
+    node: Any,
+    path: Tuple[str, ...] = (),
+    depth: int = 0,
+    unsettled: bool = False,
+) -> Iterator[Tuple[Tuple[str, ...], str, bool]]:
+    """Every string value in a bounded walk: its key path, and whether it is unsettled.
+
+    A value is unsettled when **any object enclosing it** reports a pending, failed or
+    otherwise unfinished status. The verdict flows *down* the tree and never sideways:
+
+        {"transaction": {"status": "pending", "amount": "100 tokens"},
+         "balance": "150 tokens"}
+
+    The amount sits inside the pending transaction, so it is unsettled. The balance is
+    the transaction's sibling - the only object enclosing it is the root, which reports
+    no status - so an independent wallet reading is not invalidated by a transfer
+    that happens to be in flight beside it. `{"status": "failed", "balance": ...}` is the
+    opposite case: the root itself failed, and everything under it goes with it.
+    """
     if depth > MAX_SCREEN_DEPTH:
         return
     if isinstance(node, Mapping):
+        unsettled = unsettled or _node_is_unsettled(node)
         for count, (key, value) in enumerate(node.items()):
             if count >= MAX_SCREEN_ITEMS:
                 break
-            yield from _walk_text_leaves(value, path + (str(key),), depth + 1)
+            yield from _walk_text_leaves(value, path + (str(key),), depth + 1, unsettled)
     elif isinstance(node, (list, tuple)):
         for count, item in enumerate(node):
             if count >= MAX_SCREEN_ITEMS:
                 break
-            yield from _walk_text_leaves(item, path, depth + 1)
+            yield from _walk_text_leaves(item, path, depth + 1, unsettled)
     elif isinstance(node, str):
-        yield path, node
-
-
-def _source_is_unsettled(source: Any) -> bool:
-    """Does this source say, at its top level, that the thing it describes is not done?"""
-    if not isinstance(source, Mapping):
-        return False
-    for key in _STATUS_KEYS:
-        value = source.get(key)
-        if isinstance(value, str):
-            if re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_") in _UNSETTLED_STATUSES:
-                return True
-    return False
+        yield path, node, unsettled
 
 
 @dataclass
 class _QuantityEvidence:
     """The quantities one observation can actually prove, sorted by what they prove."""
 
-    # unit -> every distinct balance reading seen for it, across all sources.
+    # unit -> every distinct *settled* balance reading seen for it, across all sources.
     balances: Dict[str, List[Decimal]] = field(default_factory=dict)
-    # Quantities that are not balance readings, from sources not marked as in flight.
+    # Quantities that are not balance readings and are not inside anything unsettled.
     settled: List[Tuple[Decimal, str]] = field(default_factory=list)
 
 
@@ -359,20 +403,28 @@ def _collect_quantity_evidence(*sources: Optional[Mapping[str, Any]]) -> _Quanti
     The classification is by the *key* a number sits under, not by the text around it,
     because the text is what an attacker or a sloppy tool controls and the key is what
     the tool's own schema says the number is.
+
+    **Anything unsettled proves nothing, balance included.** A reading inside an object
+    that reports `pending`, `failed`, `rejected`, `reverted` (or `"success": false`) is
+    dropped before it is classified, so it can neither satisfy a holding nor take part in
+    a conflict. Which numbers an unsettled status covers is decided by the object
+    structure (see `_walk_text_leaves`), so a pending transfer beside a wallet reading
+    leaves that reading intact.
     """
     evidence = _QuantityEvidence()
     for source in sources:
         if not source:
             continue
-        unsettled = _source_is_unsettled(source)
-        for path, text in _walk_text_leaves(source):
+        for path, text, unsettled in _walk_text_leaves(source):
+            if unsettled:
+                continue
             quantities = _extract_quantities(text)
             if not quantities:
                 continue
             if _is_balance_path(path):
                 for amount, unit in quantities:
                     evidence.balances.setdefault(unit, []).append(amount)
-            elif not unsettled:
+            else:
                 evidence.settled.extend(quantities)
     return evidence
 

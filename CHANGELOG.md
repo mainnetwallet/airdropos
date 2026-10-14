@@ -5,6 +5,17 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (unsettled results, review of 77d4d1b)
+- **A balance reported by a failed or pending call could still verify a holding.** With
+  `{"status": "failed", "balance": "150 tokens"}`, *hold 100 tokens* was satisfied: only
+  transfer amounts were checked against the status, and only the top-level one.
+  A status now covers everything inside the object that carries it (any depth, lists
+  included; `pending`/`failed`/`rejected`/`reverted`, `"success": false`, a non-empty
+  `error`) and nothing beside it, so a nested pending transaction's amount is not proof of
+  a transfer, while an independent wallet balance next to it still counts. Unsettled
+  readings are dropped, so they can neither satisfy a holding nor create a conflict.
+- Tests: 32 more in `backend/tests/test_quantity_evidence.py` (19 fail against `77d4d1b`).
+
 ### Fixed (requirement completion, review of e3a655a)
 - **Conflicting evidence could close a holding requirement.** With
   `observed_state={"balance": "50 tokens"}` and
