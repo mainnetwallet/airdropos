@@ -181,6 +181,18 @@ def _classify_foreign_keys(
     return correct, incorrect
 
 
+def _constraint_names_in_use(inspector: Any, table: str, foreign_keys: Sequence[Dict[str, Any]]) -> set:
+    """Every constraint name on `table`. PostgreSQL keeps one namespace per table, so a
+    unique, check or primary-key constraint blocks a new foreign key of the same name too."""
+    names = {fk["name"] for fk in foreign_keys if fk.get("name")}
+    names |= {c["name"] for c in inspector.get_unique_constraints(table) if c.get("name")}
+    names |= {c["name"] for c in inspector.get_check_constraints(table) if c.get("name")}
+    pk_name = (inspector.get_pk_constraint(table) or {}).get("name")
+    if pk_name:
+        names.add(pk_name)
+    return names
+
+
 def plan_foreign_keys(inspector: Any) -> List[Tuple[Any, ...]]:
     """Work out what it takes for every expected relationship to carry one correct cascade.
 
@@ -190,7 +202,9 @@ def plan_foreign_keys(inspector: Any) -> List[Tuple[Any, ...]]:
         ("create", table, constraint_name, column, referred_table)
         ("unresolved", table, column, reason)      # reported, never acted on
 
-    A relationship whose foreign key is already correct produces no action at all.
+    A relationship whose foreign key is already correct produces no action at all. A drop is
+    only ever planned together with the create that replaces it (or beside an existing correct
+    constraint): if the replacement cannot be created, the plan holds "unresolved" alone.
     """
     tables = set(inspector.get_table_names())
     default_schema = getattr(inspector, "default_schema_name", None)
@@ -213,19 +227,25 @@ def plan_foreign_keys(inspector: Any) -> List[Tuple[Any, ...]]:
             )
             continue
 
-        for fk in incorrect:
-            plan.append(("drop", table, fk["name"]))
+        drops = [("drop", table, fk["name"]) for fk in incorrect]
 
         if correct:
+            # A correct cascade already exists; only stale duplicates beside it go.
+            plan.extend(drops)
             continue
 
+        # Every precondition for the replacement is settled BEFORE anything destructive is
+        # planned. If the expected name is held by a constraint that is not itself being
+        # dropped, no replacement can be created, so the wrong constraint is left exactly
+        # where it is rather than removed with nothing to take its place.
         dropped = {fk["name"] for fk in incorrect}
-        taken = {fk["name"] for fk in foreign_keys if fk.get("name")} - dropped
-        if name in taken:
+        if name in _constraint_names_in_use(inspector, table, foreign_keys) - dropped:
             plan.append(
                 ("unresolved", table, column, f"constraint name {name!r} is already in use elsewhere")
             )
             continue
+
+        plan.extend(drops)
         plan.append(("create", table, name, column, referred))
 
     return plan

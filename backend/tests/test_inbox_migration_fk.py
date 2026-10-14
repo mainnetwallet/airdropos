@@ -217,6 +217,41 @@ class TestPlannerOnSqliteSchemas:
         plan = _plan(engine)
         assert [a[:3] for a in plan] == [("unresolved", table, column)]
 
+    def test_a_wrong_foreign_key_is_not_dropped_when_the_replacement_name_is_taken(self):
+        """The unsafe case: dropping first would leave the table with no constraint at all."""
+        table, column, _referred, name = BY_KEY["conv_task"]
+        engine = _sqlite_schema(
+            {"conv_task": _fk_sql("conv_task", name="wrong_table", target="projects")},
+            extra_columns=", other_task_id TEXT, "
+            f"CONSTRAINT {name} FOREIGN KEY (other_task_id) REFERENCES tasks(id)",
+        )
+        plan = _plan(engine)
+        assert [a[:3] for a in plan] == [("unresolved", table, column)]
+        assert not [a for a in plan if a[0] == "drop"], "no destructive action without a replacement"
+
+    def test_a_non_foreign_key_constraint_holding_the_name_also_blocks_the_drop(self):
+        table, column, _referred, name = BY_KEY["conv_task"]
+        engine = _sqlite_schema(
+            {"conv_task": _fk_sql("conv_task", name="no_cascade", ondelete="")},
+            extra_columns=f", CONSTRAINT {name} UNIQUE (id, task_id)",
+        )
+        plan = _plan(engine)
+        assert [a[:3] for a in plan] == [("unresolved", table, column)]
+
+    def test_a_wrong_foreign_key_that_itself_holds_the_name_is_replaced_in_place(self):
+        """The name is free once its own holder is dropped, so drop then create is safe."""
+        table, column, referred, name = BY_KEY["conv_task"]
+        engine = _sqlite_schema({"conv_task": _fk_sql("conv_task", ondelete="")})  # standard name, no cascade
+        assert _plan(engine) == [
+            ("drop", table, name),
+            ("create", table, name, column, referred),
+        ]
+
+    def test_a_stale_duplicate_is_still_dropped_beside_a_correct_cascade_with_the_name_taken(self):
+        table = BY_KEY["conv_task"][0]
+        both = _fk_sql("conv_task") + _fk_sql("conv_task", name="stale_wrong_table", target="projects")
+        assert _plan(_sqlite_schema({"conv_task": both})) == [("drop", table, "stale_wrong_table")]
+
     def test_tables_and_columns_that_do_not_exist_are_skipped(self):
         engine = sa.create_engine("sqlite://")
         with engine.begin() as con:
@@ -612,6 +647,29 @@ class TestMigrationOnPostgres:
         assert name in _constraint_oids(pg)
         assert _alembic(pg.database_name, "downgrade", "6_task_context").returncode == 0
         assert name in _constraint_oids(pg), "the unrelated constraint must still be there"
+
+    def test_a_wrong_foreign_key_survives_when_the_replacement_name_is_taken(self, pg):
+        """Nothing may be dropped if its replacement cannot be created."""
+        table, _column, _referred, name = BY_KEY["conv_task"]
+        with pg.begin() as con:
+            con.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN other_ref uuid")
+            con.exec_driver_sql(
+                f"ALTER TABLE {table} ADD CONSTRAINT {name} FOREIGN KEY (other_ref) REFERENCES tasks(id)"
+            )
+            con.exec_driver_sql(
+                f"ALTER TABLE {table} ADD CONSTRAINT stale_no_cascade "
+                "FOREIGN KEY (task_id) REFERENCES tasks(id)"
+            )
+        before = _constraint_oids(pg)
+
+        _upgrade_head(pg)
+
+        after = _constraint_oids(pg)
+        # Other relationships may gain their missing constraints, but nothing that existed
+        # may be dropped or rebuilt: the wrong constraint stays because it cannot be replaced.
+        assert {n: after.get(n) for n in before} == before, "nothing that existed may be dropped"
+        assert _alembic(pg.database_name, "downgrade", "6_task_context").returncode == 0
+        assert {"stale_no_cascade", name} <= set(_constraint_oids(pg))
 
     def test_a_failure_while_replacing_rolls_everything_back(self, pg, monkeypatch):
         """Drop and create share one transaction, so a failed create cannot strand the table."""
