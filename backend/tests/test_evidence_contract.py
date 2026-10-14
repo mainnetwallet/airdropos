@@ -8,6 +8,7 @@ recorded as a failure, and its dependents were never run.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -23,19 +24,22 @@ from backend.app.tools.base import ToolResult, ToolResultStatus
 
 
 def _verify(evidence: dict, data: dict, method: str) -> bool:
-    """Replicate `AgentController._verify_step` for the evidence-envelope path."""
-    if not evidence or not evidence.get("authoritative"):
-        return False
-    kind = str(evidence.get("kind") or "").strip().lower()
-    if method in GENERIC_EVIDENCE_METHODS:
-        return True
-    if method == "unspecified":
-        return False
-    allowed = EVIDENCE_KINDS.get(method)
-    if allowed is None:
-        return True
-    allowed = allowed | EQUIVALENT_EVIDENCE_KINDS.get(method, frozenset())
-    return kind in allowed
+    """Call the REAL `AgentController._verify_step`.
+
+    This used to be a hand-written replica of the controller's decision. That is a
+    standing invitation to the two drifting apart: the replica kept returning `True` for
+    an unmapped verification method after the controller was changed to refuse one, so
+    the suite would have gone on reporting a behaviour the agent no longer had.
+    """
+    controller = AgentController.__new__(AgentController)
+    step = PlanStep(
+        index=0, description="x", kind=StepKind.TELEGRAM, verification_method=method
+    )
+    result = ToolResult(status=ToolResultStatus.SUCCESS, data=data, evidence=evidence)
+    task = SimpleNamespace(task_id="AIR-TEST")
+
+    verified, _count = asyncio.run(controller._verify_step(task, step, result))
+    return verified
 
 
 # ======================================================================
@@ -73,6 +77,28 @@ def test_simulation_evidence_cannot_satisfy_a_receipt_method():
 def test_unspecified_method_is_never_auto_verified():
     """The planner's "nobody said how this is proven" default stays unverified."""
     assert _verify({"authoritative": True, "kind": "bot_started"}, {}, "unspecified") is False
+
+
+def test_an_unrecognised_method_is_not_satisfied_by_any_evidence():
+    """An unmapped method is free text the planner invented.
+
+    It previously returned True for any authoritative evidence, which meant a step
+    promising something specific could be closed by an unrelated observation. The safe
+    default matches `unspecified`: unproven.
+    """
+    assert _verify(
+        {"authoritative": True, "kind": "page_observation"}, {}, "transaction_confirmed"
+    ) is False
+    assert _verify(
+        {"authoritative": True, "kind": "chain_receipt"}, {}, "some_invented_method"
+    ) is False
+
+
+def test_a_recognised_method_still_verifies_against_its_own_evidence():
+    """The strict default must not break the methods that DO have a mapping."""
+    assert _verify(
+        {"authoritative": True, "kind": "chain_receipt"}, {}, "chain_receipt"
+    ) is True
 
 
 def test_non_authoritative_evidence_is_not_enough():

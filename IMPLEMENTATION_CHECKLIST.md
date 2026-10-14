@@ -1,7 +1,7 @@
 # AirdropOS Implementation Checklist
 
-**Status as of 2026-10-14:** the backend suite passes at
-**362 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
+**Status as of 2026-10-14 (review fixes):** the backend suite passes at
+**377 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
 and the frontend at **26**, with `npm run lint` (0 errors) and
 `npm run build` both clean. See
 [`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
@@ -249,8 +249,22 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       requirements no current step addresses, under its own budget
       (`MAX_DISCOVERY_REPLANS_PER_RUN`) so progress never consumes the failure-retry
       allowance.
-- [x] Secrets cannot enter the context: every write is screened, and `resource_refs`
-      accepts an allowlist of reference keys only.
+- [x] Secrets cannot enter the context. **Fixed after review (2026-10-14):** screening was
+      applied to `resource_refs` and the observation's top-level strings only, and
+      `external_state` was assigned the *raw* payload. Requirement text, error strings,
+      human-intervention reasons and authorization-refusal details were stored verbatim.
+      Screening is now recursive and bounded, and the same screened copy is written to
+      every path. `test_context_secret_exposure.py` fails against the previous code.
+- [x] **Requirement completion requires a matching target.** Closing a requirement needed
+      only one shared 4-character word, so joining `@otherchannel` closed *Join Telegram
+      channel @examplechannel*. A requirement now closes only when every identifier it
+      names — handle, address, URL, domain, quantity — appears in what was observed and
+      submitted, plus a word-overlap threshold. Ambiguity leaves it outstanding.
+- [x] Memory scope validation lives in `remember`, not only `remember_scoped`, and
+      `extra=` is restricted to `{scope, task_id, campaign_id}` so it cannot write
+      unscreened `content`/`source`. A record naming both a task and a campaign is
+      refused. `recall_for_context` requires both owner columns NULL on the GLOBAL
+      branch, so a corrupt row is not handed out on the strength of its label.
 - [x] `GET /api/v1/tasks/{id}/context` (`require_read`), a `context` block on the task
       status report, and a `task.context_updated` live event.
 - [x] **Task Manager** detail panel renders the context: goal, why the next action is

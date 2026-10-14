@@ -110,6 +110,17 @@ _RESOURCE_KEYS = ALLOWED_RESOURCE_REF_KEYS
 
 _WHITESPACE = re.compile(r"\s+")
 
+# Screening bounds. Deep enough for the shape a bot reply or a page dump actually has
+# (a list of messages, each with a nested button list), shallow enough that a hostile
+# payload cannot make the walk unbounded.
+MAX_SCREEN_DEPTH = 8
+MAX_SCREEN_ITEMS = 200
+
+# Marker written in place of a value that matched a secret pattern. The value is never
+# stored, but the record still shows that something was there.
+REDACTION_MARKER = "[REDACTED: matched a secret pattern]"
+TRUNCATION_MARKER = "[TRUNCATED: nested too deep to store]"
+
 
 def canonical_digest(payload: Any) -> str:
     """A stable digest of arbitrary JSON-ish arguments.
@@ -133,6 +144,87 @@ def action_fingerprint(tool: Optional[str], parameters: Dict[str, Any]) -> str:
 def normalize_requirement(text: str) -> str:
     """Collapse a requirement to a comparable key so the same one is not stored twice."""
     return _WHITESPACE.sub(" ", str(text or "").strip().lower())[:400]
+
+
+# The concrete things a requirement names. These are what distinguish "join
+# @examplechannel" from "join @otherchannel" - the words around them are identical, and
+# matching on those words is what let the wrong action close the requirement.
+#
+# Deliberately specific. A pattern loose enough to match "channel" or "join" cannot tell
+# two channels apart, which is the whole problem.
+_IDENTIFIER_PATTERNS: Tuple[re.Pattern, ...] = (
+    re.compile(r"@[A-Za-z0-9_]{3,}"),                       # Telegram / Discord handles
+    re.compile(r"\b0x[a-fA-F0-9]{8,}\b"),                   # addresses and transaction hashes
+    re.compile(r"https?://[^\s,;)\]\"']+"),                 # URLs
+    re.compile(r"\bt\.me/[A-Za-z0-9_/+-]+", re.IGNORECASE),  # Telegram invite links
+    re.compile(
+        r"\b\d[\d,._]*\s*(?:usd|usdt|usdc|eth|btc|token|tokens|%|percent|days?|hours?|min|minutes)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\b[\w-]+\.[\w-]+\.[\w-]{2,}\b"),           # sub.domain.tld
+)
+
+
+def _extract_identifiers(text: str) -> List[str]:
+    """Every concrete target named in `text`, normalised for comparison.
+
+    Trailing punctuation is stripped and the result lowercased, so `(@examplechannel)`
+    and `@examplechannel` are the same target while `@otherchannel` is not.
+    """
+    found: List[str] = []
+    lowered = str(text or "").lower()
+    for pattern in _IDENTIFIER_PATTERNS:
+        for match in pattern.findall(lowered):
+            if isinstance(match, tuple):
+                match = "".join(match)
+            cleaned = match.strip().strip(".,;:!?)]}'\"").rstrip("/")
+            if cleaned:
+                found.append(cleaned)
+    return found
+
+
+def _screen_value(value: Any, *, limit: int, depth: int = 0) -> Any:
+    """Recursively bound and secret-screen any value on its way into the context.
+
+    Every string at every level is checked, not only the ones at the top. The earlier
+    version screened `isinstance(value, str)` entries and JSON-encoded everything else,
+    so a secret one level down - inside a `messages` list, or a nested `meta` dict, which
+    is exactly the shape a bot reply or a page dump has - was written verbatim.
+
+    Depth and breadth are bounded so a pathological payload cannot make this unbounded;
+    anything past the limit is replaced by a truncation marker rather than dropped, so
+    the record still says "there was more here".
+    """
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+
+    if isinstance(value, str):
+        try:
+            MemoryManager.assert_no_secrets(value)
+        except SecretLeakError:
+            return REDACTION_MARKER
+        return value[:limit]
+
+    if depth >= MAX_SCREEN_DEPTH:
+        return TRUNCATION_MARKER
+
+    if isinstance(value, dict):
+        screened: Dict[str, Any] = {}
+        for key, item in list(value.items())[:MAX_SCREEN_ITEMS]:
+            screened[str(key)[:80]] = _screen_value(item, limit=limit, depth=depth + 1)
+        return screened
+
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)[:MAX_SCREEN_ITEMS]
+        return [_screen_value(item, limit=limit, depth=depth + 1) for item in items]
+
+    # Anything else is rendered to text, and that text is screened like any other.
+    rendered = str(value)
+    try:
+        MemoryManager.assert_no_secrets(rendered)
+    except SecretLeakError:
+        return REDACTION_MARKER
+    return rendered[:limit]
 
 
 def _clip(value: Any, limit: int) -> Any:
@@ -377,6 +469,13 @@ class TaskContextService:
         context = await self.load_or_create(task)
         evidence = evidence or {}
         fingerprint = action_fingerprint(tool, parameters or {})
+        # Screen ONCE, then write the same screened copy everywhere. Assigning the raw
+        # payload to `external_state` below would have left whatever the screening just
+        # removed from the observation sitting in full on the context row, and that row
+        # is what `GET /tasks/{id}/context` returns.
+        safe_state = self._screened_dict(observed_state or {})
+        safe_result = self._screened_dict(result_digest or {})
+        safe_error = self._screened_text(error, limit=2000)
 
         observation = TaskObservation(
             task_id=task.id,
@@ -390,29 +489,44 @@ class TaskContextService:
             outcome=outcome,
             evidence_kind=(str(evidence.get("kind"))[:64] if evidence.get("kind") else None),
             evidence_authoritative=bool(evidence.get("authoritative")),
-            observed_state=self._screened_dict(observed_state or {}),
-            result_digest=self._screened_dict(result_digest or {}),
+            observed_state=safe_state,
+            result_digest=safe_result,
             integration_ref=(integration_ref or None) and str(integration_ref)[:255],
             is_idempotent=bool(is_idempotent),
-            error=(error or None) and str(error)[:2000],
+            error=safe_error,
         )
         self.db.add(observation)
         await self.db.flush()
 
         # The newest observation is the current external state, and any references it
         # carries are the ones a later step in another integration will need.
-        if observed_state:
-            context.external_state = dict(observed_state)
+        if safe_state:
+            context.external_state = dict(safe_state)
             flag_modified(context, "external_state")
-        if outcome in (OUTCOME_FAILED, OUTCOME_BLOCKED) and error:
-            context.last_error = str(error)[:2000]
-        await self.merge_resource_refs(task, self._refs_from(observed_state or {}))
+        if outcome in (OUTCOME_FAILED, OUTCOME_BLOCKED) and safe_error:
+            context.last_error = safe_error
+        await self.merge_resource_refs(task, self._refs_from(safe_state))
 
         self._touch(context)
         await self.db.flush()
 
         if outcome == OUTCOME_CONFIRMED and evidence.get("authoritative"):
-            await self._satisfy_matching_requirements(task, observation, action)
+            # The evidence for "this requirement is done" is the action description plus
+            # what was actually observed and submitted. Matching on the description alone
+            # would miss the target when it lives in the arguments, and would wrongly
+            # match a description that names the wrong one.
+            await self._satisfy_matching_requirements(
+                task,
+                observation,
+                " ".join(
+                    [
+                        str(action),
+                        json.dumps(safe_state, default=str),
+                        json.dumps(safe_result, default=str),
+                        json.dumps(parameters or {}, default=str),
+                    ]
+                ),
+            )
 
         await self._notify_context_changed(task, action)
 
@@ -448,6 +562,12 @@ class TaskContextService:
         """
         cleaned = str(text or "").strip()
         if not cleaned:
+            return None
+        # Requirement text comes from a bot message or a page. It is untrusted input that
+        # happens to be shaped as an instruction, so it is screened like any other
+        # external string before it is stored or ever shown to an operator.
+        cleaned = self._screened_text(cleaned, limit=1000) or ""
+        if not cleaned or cleaned == REDACTION_MARKER:
             return None
         context = await self.load_or_create(task)
         key = normalize_requirement(cleaned)
@@ -553,8 +673,10 @@ class TaskContextService:
             state = {
                 **state,
                 "pending": bool(required),
-                "reason": str(reason)[:1000],
-                "instruction": str(instruction or reason)[:1000],
+                # The reason quotes whatever the page or bot actually said, so it is
+                # screened for the same reason requirement text is.
+                "reason": self._screened_text(str(reason), limit=1000),
+                "instruction": self._screened_text(str(instruction or reason), limit=1000),
                 "step_index": step_index,
                 "raised_at": datetime.now(timezone.utc).isoformat(),
             }
@@ -571,7 +693,8 @@ class TaskContextService:
         state = dict(context.authorization_state or {})
         state[str(permission)[:128]] = {
             "granted": bool(granted),
-            "detail": str(detail)[:500],
+            # A refusal reason can quote the policy text or a remote response verbatim.
+            "detail": self._screened_text(str(detail), limit=500),
             "at": datetime.now(timezone.utc).isoformat(),
         }
         context.authorization_state = state
@@ -582,20 +705,27 @@ class TaskContextService:
     async def record_failure(
         self, task: Task, *, error: str, category: str = "", recovery: str = ""
     ) -> None:
+        """Record a failure and the recovery decision taken.
+
+        An error string is whatever the failing call said, which for a remote service is
+        whatever that service chose to echo back - including a submitted value. It is
+        screened before storage for the same reason requirement text is.
+        """
         context = await self.load_or_create(task)
+        safe_error = self._screened_text(str(error), limit=2000)
         summary = dict(context.retry_summary or {})
         attempts = int(summary.get("attempts", 0)) + 1
         summary.update(
             {
                 "attempts": attempts,
-                "last_error": str(error)[:1000],
-                "last_category": str(category)[:100],
-                "last_recovery": str(recovery)[:500],
+                "last_error": self._screened_text(str(error), limit=1000),
+                "last_category": self._screened_text(str(category), limit=100),
+                "last_recovery": self._screened_text(str(recovery), limit=500),
                 "last_at": datetime.now(timezone.utc).isoformat(),
             }
         )
         context.retry_summary = summary
-        context.last_error = str(error)[:2000]
+        context.last_error = safe_error
         flag_modified(context, "retry_summary")
         self._touch(context)
         await self.db.flush()
@@ -689,25 +819,42 @@ class TaskContextService:
         )
 
     async def unaddressed_requirements(self, task: Task, plan_descriptions: Sequence[str]) -> List[TaskRequirement]:
-        """Outstanding requirements that no current plan step appears to address.
+        """Outstanding requirements that no current plan step actually targets.
 
-        Word-overlap is a deliberately weak signal, and that is the point: it only has to
-        be good enough to notice that a newly discovered requirement has nothing in the
-        plan aimed at it, which is the condition that needs a replan. The decision to
-        replan is still made by bounded code, not by this heuristic.
+        This decides whether the plan needs revising, so it errs towards reporting a
+        requirement as unaddressed: a needless replan costs one bounded LLM call, while
+        a missed one leaves real work with no step aimed at it.
+
+        A requirement that names a target - a handle, an address, a URL, a quantity - is
+        only treated as addressed when that target appears in the plan. Sharing the word
+        "channel" with a step aimed at a different channel does not count.
         """
         outstanding = await self.requirements(task, only_outstanding=True)
         if not outstanding:
             return []
-        haystack = " ".join(str(d or "").lower() for d in plan_descriptions)
-        words = set(re.findall(r"[a-z0-9]{4,}", haystack))
+
+        haystack = " ".join(str(d or "") for d in plan_descriptions).lower()
+        plan_ids = set(_extract_identifiers(haystack))
+        plan_words = set(re.findall(r"[a-z0-9]{4,}", haystack))
 
         unaddressed: List[TaskRequirement] = []
         for requirement in outstanding:
-            terms = set(re.findall(r"[a-z0-9]{4,}", requirement.text.lower()))
-            if terms & words:
+            text = requirement.text.lower()
+            identifiers = set(_extract_identifiers(text))
+
+            # A named target the plan never mentions means the plan is aimed elsewhere.
+            if identifiers and not identifiers.issubset(plan_ids):
+                unaddressed.append(requirement)
                 continue
-            unaddressed.append(requirement)
+
+            terms = set(re.findall(r"[a-z0-9]{4,}", text))
+            shared = terms & plan_words
+            if not shared:
+                unaddressed.append(requirement)
+                continue
+            if len(shared) * 2 < len(terms) and len(shared) < 3:
+                unaddressed.append(requirement)
+
         return unaddressed
 
     async def merge_resource_refs(self, task: Task, refs: Dict[str, Any]) -> None:
@@ -856,20 +1003,29 @@ class TaskContextService:
     def _screened_dict(payload: Dict[str, Any], limit: int = 2000) -> Dict[str, Any]:
         """Bound and secret-screen a dict before it is written to the context.
 
-        A value matching a secret pattern is replaced by a redaction marker rather than
-        dropped, so the record still says "there was something here" without storing it.
+        Delegates to the recursive walker, so a secret nested inside a list or a dict is
+        redacted exactly as a top-level one is. A value matching a secret pattern becomes
+        a redaction marker rather than being dropped, so the record still says "there was
+        something here" without storing it.
         """
-        screened: Dict[str, Any] = {}
-        for key, value in (payload or {}).items():
-            if isinstance(value, str):
-                try:
-                    MemoryManager.assert_no_secrets(value)
-                    screened[str(key)[:80]] = value[:limit]
-                except SecretLeakError:
-                    screened[str(key)[:80]] = "[REDACTED: matched a secret pattern]"
-                continue
-            screened[str(key)[:80]] = _clip(value, limit)
-        return screened
+        if not isinstance(payload, dict):
+            return {"value": _screen_value(payload, limit=limit)}
+        return {
+            str(key)[:80]: _screen_value(value, limit=limit)
+            for key, value in payload.items()
+        }
+
+    @staticmethod
+    def _screened_text(value: Optional[str], limit: int = 2000) -> Optional[str]:
+        """Screen a single string on its way into the context.
+
+        Requirement text, error strings and human-intervention reasons are all
+        single strings, and all of them are built from untrusted external content: a bot
+        message, a page, or a remote service quoting back what was submitted to it.
+        """
+        if value is None:
+            return None
+        return _screen_value(str(value), limit=limit)
 
     async def _refresh_outstanding(self, task: Task) -> None:
         """Keep the denormalised outstanding list equal to the authoritative rows."""
@@ -891,21 +1047,57 @@ class TaskContextService:
         await self.db.flush()
 
     async def _satisfy_matching_requirements(
-        self, task: Task, observation: TaskObservation, action: str
+        self, task: Task, observation: TaskObservation, evidence_text: str
     ) -> None:
-        """Mark requirements this confirmed observation actually satisfies.
+        """Close only the requirements this confirmed observation actually satisfies.
 
-        Matching is deliberately conservative: only outstanding requirements whose wording
-        overlaps the action that was just proven are closed. An unproven action closes
-        nothing, and an unrelated action closes nothing.
+        The previous rule was "share any 4-character word with the action". That closed
+        *Join Telegram channel @examplechannel* when the agent joined *@otherchannel*,
+        because `join`, `telegram` and `channel` all matched. A false completion state
+        is worse than an unfinished one: the operator is told work is done that was never
+        done against the right target.
+
+        So a requirement is closed only when:
+
+        1. every **identifier** it names - a `@handle`, an address, a URL, a domain, a
+           quantity - appears in what was actually observed, and
+        2. it shares enough of its ordinary words with the observed evidence to be about
+           the same thing.
+
+        When a requirement names identifiers and the evidence does not carry them, the
+        requirement stays outstanding. Ambiguity resolves to "not proven".
         """
         outstanding = await self.requirements(task, only_outstanding=True)
-        action_words = set(re.findall(r"[a-z0-9]{4,}", action.lower()))
+        if not outstanding:
+            return
+
+        haystack = evidence_text.lower()
+        haystack_ids = set(_extract_identifiers(haystack))
+        action_words = set(re.findall(r"[a-z0-9]{4,}", haystack))
+
         for requirement in outstanding:
-            terms = set(re.findall(r"[a-z0-9]{4,}", requirement.text.lower()))
-            if terms and terms & action_words:
-                requirement.status = REQUIREMENT_SATISFIED
-                requirement.satisfied_by_observation_id = observation.id
+            text = requirement.text.lower()
+            terms = set(re.findall(r"[a-z0-9]{4,}", text))
+            identifiers = set(_extract_identifiers(text))
+
+            # (1) Every named target must be present in the evidence. One miss is enough.
+            if identifiers and not identifiers.issubset(haystack_ids):
+                continue
+
+            # (2) The requirement must be about the same kind of thing. A single shared
+            # word is far too weak; require the overlap to be the bulk of the wording,
+            # or - for a short requirement - every significant word of it.
+            if not terms:
+                continue
+            shared = terms & action_words
+            if not shared:
+                continue
+            if len(shared) * 2 < len(terms) and len(shared) < 3:
+                continue
+
+            requirement.status = REQUIREMENT_SATISFIED
+            requirement.satisfied_by_observation_id = observation.id
+
         await self.db.flush()
         await self._refresh_outstanding(task)
 

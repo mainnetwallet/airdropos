@@ -19,6 +19,7 @@ any integration's.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -372,7 +373,12 @@ class TestDiscoveredRequirements:
         assert [r.text for r in outstanding] == ["complete the quiz"]
 
     async def test_unaddressed_requirements_are_separated_from_covered_ones(self, factory):
-        """The signal that decides whether a plan must be revised."""
+        """The signal that decides whether a plan must be revised.
+
+        A requirement is covered only when the plan names the target it asks for. A step
+        that merely shares a word with it is aimed somewhere else, and treating that as
+        covered is how a newly discovered requirement gets no step and never gets done.
+        """
         task_id = await _new_task(factory, "Partially covered")
         async with factory() as db:
             task = await db.get(Task, task_id)
@@ -381,10 +387,20 @@ class TestDiscoveredRequirements:
             await service.record_requirement(task, "sign in with the connected wallet")
             await db.commit()
 
-            plan = ["Open the bot and read its instructions", "join the Telegram channel"]
+            # A plan that names the handle covers the join, and says nothing about the
+            # wallet, so exactly one requirement is left with nothing aimed at it.
+            plan = [
+                "Open the bot and read its instructions",
+                "join the Telegram channel @examplechannel",
+            ]
             unaddressed = await service.unaddressed_requirements(task, plan)
+            assert [r.text for r in unaddressed] == ["sign in with the connected wallet"]
 
-        assert [r.text for r in unaddressed] == ["sign in with the connected wallet"]
+            # A plan that only mentions "the Telegram channel" without naming it is not
+            # demonstrably aimed at @examplechannel, so it is reported as unaddressed.
+            vague = ["Open the bot and read its instructions", "join the Telegram channel"]
+            still_open = await service.unaddressed_requirements(task, vague)
+            assert "join the Telegram channel @examplechannel" in [r.text for r in still_open]
 
     async def test_an_account_specific_requirement_is_marked_and_kept_in_its_task(self, factory):
         """Membership of one account must not be reusable as another's evidence."""
@@ -536,6 +552,80 @@ class TestMemoryHierarchy:
                 await memory.remember_scoped(
                     "X", "private", "agent", scope=SCOPE_GLOBAL, task_id=task_id
                 )
+
+    async def test_the_plain_remember_path_cannot_bypass_the_scope_rules(self, factory):
+        """`remember_scoped` is not the only door, so it cannot be the only lock.
+
+        The validation lives in `remember` itself. Reaching it directly with a
+        contradictory scope/owner pair must fail, not quietly write a record that reads
+        as general knowledge while belonging to a task.
+        """
+        task_id = await _new_task(factory, "Direct write path")
+        async with factory() as db:
+            memory = MemoryManager(db)
+            with pytest.raises(ValueError):
+                await memory.remember(
+                    "X", "private", "agent",
+                    extra={"scope": SCOPE_GLOBAL, "task_id": task_id},
+                )
+            with pytest.raises(ValueError):
+                await memory.remember(
+                    "X", "orphan", "agent", extra={"scope": SCOPE_TASK},
+                )
+            with pytest.raises(ValueError):
+                await memory.remember(
+                    "X", "both", "agent",
+                    extra={"scope": SCOPE_TASK, "task_id": task_id, "campaign_id": uuid.uuid4()},
+                )
+            with pytest.raises(ValueError):
+                await memory.remember("X", "bad", "agent", extra={"scope": "nonsense"})
+
+    async def test_extra_cannot_reach_an_unscreened_attribute(self, factory):
+        """`extra` must not become a way to write text that skipped secret screening."""
+        task_id = await _new_task(factory, "Extra is bounded")
+        async with factory() as db:
+            memory = MemoryManager(db)
+            record = await memory.remember(
+                "VERIFIED_FACT", "harmless", "agent",
+                extra={"scope": SCOPE_TASK, "task_id": task_id, "source": "smuggled source"},
+            )
+            assert record.source == "agent", (
+                "content and source must be unreachable through extra; they are the two "
+                "fields secret screening covers"
+            )
+
+    async def test_a_global_record_that_carries_a_task_is_never_handed_out(self, factory):
+        """Defence in depth on the read side.
+
+        `remember` refuses to create this row, but a row written by any other writer -
+        a migration, a manual fix, an older build - could still carry it. The read must
+        not widen on the strength of the scope label alone.
+        """
+        a_id = await _new_task(factory, "Task A")
+        b_id = await _new_task(factory, "Task B")
+
+        async with factory() as db:
+            db.add(
+                MemoryRecord(
+                    category="EXECUTION_OUTCOME",
+                    content="Task A's private history",
+                    source="agent",
+                    scope=SCOPE_GLOBAL,       # claims to be general knowledge
+                    task_id=a_id,             # but belongs to a task
+                )
+            )
+            await db.commit()
+
+            memory = MemoryManager(db)
+            for_task_b = await memory.recall_for_context(task_id=b_id)
+            for_task_a = await memory.recall_for_context(task_id=a_id)
+            contents = [r.content for r in for_task_b]
+
+            assert "Task A's private history" not in contents, (
+                "a global record carrying a task must not be recalled by another task"
+            )
+            # Even its own task does not get it back as general knowledge.
+            assert "Task A's private history" not in [r.content for r in for_task_a]
 
     async def test_secrets_are_still_refused_at_every_scope(self, factory):
         task_id = await _new_task(factory, "No secret memory")

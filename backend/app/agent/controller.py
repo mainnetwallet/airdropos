@@ -1537,10 +1537,22 @@ class AgentController:
                 return False, 0
             allowed = EVIDENCE_KINDS.get(method)
             if allowed is None:
-                # A method nobody has mapped to a concrete evidence kind (free text
-                # from the model). Authoritative evidence is the best signal
-                # available; anything weaker is not.
-                return True, 1
+                # An unrecognised method is free text the planner invented. Nobody has
+                # said what it was trying to prove, so authoritative evidence of *some*
+                # kind is not evidence of *this*.
+                #
+                # This used to return True, which meant a step promising
+                # "transaction_confirmed" could be satisfied by a page observation. The
+                # safe default is the same one `unspecified` already gets: unverified.
+                # It costs a report that says "we could not prove this", and it prevents
+                # a report that says "done" on the strength of unrelated evidence.
+                logger.info(
+                    "Task %s step %s: verification method %r is not a recognised one. "
+                    "Treated as UNVERIFIED rather than assuming any authoritative evidence "
+                    "satisfies it. Add it to EVIDENCE_KINDS if it is a real method.",
+                    task.task_id, step.index, method,
+                )
+                return False, 0
             # Cross-integration equivalence: some methods describe a FACT rather than
             # an integration (e.g. "the remote state now says X"). A Telegram read and
             # a page observation are both authoritative observations of remote state,

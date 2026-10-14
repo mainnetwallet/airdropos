@@ -34,6 +34,12 @@ class SecretLeakError(Exception):
     """Raised when content matching a secret pattern is about to be stored."""
 
 
+# The only model attributes a caller may set through `remember(extra=...)`. Everything
+# else - notably `content` and `source`, which are secret-screened - is out of reach, so
+# the escape hatch cannot be used to write unscreened text.
+_SETTABLE_BY_CALLER = frozenset({"scope", "task_id", "campaign_id"})
+
+
 class MemoryManager:
     """Stores and retrieves agent memory with confidence and revalidation."""
 
@@ -64,11 +70,24 @@ class MemoryManager:
     ) -> MemoryRecord:
         """Persist a memory record after screening it for secrets.
 
-        `extra` sets model attributes that are not part of the historical signature
-        (currently the context hierarchy's scope and owner). They are applied as plain
-        attributes rather than as parameters so the existing callers keep working.
+        This is the single write path, so the context hierarchy is enforced HERE rather
+        than only in `remember_scoped`. Previously `remember_scoped` validated the
+        scope/owner pair and `remember` did not, and `extra` could `setattr` any model
+        attribute - so a caller reaching `remember` directly could write a "global" record
+        carrying a task_id, which is precisely the private-data-published-as-general
+        mistake the hierarchy exists to prevent.
+
+        `extra` is restricted to `_SETTABLE_BY_CALLER`. An allowlist, because `extra` is
+        an escape hatch for attributes outside the signature; a dict of arbitrary model
+        fields would be a way to set `content` or `source` without screening them.
         """
         self.assert_no_secrets(content)
+
+        scope, task_id, campaign_id = self._validate_scope_owner(
+            (extra or {}).get("scope", SCOPE_GLOBAL),
+            (extra or {}).get("task_id"),
+            (extra or {}).get("campaign_id"),
+        )
 
         record = MemoryRecord(
             category=category,
@@ -80,13 +99,46 @@ class MemoryManager:
             expires_at=datetime.now(timezone.utc) + timedelta(days=ttl_days) if ttl_days else None,
             last_verified_at=datetime.now(timezone.utc) if not is_inference else None,
             review_policy={"revalidate_after_days": 30 if category.endswith("_REQUIREMENT") else 90},
+            scope=scope,
+            task_id=task_id,
+            campaign_id=campaign_id,
         )
         for key, value in (extra or {}).items():
-            if value is not None and hasattr(record, key):
+            if key in _SETTABLE_BY_CALLER and value is not None and hasattr(record, key):
                 setattr(record, key, value)
         self.db.add(record)
         await self.db.flush()
         return record
+
+    @staticmethod
+    def _validate_scope_owner(
+        scope: Any, task_id: Any, campaign_id: Any
+    ) -> tuple:
+        """Refuse every scope/owner combination that cannot mean what it claims.
+
+        * a TASK or CAMPAIGN record with no owner would be private context nobody can
+          read back - silent data loss;
+        * a GLOBAL record carrying an owner is private data published as general
+          knowledge, which any task could then recall.
+        """
+        if scope not in (SCOPE_GLOBAL, SCOPE_CAMPAIGN, SCOPE_TASK):
+            raise ValueError(f"Unknown memory scope: {scope!r}")
+        if scope == SCOPE_TASK and task_id is None:
+            raise ValueError("A task-scoped memory must name its task.")
+        if scope == SCOPE_CAMPAIGN and campaign_id is None:
+            raise ValueError("A campaign-scoped memory must name its campaign.")
+        if scope == SCOPE_GLOBAL and (task_id is not None or campaign_id is not None):
+            raise ValueError(
+                "A global memory cannot belong to a task or campaign; that is what "
+                "'global' means. Write it at the narrower scope instead."
+            )
+        # A record cannot belong to a task and a campaign at once: it would be readable
+        # by two different audiences on two different terms.
+        if scope == SCOPE_TASK and campaign_id is not None:
+            raise ValueError("A task-scoped memory cannot also name a campaign.")
+        if scope == SCOPE_CAMPAIGN and task_id is not None:
+            raise ValueError("A campaign-scoped memory cannot also name a task.")
+        return scope, task_id, campaign_id
 
     # ------------------------------------------------------------------
     # Context hierarchy
@@ -153,8 +205,18 @@ class MemoryManager:
 
         The three levels are unioned, never substituted for one another, and the result is
         ordered so this task's own context is read before general knowledge.
+
+        The GLOBAL branch requires BOTH owner columns to be NULL. Matching on the scope
+        alone would hand any task a record that claims to be general knowledge while
+        carrying a task_id - the exact shape `remember` now refuses to write, and which a
+        row written before that check, or by any other writer, could still hold.
         """
-        owner_clauses = [MemoryRecord.scope == SCOPE_GLOBAL]
+        global_clause = (
+            (MemoryRecord.scope == SCOPE_GLOBAL)
+            & MemoryRecord.task_id.is_(None)
+            & MemoryRecord.campaign_id.is_(None)
+        )
+        owner_clauses = [global_clause]
         if task_id is not None:
             owner_clauses.append(
                 (MemoryRecord.scope == SCOPE_TASK) & (MemoryRecord.task_id == task_id)
@@ -165,14 +227,7 @@ class MemoryManager:
                 & (MemoryRecord.campaign_id == campaign_id)
             )
 
-        stmt = select(MemoryRecord).where(
-            or_(*owner_clauses),
-            # A scoped record with no owner is corrupt (the write path refuses to create
-            # one). It is excluded here rather than surfaced, so a bad row cannot widen
-            # what a task is shown.
-            or_(MemoryRecord.task_id.isnot(None), MemoryRecord.campaign_id.isnot(None))
-            | (MemoryRecord.scope == SCOPE_GLOBAL),
-        )
+        stmt = select(MemoryRecord).where(or_(*owner_clauses))
         if categories:
             stmt = stmt.where(MemoryRecord.category.in_(categories))
         if query:

@@ -31,11 +31,16 @@ recall returned whatever had been written, from any task.
 They are a strict hierarchy, enforced in code rather than by convention:
 
 * `MemoryManager.remember_scoped` **refuses** a task-scoped record with no task, a
-  campaign-scoped record with no campaign, and a "global" record that carries an owner.
-  The last is the important one: it is the exact shape of private data published as
-  general knowledge.
+  campaign-scoped record with no campaign, a record naming both, and a "global" record
+  that carries an owner. The last is the important one: it is the exact shape of private
+  data published as general knowledge.
+* Those rules live in `remember`, not only in `remember_scoped`. `remember_scoped` is not
+  the only door into the table, so it cannot be the only lock; and `extra=` is restricted
+  to `{scope, task_id, campaign_id}` so it cannot be used to write `content` or `source`
+  without screening.
 * `recall_for_context` returns the union of what a task is entitled to, never anything
-  else, and excludes a scoped record whose owner is missing rather than widening the view.
+  else. The GLOBAL branch additionally requires **both** owner columns to be NULL, so a
+  corrupt row written by any other path is not handed out on the strength of its label.
 * `CampaignContextService.record_shared_fact` **raises** when asked to store
   account- or wallet-specific state. "Wallet 0xabc is eligible" describes one participant;
   writing it to shared campaign context is how one wallet's state would come to stand in
@@ -132,13 +137,46 @@ so progress never consumes the failure-retry allowance.
 
 ### Secrets
 
-Every context write is screened with the same patterns memory uses. A value matching one
-is stored as `[REDACTED: matched a secret pattern]` rather than kept or dropped, so the
-record still shows something was there.
+Every write path is screened, not just the obvious ones. The earlier version screened
+only `resource_refs` and the observation's top-level strings, which left three open
+routes — each confirmed by a test that failed before the fix:
+
+* `external_state` was assigned the **raw** payload a few lines after the screened copy
+  had been written to the observation, so anything removed from one was present in full
+  on the other.
+* a secret nested inside a dict or list was never checked — the old code screened only
+  `isinstance(value, str)` at the top level and JSON-encoded everything else, and a bot
+  reply or page dump is *mostly* nested.
+* requirement text, error strings, human-intervention reasons and authorization-refusal
+  details were stored verbatim. All four are built from untrusted external content: a
+  remote service quoting back what was submitted to it is the ordinary case.
+
+Screening is now recursive and bounded (`MAX_SCREEN_DEPTH`, `MAX_SCREEN_ITEMS`), and the
+*same* screened copy is written everywhere. A value matching a secret pattern becomes
+`[REDACTED: matched a secret pattern]` rather than being dropped, so the record still
+shows something was there.
 
 `resource_refs` accepts an **allowlist** of reference keys only (`url`, `chat_id`,
 `session_key`, `tx_hash`, …). A `session_cookie` has no key and is refused, so the
 context cannot become a place credentials accumulate.
+
+### Closing a requirement
+
+A requirement is closed only when the confirmed observation actually targets it:
+
+* every **identifier** it names — a `@handle`, an address, a URL, a domain, a quantity —
+  must appear in what was observed and submitted, and
+* enough of its ordinary words must overlap for it to be the same kind of thing.
+
+The previous rule was "share any 4-character word", which closed *Join Telegram channel
+@examplechannel* when the agent joined *@otherchannel* — `join`, `telegram` and `channel`
+all matched. A false completion is worse than an unfinished one, so ambiguity resolves to
+"not proven" and the requirement stays outstanding.
+
+`unaddressed_requirements()` applies the same rule and deliberately errs the other way:
+a requirement is reported as unaddressed unless the plan demonstrably names its target.
+A needless replan costs one bounded LLM call; a missed one leaves real work with no step
+aimed at it.
 
 ---
 
@@ -182,17 +220,23 @@ campaign. It inherits none of the first task's history.
 
 ## Tests
 
+* `backend/tests/test_context_secret_exposure.py` — the leak suite. Each test asserts the
+  behaviour that should hold and **failed against the previous code**, so it is evidence
+  rather than intent: raw `external_state`, nested values, requirement text, error
+  strings, human-intervention reasons, and joining the wrong channel closing the
+  requirement. Kept in the suite so the leak cannot return.
 * `backend/tests/test_task_context_isolation.py` — isolation between unrelated tasks,
   concurrent tasks, cascade on delete, attempted ≠ confirmed, repeat recognition,
-  requirement lifecycle, secret refusal, persistence across a fresh session, the
-  resume marker, and the memory hierarchy.
+  requirement lifecycle, secret refusal, persistence across a fresh session, the resume
+  marker, the memory hierarchy, and the three memory-scope bypass paths.
 * `backend/tests/test_campaign_context.py` — shared campaign facts, no inherited history,
   account/wallet separation, staleness, official-vs-community provenance, terminal
   campaigns.
 * `backend/tests/test_context_aware_execution.py` — deterministic vs prose extraction,
-  budget enforcement, injection resistance, the real `AgentController` loop (a proven
-  step is not re-executed; an executed step is recorded with its evidence), and the API
-  endpoint including its authentication requirement.
+  budget enforcement, injection resistance, the real `AgentController` loop, the recovery
+  vs discovery replan budgets, and the API endpoint including its authentication.
+* `backend/tests/test_evidence_contract.py` — calls the **real** `_verify_step` rather than
+  a replica. The replica is how the suite came to disagree with the controller.
 * `backend/tests/test_migrations_sqlite.py` — the tables exist, match the ORM, and memory
   has its scope columns.
 
