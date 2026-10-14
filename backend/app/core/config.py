@@ -238,7 +238,17 @@ class Settings(BaseSettings):
             "(or a dated variant of it). Off by default because a provider may "
             "legitimately answer with a versioned id such as "
             "'gpt-4o-2024-08-06'. Turn this on where routing must fail closed. "
-            "A mismatch is always logged at WARNING either way."
+            "Unless LLM_WARN_ON_SERVED_MODEL_MISMATCH is on, a mismatch is only logged "
+            "at DEBUG (and still recorded in the LLM diagnostics)."
+        ),
+    )
+    LLM_WARN_ON_SERVED_MODEL_MISMATCH: bool = Field(
+        default=False,
+        description=(
+            "Log a WARNING when the endpoint reports a different model than the configured "
+            "one. Off by default: with a router endpoint (e.g. an API router) the served "
+            "model legitimately varies, so this is expected and not a fault. The served "
+            "models are still tracked in the LLM diagnostics. Turn on to see every mismatch."
         ),
     )
 

@@ -504,21 +504,25 @@ class FixedLLMClient:
 
         A provider may legitimately answer with a dated variant of the model it
         was asked for (`gpt-4o` -> `gpt-4o-2024-08-06`), so a mismatch is
-        reported rather than treated as a failure. It is still loud, because on
-        this deployment the endpoint is a router: requesting `gpt-4o` has been
-        observed to return `nvidia/nemotron-3-super-120b-a12b`, which is a
-        different model entirely and not a variant of anything.
+        reported rather than treated as a failure. The endpoint may be a router
+        that picks the model per request, so a different model is expected there:
+        it is recorded in the diagnostics and logged at DEBUG, or at WARNING when
+        LLM_WARN_ON_SERVED_MODEL_MISMATCH is on. LLM_REQUIRE_SERVED_MODEL_MATCH
+        makes it a hard failure instead.
         """
         self._served_models.add(served_model)
         if served_model is None or served_model == self._model_id:
             return
         if served_model.startswith(self._model_id + "-"):
             return  # a dated variant of the same model; normal and not a fault
-        logger.warning(
-            "LLM provider served model %r, not the configured model %r. AirdropOS "
-            "requested %r and cannot control what the endpoint chooses to run: this is "
-            "a routing fault on the provider, not a configured one.",
-            served_model, self._model_id, self._model_id,
+        # Routers (API routers, gateways) pick the model per request, so a different served
+        # model is expected there. Keep it visible in diagnostics (`served_models_observed`),
+        # but only warn when the operator asked for that.
+        level = logging.WARNING if settings.LLM_WARN_ON_SERVED_MODEL_MISMATCH else logging.DEBUG
+        logger.log(
+            level,
+            "LLM endpoint served model %r for requested model %r.",
+            served_model, self._model_id,
         )
         if settings.LLM_REQUIRE_SERVED_MODEL_MATCH:
             raise LLMError(
