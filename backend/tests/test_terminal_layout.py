@@ -178,7 +178,10 @@ def test_a_rule_at_the_full_width_would_wrap_onto_a_second_row():
 
     for width in (200, 160, 120, 96, 80, 60):
         full = Text.from_markup(theme.gradient_rule(width))
-        expected = 2 if render._edge_slack() else 1
+        # The oracle is rich itself, not the helper under test: a console with edge
+        # slack folds the full-width rule, any other console does not.
+        probe = Console(width=width, height=10, file=io.StringIO(), force_terminal=True)
+        expected = 2 if probe.legacy_windows else 1
         assert rows(full, width) == expected, f"{width}: a full-width rule should take {expected} row(s)"
         # What the dashboard actually uses:
         assert rows(render._rule(width), width) == 1, f"{width}: the rule must be one row"

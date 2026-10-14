@@ -517,3 +517,79 @@ async def test_resolving_twice_in_one_cycle_reads_the_rows_once(factory, monkeyp
         controller.begin_planning_cycle(task)
         await controller._resolved_planning_context(task)
         assert calls["n"] == 2
+
+
+# ======================================================================
+# Optional spend ceilings: None means "no ceiling", a set value still binds
+# ======================================================================
+import math  # noqa: E402
+
+from backend.app.core.config import settings as _settings  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "per_tx, daily, spent, expected",
+    [
+        (None, None, 0.0, math.inf),     # no ceilings configured: unbounded, no TypeError
+        (None, None, 99.0, math.inf),    # spend so far is irrelevant without a daily ceiling
+        (10.0, None, 0.0, 10.0),         # only the per-transaction ceiling
+        (None, 25.0, 5.0, 20.0),         # only the daily ceiling: what is left today
+        (10.0, 25.0, 5.0, 10.0),         # both set: the tighter one wins ...
+        (50.0, 25.0, 5.0, 20.0),         # ... in either direction
+        (None, 25.0, 40.0, 0.0),         # already over the daily ceiling: nothing left, never negative
+    ],
+)
+def test_remaining_budget_treats_none_as_no_ceiling_and_still_enforces_set_ones(
+    per_tx, daily, spent, expected
+):
+    constraints = PlanConstraints(
+        max_cost_usd=per_tx, max_daily_spend_usd=daily, spent_already_usd=spent
+    )
+    assert constraints.remaining_budget_usd() == expected
+    payload = constraints.to_dict()
+    assert payload["budget_is_unbounded"] is math.isinf(expected)
+    assert payload["remaining_budget_usd"] == (None if math.isinf(expected) else expected)
+
+
+async def _replan_trigger(factory, monkeypatch, *, ceiling, step_cost):
+    task_id = await _task(factory, "Budget trigger")
+    monkeypatch.setattr(_settings, "MAX_TRANSACTION_VALUE_USD", ceiling, raising=False)
+    async with factory() as db:
+        task = await db.get(Task, task_id)
+        recorder = _ReplanRecorder()
+        controller = AgentController(db)
+        controller.planner.replan = recorder
+        plan = _spec(task.description)
+        plan.steps[0].estimated_cost_usd = step_cost
+        await controller._replan(
+            task,
+            iteration=1,
+            report=LoopReport(task_id=task.task_id, outcome=LoopOutcome.FAILED),
+            plan=plan,
+            trigger=ReplanTrigger.FAILURE,
+            reason="boom",
+            outcome=LoopOutcome.PARTIALLY_COMPLETED,
+        )
+    return recorder.kwargs["trigger"]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_replan_is_not_a_budget_replan_when_no_ceiling_is_configured(
+    factory, monkeypatch
+):
+    trigger = await _replan_trigger(factory, monkeypatch, ceiling=None, step_cost=1_000_000.0)
+    assert trigger is ReplanTrigger.FAILURE
+
+
+@pytest.mark.asyncio
+async def test_a_failure_replan_becomes_a_budget_replan_when_a_set_ceiling_is_exceeded(
+    factory, monkeypatch
+):
+    trigger = await _replan_trigger(factory, monkeypatch, ceiling=10.0, step_cost=50.0)
+    assert trigger is ReplanTrigger.BUDGET
+
+
+@pytest.mark.asyncio
+async def test_a_failure_replan_stays_a_failure_replan_within_a_set_ceiling(factory, monkeypatch):
+    trigger = await _replan_trigger(factory, monkeypatch, ceiling=10.0, step_cost=5.0)
+    assert trigger is ReplanTrigger.FAILURE
