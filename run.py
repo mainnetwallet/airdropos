@@ -196,15 +196,36 @@ def set_password(env_file: Path, hidden: bool = False) -> None:
         break
     else:
         die("No valid password entered. Run: py run.py --set-password")
-    code = "import sys; from backend.app.security.auth import hash_password; print(hash_password(sys.stdin.read()))"
+    # Bytes in, bytes out: the console code page (cp1252 etc. on Windows) must never change
+    # which characters the password hashes. The browser sends UTF-8, so hash UTF-8.
+    code = (
+        "import sys; from backend.app.security.auth import hash_password; "
+        "sys.stdout.write(hash_password(sys.stdin.buffer.read().decode('utf-8')))"
+    )
+    child_env = {**os.environ, "PYTHONPATH": str(ROOT), "PYTHONIOENCODING": "utf-8"}
     r = subprocess.run(
-        [str(VENV_PY), "-c", code], cwd=ROOT, input=pw, capture_output=True, text=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
+        [str(VENV_PY), "-c", code], cwd=ROOT, input=pw.encode("utf-8"), capture_output=True,
+        env=child_env,
     )
     if r.returncode != 0:
-        die("Could not hash password:\n" + r.stderr)
-    set_env_value(env_file, "OPERATOR_PASSWORD_HASH", "'" + r.stdout.strip() + "'")
-    log("Saved OPERATOR_PASSWORD_HASH to .env. Log in with OPERATOR_EMAIL and this password.")
+        die("Could not hash password:\n" + r.stderr.decode("utf-8", "replace"))
+    hashed = r.stdout.decode("utf-8").strip().splitlines()[-1].strip()
+    set_env_value(env_file, "OPERATOR_PASSWORD_HASH", "'" + hashed + "'")
+    log("Saved OPERATOR_PASSWORD_HASH to .env.")
+
+    # Also write it straight into the database, so the password works right away and does not
+    # depend on a restart, the working directory, or which email the old account used.
+    a = subprocess.run(
+        [str(VENV_PY), "-m", "backend.app.security.operator_sync"], cwd=ROOT,
+        capture_output=True, env=child_env,
+    )
+    out = (a.stdout.decode("utf-8", "replace").strip().splitlines() or [""])[-1]
+    if a.returncode == 0:
+        log(f"Operator account in the database: {out}")
+        log("Log in now with that email and the password you just set.")
+    else:
+        log(f"Could not update the database yet ({out or 'no output'}).")
+        log("Start AirdropOS normally: it applies the new password to the database at startup.")
 
 
 def update_code() -> None:

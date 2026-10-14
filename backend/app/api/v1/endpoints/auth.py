@@ -70,8 +70,10 @@ async def login(
     if user is None:
         verify_against_dummy(payload.password)
     if user is None or not verify_password(payload.password, user.hashed_password):
-        logger.warning("Failed login attempt for %s from %s", payload.email,
-                       request.client.host if request.client else "unknown")
+        # The client only ever sees "Invalid credentials". The server log says which it was.
+        reason = "no account with that email" if user is None else "password does not match the stored hash"
+        logger.warning("Failed login attempt for %s from %s: %s", payload.email,
+                       request.client.host if request.client else "unknown", reason)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "Invalid credentials."},
@@ -203,7 +205,7 @@ async def bootstrap_operator(
         )
 
     user = User(
-        email=settings.OPERATOR_EMAIL.lower(),
+        email=settings.OPERATOR_EMAIL.strip().lower(),
         hashed_password=settings.OPERATOR_PASSWORD_HASH,
         full_name="Operator",
         is_active=True,
