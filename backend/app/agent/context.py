@@ -42,7 +42,8 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -170,14 +171,31 @@ _QUANTITY_RE = re.compile(
 )
 
 
-def _extract_quantities(text: str) -> List[Tuple[float, str]]:
+def _as_decimal(value: Any) -> Decimal:
+    """Coerce a number to `Decimal` without importing a float's binary noise.
+
+    `Decimal(0.1)` is `0.1000000000000000055...`, which is then *greater* than the
+    exactly-parsed `Decimal("0.1")` and would fail a boundary comparison that should
+    pass. Going through `str()` first gives the number as it is written.
+    """
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
+def _extract_quantities(text: str) -> List[Tuple[Decimal, str]]:
     """Every "amount unit" in `text`, as a comparable (number, unit) pair.
 
     Separating the number from the unit is what lets a threshold be checked honestly:
-    "hold at least 100 tokens" becomes `(100.0, "token")`, which a proof reading "150
-    token" satisfies and a proof reading "50 token" does not.
+    "hold at least 100 tokens" becomes `(Decimal("100"), "token")`, which a proof reading
+    "150 token" satisfies and a proof reading "50 token" does not.
+
+    The number is a `Decimal`, never a `float`. Crypto amounts are fractional and compared
+    against thresholds; a binary float cannot represent `0.1` or `1.250` exactly, so a
+    balance sitting exactly on a threshold could round to the wrong side of it. A
+    `Decimal` keeps every digit as written (`0.500`, `0.0001`, `1000.500`).
     """
-    found: List[Tuple[float, str]] = []
+    found: List[Tuple[Decimal, str]] = []
     for raw_number, unit in _QUANTITY_RE.findall(str(text or "").lower()):
         # Read the number exactly as written. A previous version treated a trailing group
         # of three digits after a point as a thousands separator, which read `0.500
@@ -189,8 +207,11 @@ def _extract_quantities(text: str) -> List[Tuple[float, str]]:
         # separator; there is no rule that gets both readings right, so there is no rule.
         cleaned = raw_number.replace(",", "").replace("_", "")
         try:
-            value = float(cleaned)
-        except ValueError:
+            value = Decimal(cleaned)
+        except InvalidOperation:
+            # "1.2.3" and similar are not a number. Skip them rather than guess.
+            continue
+        if not value.is_finite():
             continue
         found.append((value, unit[:-1] if unit.endswith("s") else unit))
     return found
@@ -210,17 +231,168 @@ _NAMED_TARGET_RE = re.compile(
 )
 
 
-def _quantities_met(required: List[Tuple[float, str]], proved: List[Tuple[float, str]]) -> bool:
+def _quantities_met(
+    required: Sequence[Tuple[Any, str]], proved: Sequence[Tuple[Any, str]]
+) -> bool:
     """Is every required amount met by something the proof actually shows?
 
     Same unit, and an amount at least as large. A requirement naming a unit the proof
     never mentions is not met, however large the proof's other numbers are.
+
+    Amounts are compared as `Decimal`. A `float` on either side is converted through its
+    printed form first (see `_as_decimal`), so `0.1` meets `0.1` exactly.
     """
     for amount, unit in required:
+        needed = _as_decimal(amount)
         if not any(
-            proved_unit == unit and proved_amount >= amount
+            proved_unit == unit and _as_decimal(proved_amount) >= needed
             for proved_amount, proved_unit in proved
         ):
+            return False
+    return True
+
+
+# ----------------------------------------------------------------------
+# Which kind of evidence proves which kind of quantity
+# ----------------------------------------------------------------------
+# "hold 100 tokens" and "send 100 usdt" both contain "100 <unit>", but they are proved by
+# different things. A holding is proved by what the wallet *has* - a balance reading. A
+# transfer is proved by an amount that actually *settled*. Treating every number in the
+# result as interchangeable proof let this close a holding requirement:
+#
+#     requirement   hold 100 tokens
+#     observed      {"balance": "50 tokens"}                      <- what the wallet has
+#     result        {"amount": "100 tokens", "status": "pending"} <- a transfer not yet done
+#
+# 100 appears in the proof, so "hold 100 tokens" closed on a wallet holding 50.
+_HOLDING_REQUIREMENT_RE = re.compile(
+    r"\b(?:hold|holds|holding|held|balance|own|owns|owning|possess|possesses)\b"
+    r"|\bin\s+(?:your|the|a)\s+wallet\b",
+    re.IGNORECASE,
+)
+
+# A key names a balance reading when one of its words is a balance word...
+_BALANCE_KEY_RE = re.compile(r"(?:^|_)(?:balance|balances|holding|holdings|held)(?:_|$)")
+
+# ...unless another word says the number is not a settled holding: a pending, expected or
+# requested figure, or a threshold. `pending_balance` is a transaction in flight, not what
+# the wallet holds.
+_NOT_A_HOLDING_WORDS = frozenset(
+    {
+        "pending", "unconfirmed", "incoming", "outgoing", "expected", "projected",
+        "requested", "estimated", "target", "required", "requirement", "minimum", "min",
+        "max", "maximum", "threshold", "needed", "reserved",
+    }
+)
+
+# A result that says it is still in flight, or that it did not happen, proves no amount.
+_UNSETTLED_STATUSES = frozenset(
+    {
+        "pending", "processing", "submitted", "queued", "in_progress", "inprogress",
+        "unconfirmed", "awaiting", "awaiting_confirmation", "waiting", "initiated",
+        "broadcast", "failed", "error", "rejected", "reverted", "cancelled", "canceled",
+        "declined", "expired", "dropped", "unknown",
+    }
+)
+_STATUS_KEYS = ("status", "state", "tx_status", "transaction_status")
+
+
+def _key_words(key: Any) -> List[str]:
+    return [w for w in re.split(r"[^a-z0-9]+", str(key).lower()) if w]
+
+
+def _is_balance_path(path: Tuple[str, ...]) -> bool:
+    """Does this key path name a settled balance reading?"""
+    words: List[str] = []
+    for key in path:
+        words.extend(_key_words(key))
+    if any(word in _NOT_A_HOLDING_WORDS for word in words):
+        return False
+    return any(_BALANCE_KEY_RE.search("_".join(_key_words(key))) for key in path)
+
+
+def _walk_text_leaves(
+    node: Any, path: Tuple[str, ...] = (), depth: int = 0
+) -> Iterator[Tuple[Tuple[str, ...], str]]:
+    """Every string value in a bounded walk, with the dictionary keys leading to it."""
+    if depth > MAX_SCREEN_DEPTH:
+        return
+    if isinstance(node, Mapping):
+        for count, (key, value) in enumerate(node.items()):
+            if count >= MAX_SCREEN_ITEMS:
+                break
+            yield from _walk_text_leaves(value, path + (str(key),), depth + 1)
+    elif isinstance(node, (list, tuple)):
+        for count, item in enumerate(node):
+            if count >= MAX_SCREEN_ITEMS:
+                break
+            yield from _walk_text_leaves(item, path, depth + 1)
+    elif isinstance(node, str):
+        yield path, node
+
+
+def _source_is_unsettled(source: Any) -> bool:
+    """Does this source say, at its top level, that the thing it describes is not done?"""
+    if not isinstance(source, Mapping):
+        return False
+    for key in _STATUS_KEYS:
+        value = source.get(key)
+        if isinstance(value, str):
+            if re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_") in _UNSETTLED_STATUSES:
+                return True
+    return False
+
+
+@dataclass
+class _QuantityEvidence:
+    """The quantities one observation can actually prove, sorted by what they prove."""
+
+    # unit -> every distinct balance reading seen for it, across all sources.
+    balances: Dict[str, List[Decimal]] = field(default_factory=dict)
+    # Quantities that are not balance readings, from sources not marked as in flight.
+    settled: List[Tuple[Decimal, str]] = field(default_factory=list)
+
+
+def _collect_quantity_evidence(*sources: Optional[Mapping[str, Any]]) -> _QuantityEvidence:
+    """Read the observed state and the tool result into balance and non-balance evidence.
+
+    The classification is by the *key* a number sits under, not by the text around it,
+    because the text is what an attacker or a sloppy tool controls and the key is what
+    the tool's own schema says the number is.
+    """
+    evidence = _QuantityEvidence()
+    for source in sources:
+        if not source:
+            continue
+        unsettled = _source_is_unsettled(source)
+        for path, text in _walk_text_leaves(source):
+            quantities = _extract_quantities(text)
+            if not quantities:
+                continue
+            if _is_balance_path(path):
+                for amount, unit in quantities:
+                    evidence.balances.setdefault(unit, []).append(amount)
+            elif not unsettled:
+                evidence.settled.extend(quantities)
+    return evidence
+
+
+def _holding_met(
+    required: Sequence[Tuple[Decimal, str]], evidence: _QuantityEvidence
+) -> bool:
+    """A holding is met only by an unambiguous balance reading that is large enough.
+
+    No balance reading for the unit means nothing was observed, so it is not met. Two
+    readings that disagree mean the evidence conflicts, so it is not met either: the
+    requirement stays outstanding until a later observation settles which is true.
+    """
+    for amount, unit in required:
+        readings = evidence.balances.get(unit)
+        if not readings:
+            return False
+        if len(set(readings)) > 1:
+            return False
+        if readings[0] < amount:
             return False
     return True
 
@@ -633,6 +805,10 @@ class TaskContextService:
                         json.dumps(safe_result, default=str),
                     ]
                 ),
+                # Amounts are read from these, by key, not from the flat text above: a
+                # pending transfer's amount must not be able to stand in for a balance.
+                observed_state=safe_state,
+                result=safe_result,
             )
 
         await self._notify_context_changed(task, action)
@@ -1162,7 +1338,13 @@ class TaskContextService:
         await self.db.flush()
 
     async def _satisfy_matching_requirements(
-        self, task: Task, observation: TaskObservation, proof_text: str
+        self,
+        task: Task,
+        observation: TaskObservation,
+        proof_text: str,
+        *,
+        observed_state: Optional[Mapping[str, Any]] = None,
+        result: Optional[Mapping[str, Any]] = None,
     ) -> None:
         """Close only the requirements this confirmed observation actually satisfies.
 
@@ -1192,6 +1374,19 @@ class TaskContextService:
         * it names none, and enough of its ordinary words overlap to be the same thing.
 
         Anything else stays outstanding. Ambiguity resolves to "not proven".
+
+        **Amounts are proved by the right kind of evidence.** `proof_text` is a flat
+        string and cannot say whether "100 tokens" in it is a balance or a pending
+        transfer, so quantities are not read from it. They come from the structured
+        `observed_state` and `result`, classified by the key each number sits under:
+
+        * a holding requirement ("hold 100 tokens") is met only by a *balance* reading,
+          never by a transfer amount, and never when two balance readings disagree;
+        * any other quantity requirement is met by a non-balance amount from a source
+          that is not marked pending or failed.
+
+        If neither structured source is supplied, no amount can be proved and a
+        requirement that names one stays outstanding.
         """
         outstanding = await self.requirements(task, only_outstanding=True)
         if not outstanding:
@@ -1200,7 +1395,7 @@ class TaskContextService:
         haystack = proof_text.lower()
         haystack_ids = set(_extract_identifiers(haystack))
         proof_words = set(re.findall(r"[a-z0-9]{4,}", haystack))
-        proof_quantities = _extract_quantities(haystack)
+        quantity_evidence = _collect_quantity_evidence(observed_state, result)
 
         for requirement in outstanding:
             text = requirement.text.lower()
@@ -1214,8 +1409,12 @@ class TaskContextService:
                 # surrounding wording is decoration around a concrete requirement.
                 if not identifiers.issubset(haystack_ids):
                     continue
-                if not _quantities_met(quantities, proof_quantities):
-                    continue
+                if quantities:
+                    if _HOLDING_REQUIREMENT_RE.search(text):
+                        if not _holding_met(quantities, quantity_evidence):
+                            continue
+                    elif not _quantities_met(quantities, quantity_evidence.settled):
+                        continue
             else:
                 # No target to match on, so fall back to wording - and demand real
                 # overlap, because a single shared word proves nothing.

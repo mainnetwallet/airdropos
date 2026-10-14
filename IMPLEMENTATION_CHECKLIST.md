@@ -1,8 +1,12 @@
 # AirdropOS Implementation Checklist
 
-**Status as of 2026-10-14 (review fixes):** the backend suite passes at
-**406 tests** (17 terminal-layout tests fail — they also fail at HEAD, see *Known gaps*)
-and the frontend at **26**, with `npm run lint` (0 errors) and
+**Status as of 2026-10-14 (review fixes):** the backend suite has **457 tests**. Verified
+on Linux / Python 3.13 after the quantity-evidence fix: **456 passed, 1 failed**. The one
+failure, `test_agent_inbox.py::...::test_verifier_never_constructs_a_second_telethon_client`,
+fails identically before the fix (423 tests: 422 passed, 1 failed). The 17 terminal-layout
+failures recorded in the previous run did **not** reproduce there — all 68 tests in
+`test_terminal_layout.py` and `test_terminal_logs.py` pass — see *Known gaps*.
+The frontend is at **26** (not re-run in this fix), with `npm run lint` (0 errors) and
 `npm run build` both clean. See
 [`CONTINUATION.md`](./CONTINUATION.md) for the authoritative status and honest gap
 list, [`docs/AUTONOMOUS_EXECUTION.md`](./docs/AUTONOMOUS_EXECUTION.md) for the
@@ -152,11 +156,17 @@ Legend: `[x]` created · `[~]` partial/stub · `[ ]` not implemented
 - [ ] Human-approval store/API: `TransactionEngine` requires an `ApprovalVerifier`, but no implementation or approval endpoint exists, so broadcast fails closed.
 - [~] Containers (backend, worker, frontend) run as root; the dashboard publishes on `0.0.0.0:3000` over plain HTTP unless `FRONTEND_BIND` is set.
 - [~] Egress: destinations are vetted before each request, but there is no network-level egress firewall; DNS rebinding is narrowed, not eliminated.
-- [~] **The terminal dashboard's layout tests fail (17).** `test_terminal_layout.py` and
-      `test_terminal_logs.py` fail at HEAD, before any of this work: click targets are
-      recorded at coordinates where the frame draws whitespace, and some sizes render a
-      row count other than the terminal height. Reproduced in a clean worktree of `fbca677`.
-      Unrelated to the agent; not fixed here.
+- [~] **The terminal dashboard's layout tests failed (17) in the earlier environment.**
+      `test_terminal_layout.py` and `test_terminal_logs.py` failed at HEAD, before any of
+      this work: click targets were recorded at coordinates where the frame draws
+      whitespace, and some sizes rendered a row count other than the terminal height.
+      Reproduced in a clean worktree of `fbca677`. **Not reproduced on Linux / Python 3.13**
+      (2026-10-14): all 68 tests in those two files pass there, so the failures look
+      environment-dependent (the earlier runs were on Windows). Unrelated to the agent;
+      not changed here.
+- [~] `test_agent_inbox.py::TestTelegramVerificationUsesTheOwningClient::test_verifier_never_constructs_a_second_telethon_client`
+      fails on Linux / Python 3.13 both before and after the quantity-evidence fix
+      (the verifier reports "No Telegram session ..." instead of ready). Not investigated here.
 
 ## Phase 12 — Chat-Controlled Agent (added 2026-10-13)
 - [x] `app/agent/chat_loop.py` — bounded decide -> authorize -> execute -> verify -> report
@@ -276,6 +286,21 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       read `0.500 tokens` as **500**, letting 0.5 tokens satisfy *hold 100 tokens*. It is
       removed rather than refined: crypto balances are fractional and no rule gets both
       readings right.
+- [x] **Amounts are `Decimal`, not `float`.** `float` cannot hold `0.1` or `1.250`
+      exactly, so a balance on a threshold could land on the wrong side of it, and values
+      beyond float resolution collapsed together. `_extract_quantities` returns `Decimal`
+      (`0.500`, `0.0001`, `1000.500` keep every digit); `_quantities_met` compares as
+      `Decimal`, converting any float through its printed form.
+- [x] **The right evidence proves the right requirement.** `observed_state` and the result
+      were flattened into one string, so a pending transfer's `100 tokens` closed *hold 100
+      tokens* on a wallet holding 50. Quantities are now read from the structured sources,
+      classified by the key they sit under: a **holding** (*hold / balance / own*) is met
+      only by a balance reading, never by a transfer amount, never by a `pending_*` /
+      `expected` / `minimum` key, and **not at all when two balance readings disagree**;
+      any other quantity (*send 100 usdt*, *7 days*) is met by a non-balance amount from a
+      source not marked pending or failed. Conflicting or missing evidence leaves the
+      requirement outstanding. Limitation: a quantity must carry its unit in the same string
+      (`"150 tokens"`); a bare numeric `balance` with the symbol in another field is not read.
 - [x] A handle matches with or without its `@`, and a target named only by a field — a
       tool result's `"username": "examplechannel"` — is recognised. Without this a genuine
       successful join could never close its own requirement.
@@ -290,8 +315,8 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       next, outstanding requirements, proven actions, and attempted-but-unverified actions
       as three separate lists. It never renders an unproven action as a success.
 - [x] `test_task_context_isolation.py` (31), `test_campaign_context.py` (15),
-      `test_context_aware_execution.py` (31), plus context assertions in
-      `test_migrations_sqlite.py`.
+      `test_context_aware_execution.py` (31), `test_quantity_evidence.py` (34; 17 of them
+      fail against `e3a655a`), plus context assertions in `test_migrations_sqlite.py`.
 - [x] **Recovery replans are budgeted separately from discovery replans.** Both advance
       the same revision counter, so the recovery cap is now read from the persisted
       revision history counting only recovery triggers. Without this, a task that

@@ -21,6 +21,8 @@ Nothing here contacts Telegram, a chain, a browser or an LLM.
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from backend.app.agent.context import (
@@ -63,19 +65,20 @@ class TestDecimalQuantitiesAreNotInflated:
     @pytest.mark.parametrize(
         "text,expected",
         [
-            ("0.500 tokens", 0.5),
-            ("1.250 tokens", 1.25),
-            ("1,000 tokens", 1000.0),
-            ("1,000.500 tokens", 1000.5),
-            ("100 tokens", 100.0),
-            ("0.0001 eth", 0.0001),
-            ("12.5 usd", 12.5),
+            ("0.500 tokens", "0.5"),
+            ("1.250 tokens", "1.25"),
+            ("1,000 tokens", "1000"),
+            ("1,000.500 tokens", "1000.5"),
+            ("100 tokens", "100"),
+            ("0.0001 eth", "0.0001"),
+            ("12.5 usd", "12.5"),
         ],
     )
     def test_the_number_is_read_as_written(self, text, expected):
         parsed = _extract_quantities(text)
         assert parsed, f"{text!r} produced no quantity at all"
-        assert parsed[0][0] == pytest.approx(expected), (
+        # Compared exactly as a Decimal. `pytest.approx` here would hide a precision loss.
+        assert parsed[0][0] == Decimal(expected), (
             f"{text!r} parsed as {parsed[0][0]}, expected {expected}. Inflating a decimal "
             "turns an insufficient balance into a satisfied requirement."
         )

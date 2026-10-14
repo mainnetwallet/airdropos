@@ -5,6 +5,20 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (requirement completion, review of e3a655a)
+- **Conflicting evidence could close a holding requirement.** With
+  `observed_state={"balance": "50 tokens"}` and
+  `result={"amount": "100 tokens", "status": "pending"}`, *hold 100 tokens* was marked
+  satisfied, because both sources were flattened into one string. Quantities are now read
+  from the structured sources by key: a holding needs a balance reading, a pending
+  transfer amount never counts, and disagreeing balance readings leave the requirement
+  outstanding.
+- **Crypto amounts were parsed as `float`.** They are `Decimal` now, so `0.500`, `0.0001`,
+  `1.250` and `1000.500` keep their precision and threshold comparisons cannot round the
+  wrong way.
+- Tests: `backend/tests/test_quantity_evidence.py` (34 new). The `float` expectations in
+  `test_context_edge_cases.py` became exact `Decimal` comparisons.
+
 ### Fixed (terminal dashboard lag)
 - **The dashboard reacted about a second late.** Resizing the window, or anything else on
   screen, only showed up at the next one-second tick, and a slow HTTP or database probe
