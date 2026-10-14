@@ -126,28 +126,55 @@ class ApprovalVerifier(Protocol):
 
 @dataclass(frozen=True)
 class DecodedRawTransaction:
-    """The fields of a signed raw transaction that destination validation needs."""
+    """Every field of a signed raw transaction that an authorization binds to.
+
+    ``nonce`` and ``gas_limit`` are decoded alongside destination, value and calldata
+    because an approval binds to the gas limit too: a transfer approved at 65,000 gas
+    is a different authorization from one approved at 21,000, and the engine can only
+    tell them apart from the signed bytes themselves.
+    """
 
     tx_type: int
     chain_id: Optional[int]
+    nonce: int
+    gas_limit: int
     to: Optional[str]
     value: int
     data: bytes
 
+    @property
+    def data_hex(self) -> str:
+        """Calldata as canonical lowercase ``0x`` hex. Hex case carries no meaning."""
+        return "0x" + self.data.hex()
 
-# Signed transaction types whose payload layout is decoded below. Anything else (blob,
+
+# Signed transaction types whose payload layout is decoded below, as
+# (chainId, nonce, gas, to, value, data, field count). Anything else (blob,
 # set-code/EIP-7702, unknown future types) is refused rather than guessed at.
 _TX_LAYOUT = {
-    # type: (index of chainId, index of `to`, index of `value`, index of `data`, field count)
-    1: (0, 4, 5, 6, 11),   # EIP-2930: chainId, nonce, gasPrice, gas, to, value, data, accessList, v, r, s
-    2: (0, 5, 6, 7, 12),   # EIP-1559: chainId, nonce, tip, maxFee, gas, to, value, data, accessList, v, r, s
+    # EIP-2930: chainId, nonce, gasPrice, gas, to, value, data, accessList, v, r, s
+    1: (0, 1, 3, 4, 5, 6, 11),
+    # EIP-1559: chainId, nonce, tip, maxFee, gas, to, value, data, accessList, v, r, s
+    2: (0, 1, 4, 5, 6, 7, 12),
 }
+
+# A legacy transaction carries no chainId field and has a different arity:
+# nonce, gasPrice, gas, to, value, data, v, r, s.
+_LEGACY_FIELDS = 9
+_LEGACY_NONCE, _LEGACY_GAS, _LEGACY_TO, _LEGACY_VALUE, _LEGACY_DATA = 0, 2, 3, 4, 5
+
+
+def _uint(value: bytes) -> int:
+    """RLP integers are big-endian and may be zero-length, which is still zero."""
+    return int.from_bytes(value, "big")
 
 
 def decode_raw_transaction(raw_tx_hex: str) -> DecodedRawTransaction:
-    """Decode destination, value, calldata and chain id from a signed raw transaction.
+    """Decode chain id, nonce, gas limit, destination, value and calldata.
 
-    Raises TransactionRejected for anything that cannot be decoded with certainty.
+    Raises TransactionRejected for anything that cannot be decoded with certainty. This
+    is the only place a signed transaction is interpreted, and everything the engine
+    later authorizes is read from here rather than from whatever the caller asserted.
     """
     import rlp
     from hexbytes import HexBytes
@@ -172,24 +199,34 @@ def decode_raw_transaction(raw_tx_hex: str) -> DecodedRawTransaction:
     try:
         if raw[0] >= 0xC0:  # legacy transaction: a bare RLP list
             fields = rlp.decode(raw)
-            if not isinstance(fields, list) or len(fields) != 9:
+            if not isinstance(fields, list) or len(fields) != _LEGACY_FIELDS:
                 raise reject("malformed legacy transaction")
-            v = int.from_bytes(fields[6], "big")
+            v = _uint(fields[6])
             chain_id = (v - 35) // 2 if v >= 35 else None  # v of 27/28 carries no chain id
-            return DecodedRawTransaction(0, chain_id, to_hex(fields[3]), int.from_bytes(fields[4], "big"), bytes(fields[5]))
+            return DecodedRawTransaction(
+                tx_type=0,
+                chain_id=chain_id,
+                nonce=_uint(fields[_LEGACY_NONCE]),
+                gas_limit=_uint(fields[_LEGACY_GAS]),
+                to=to_hex(fields[_LEGACY_TO]),
+                value=_uint(fields[_LEGACY_VALUE]),
+                data=bytes(fields[_LEGACY_DATA]),
+            )
         layout = _TX_LAYOUT.get(raw[0])
         if layout is None:
             raise reject(f"unsupported transaction type 0x{raw[0]:02x}")
         fields = rlp.decode(raw[1:])
-        c_i, to_i, val_i, data_i, count = layout
+        c_i, n_i, g_i, to_i, val_i, data_i, count = layout
         if not isinstance(fields, list) or len(fields) != count:
             raise reject("malformed typed transaction")
         return DecodedRawTransaction(
-            raw[0],
-            int.from_bytes(fields[c_i], "big"),
-            to_hex(fields[to_i]),
-            int.from_bytes(fields[val_i], "big"),
-            bytes(fields[data_i]),
+            tx_type=raw[0],
+            chain_id=_uint(fields[c_i]),
+            nonce=_uint(fields[n_i]),
+            gas_limit=_uint(fields[g_i]),
+            to=to_hex(fields[to_i]),
+            value=_uint(fields[val_i]),
+            data=bytes(fields[data_i]),
         )
     except TransactionRejected:
         raise
@@ -197,13 +234,39 @@ def decode_raw_transaction(raw_tx_hex: str) -> DecodedRawTransaction:
         raise reject("could not be decoded") from None
 
 
+def canonical_calldata(value: Any) -> str:
+    """Normalise calldata to lowercase ``0x`` hex so equivalent bytes compare equal.
+
+    Hex digit case is not semantic - ``0xA9059CBB`` and ``0xa9059cbb`` are the same four
+    bytes - so comparing them verbatim would refuse a correct transfer whenever the
+    encoder and the decoder disagree on case, which is not a security property.
+    """
+    text = str(value or "0x").strip()
+    if not text.startswith("0x"):
+        text = "0x" + text
+    body = text[2:]
+    try:
+        bytes.fromhex(body)
+    except ValueError:
+        return text.lower()  # not hex; leave it for the caller to reject explicitly
+    return "0x" + body.lower()
+
+
 @dataclass(frozen=True)
 class SubmissionAuthorization:
     """Everything `submit_raw` requires before it will broadcast.
 
     There is deliberately no default: a caller cannot broadcast without
-    stating the wallet it is authorised for, the cost it is spending, and the
-    human who approved it.
+    stating the wallet it is authorised for, the cost it is spending, the
+    identity that authorized it, and the transaction it claims to cover.
+
+    The ``expected_*`` fields are the trusted execution context: the statement of
+    what this authorization is *for*. The engine decodes the signed bytes and
+    requires them to match these exactly before it sends anything, and then builds
+    the verification binding from the decoded values - never from these fields.
+    Copying them into the binding unchecked would make the approval comparison
+    vacuous: it would compare the approval to itself instead of to the transaction.
+    Leaving them unset refuses the broadcast rather than skipping the comparison.
     """
 
     wallet_address: str
@@ -217,6 +280,27 @@ class SubmissionAuthorization:
     task_id: Optional[str] = None
     # Destinations this broadcast may be sent to. Empty means none: it fails closed.
     allowed_destinations: frozenset = frozenset()
+    # The authorized intent, verified against the decoded signed transaction.
+    expected_chain_id: Optional[int] = None
+    expected_to: Optional[str] = None
+    expected_value_wei: Optional[int] = None
+    expected_data: Optional[str] = None
+    expected_gas_limit: Optional[int] = None
+
+    def unstated_intent_fields(self) -> List[str]:
+        """Which parts of the authorized intent this authorization does not state."""
+        missing = []
+        if self.expected_chain_id is None:
+            missing.append("chain_id")
+        if self.expected_to is None:
+            missing.append("to")
+        if self.expected_value_wei is None:
+            missing.append("value_wei")
+        if self.expected_data is None:
+            missing.append("data")
+        if self.expected_gas_limit is None:
+            missing.append("gas_limit")
+        return missing
 
 
 class TransactionEngine:
@@ -279,28 +363,42 @@ class TransactionEngine:
             raise TransactionRejected("Invalid gas estimate.", "GAS_ESTIMATE")
 
     async def check_spend_limits(self, estimated_cost_usd: float) -> None:
-        """Advisory, read-only check of the per-transaction and rolling daily ceilings.
+        """Advisory, read-only check of any configured spend ceilings.
+
+        Unset ceilings impose nothing: the platform ships without a fixed
+        application-level amount or daily-spend cap, so a legitimate autonomous
+        transfer is never refused for being large. An operator who configures a
+        ceiling gets it enforced here and, atomically, in `reserve_spend`.
 
         This does NOT reserve anything, so on its own it cannot stop concurrent
         callers from collectively overspending. Anything that actually spends
         must use `reserve_spend`, which checks and reserves atomically.
         """
-        if estimated_cost_usd > settings.MAX_TRANSACTION_VALUE_USD:
+        per_transaction = settings.MAX_TRANSACTION_VALUE_USD
+        if per_transaction is not None and estimated_cost_usd > per_transaction:
             raise TransactionRejected(
                 f"Estimated transaction cost ${estimated_cost_usd:.2f} exceeds the per-transaction "
-                f"limit of ${settings.MAX_TRANSACTION_VALUE_USD:.2f}.",
+                f"limit of ${per_transaction:.2f} configured by the operator.",
                 "LIMIT_EXCEEDED",
             )
+        daily = settings.MAX_DAILY_GAS_SPEND_USD
+        if daily is None:
+            return
         projected = (await asyncio.to_thread(self.ledger.spent_last_24h)) + estimated_cost_usd
-        if projected > settings.MAX_DAILY_GAS_SPEND_USD:
+        if projected > daily:
             raise TransactionRejected(
                 f"Projected daily spend ${projected:.2f} exceeds the daily limit of "
-                f"${settings.MAX_DAILY_GAS_SPEND_USD:.2f}.",
+                f"${daily:.2f} configured by the operator.",
                 "DAILY_LIMIT_EXCEEDED",
             )
 
     async def reserve_spend(self, estimated_cost_usd: float, ref: Optional[str] = None) -> str:
-        """Atomically enforce both limits and reserve the cost. Returns a reservation id."""
+        """Atomically enforce any configured ceilings and reserve the cost.
+
+        Returns a reservation id. The reservation is recorded either way: it is the
+        durable record of what was attempted, and it is what an ambiguous broadcast
+        outcome keeps counting against.
+        """
         try:
             return await asyncio.to_thread(
                 self.ledger.reserve,
@@ -481,15 +579,29 @@ class TransactionEngine:
             ) from exc
 
     @staticmethod
-    def _validate_raw_destination(
+    def _verify_signed_transaction(
         network: str, raw_tx_hex: str, authorization: SubmissionAuthorization
     ) -> DecodedRawTransaction:
-        """Judge what a pre-signed transaction actually does, from its own bytes."""
+        """Judge what a pre-signed transaction actually does, from its own bytes.
+
+        Every field compared here is decoded from the transaction. Nothing is taken
+        from the approval dictionary: an approval says what was authorized, and this
+        says what is about to be sent, and the two must be identical.
+        """
+        missing = authorization.unstated_intent_fields()
+        if missing:
+            raise TransactionRejected(
+                "The authorization does not state what the transaction is supposed to be "
+                f"({', '.join(missing)}); refusing to broadcast.",
+                "INTENT_NOT_AUTHORIZED",
+            )
+
         decoded = decode_raw_transaction(raw_tx_hex)
         try:
             expected_chain = get_chain(network).chain_id
         except ChainError as exc:
             raise TransactionRejected(f"Unknown network: {exc}", "UNKNOWN_NETWORK") from exc
+
         if decoded.chain_id != expected_chain:
             # No chain id (pre-EIP-155) is replayable on any chain; a different one is the wrong chain.
             raise TransactionRejected(
@@ -502,6 +614,38 @@ class TransactionEngine:
                 "Contract-creation transactions cannot be broadcast through submit_raw.", "DESTINATION_NOT_ALLOWED"
             )
         to = decoded.to.lower()
+
+        if decoded.chain_id != authorization.expected_chain_id:
+            raise TransactionRejected(
+                f"The transaction is for chain {decoded.chain_id}, but it was authorized for "
+                f"chain {authorization.expected_chain_id}; refusing to broadcast.",
+                "CHAIN_ID_MISMATCH",
+            )
+        if to != str(authorization.expected_to or "").lower():
+            raise TransactionRejected(
+                f"The transaction goes to {decoded.to}, but it was authorized to go to "
+                f"{authorization.expected_to}; refusing to broadcast.",
+                "DESTINATION_MISMATCH",
+            )
+        if decoded.value != authorization.expected_value_wei:
+            raise TransactionRejected(
+                f"The transaction moves {decoded.value} wei, but "
+                f"{authorization.expected_value_wei} wei was authorized; refusing to broadcast.",
+                "VALUE_MISMATCH",
+            )
+        if decoded.data_hex != canonical_calldata(authorization.expected_data):
+            raise TransactionRejected(
+                "The transaction's calldata does not match the authorized calldata; "
+                "refusing to broadcast.",
+                "CALLDATA_MISMATCH",
+            )
+        if decoded.gas_limit != authorization.expected_gas_limit:
+            raise TransactionRejected(
+                f"The transaction was signed with a gas limit of {decoded.gas_limit}, but "
+                f"{authorization.expected_gas_limit} was authorized; refusing to broadcast.",
+                "GAS_LIMIT_MISMATCH",
+            )
+
         allowed = {str(a).lower() for a in (authorization.allowed_destinations or ())}
         if not allowed or to not in allowed:
             raise TransactionRejected(
@@ -517,7 +661,7 @@ class TransactionEngine:
         from backend.app.wallets.vault import KeyVault, SigningDenied
 
         try:
-            KeyVault._validate_transaction({"to": to, "data": "0x" + decoded.data.hex()})
+            KeyVault._validate_transaction({"to": to, "data": decoded.data_hex})
         except SigningDenied as exc:
             raise TransactionRejected(str(exc), "RESTRICTED_OPERATION") from exc
         return decoded
@@ -533,13 +677,16 @@ class TransactionEngine:
 
         Fails closed. Before any broadcast this enforces, in order:
           1. Emergency Stop,
-          2. a named human approval, confirmed by the server-side ApprovalVerifier (the
-             caller-supplied ``human_approved`` flag alone is never accepted),
+          2. a named authorizing identity, confirmed by the server-side ApprovalVerifier
+             (the caller-supplied ``human_approved`` flag alone is never accepted),
           3. that the transaction was signed by an authorised wallet,
-          4. the decoded chain id, destination and calldata (allowed destination, no contract
-             creation, no restricted selectors),
-          5. the approval being consumed for exactly this transaction,
-          6. the per-transaction and rolling daily spend limits (atomic reservation),
+          4. that the decoded transaction - chain id, destination, value, calldata and
+             gas limit read from the signed bytes themselves - is exactly the
+             authorized intent, and is not contract creation, not on a denylist and
+             carries no restricted selector,
+          5. the approval being consumed for exactly this transaction, bound to those
+             same decoded values,
+          6. any operator-configured spend ceilings (atomic reservation), and
           7. Emergency Stop again, immediately before the RPC call.
         """
         if not emergency_stop.can_submit_transactions():
@@ -555,7 +702,8 @@ class TransactionEngine:
             or not str(authorization.approval_id or "").strip()
         ):
             raise TransactionRejected(
-                "Broadcast requires an explicit human approval (approved_by and approval_id).",
+                "Broadcast requires an explicit authorization naming who approved it "
+                "(approved_by and approval_id).",
                 "HUMAN_APPROVAL_REQUIRED",
             )
 
@@ -578,7 +726,7 @@ class TransactionEngine:
                 "NOT_AUTHORIZED",
             )
 
-        decoded = self._validate_raw_destination(network, raw_tx_hex, authorization)
+        decoded = self._verify_signed_transaction(network, raw_tx_hex, authorization)
 
         try:
             from eth_utils import keccak
@@ -587,12 +735,17 @@ class TransactionEngine:
             approved = await self.approval_verifier.verify_and_consume(
                 approval_id=str(authorization.approval_id),
                 approved_by=str(authorization.approved_by),
+                # Built from the decoded transaction, and only after `_verify_signed_transaction`
+                # proved those decoded values equal the authorized intent. Copying the intent
+                # here instead would compare the approval against itself.
                 binding={
                     "network": str(network).lower(),
                     "chain_id": str(decoded.chain_id),
                     "wallet": str(authorization.wallet_address).lower(),
                     "to": str(decoded.to),
                     "value_wei": str(decoded.value),
+                    "data": decoded.data_hex,
+                    "gas_limit": str(decoded.gas_limit),
                     "tx_hash": "0x" + keccak(raw_bytes).hex(),
                     "estimated_cost_usd": repr(float(authorization.estimated_cost_usd)),
                 },
@@ -602,7 +755,7 @@ class TransactionEngine:
             approved = False
         if approved is not True:
             raise TransactionRejected(
-                "Broadcast requires an approval that the server can verify for this exact "
+                "Broadcast requires an authorization that the server can verify for this exact "
                 "transaction; none was found.",
                 "HUMAN_APPROVAL_REQUIRED",
             )

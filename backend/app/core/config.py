@@ -252,13 +252,25 @@ class Settings(BaseSettings):
             "spending limit atomically."
         ),
     )
-    MAX_TRANSACTION_VALUE_USD: float = Field(
-        default=50.0,
-        description="Hard spending ceiling for any individual on-chain transaction",
+    MAX_TRANSACTION_VALUE_USD: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional operator-set ceiling on any individual on-chain transaction, in USD. "
+            "Unset (the default) means no application-imposed transaction amount cap: a "
+            "legitimate autonomous transfer is never refused for being large. Set a number "
+            "to have the spend ledger enforce it atomically across processes. Value-moving "
+            "authority itself is governed by the autonomous policy, not by this number."
+        ),
     )
-    MAX_DAILY_GAS_SPEND_USD: float = Field(
-        default=25.0,
-        description="Cumulative 24-hour limit on gas fees",
+    MAX_DAILY_GAS_SPEND_USD: Optional[float] = Field(
+        default=None,
+        description=(
+            "Optional operator-set ceiling on cumulative 24-hour spend, in USD. Unset (the "
+            "default) means no application-imposed daily spend cap. Spend is still recorded "
+            "in the ledger for accounting and for reconciling an ambiguous broadcast, so a "
+            "ceiling can be turned on later without losing history. There is no daily "
+            "transaction-count cap anywhere in the platform."
+        ),
     )
     MAX_CONCURRENT_TASKS: int = Field(
         default=5,
@@ -522,6 +534,18 @@ class Settings(BaseSettings):
     @classmethod
     def _blank_prose_cap_means_unset(cls, value: Any) -> Any:
         if isinstance(value, str) and value.strip().lower() in ("", "none", "null"):
+            return None
+        return value
+
+    @field_validator("MAX_TRANSACTION_VALUE_USD", "MAX_DAILY_GAS_SPEND_USD", mode="before")
+    @classmethod
+    def _blank_spend_ceiling_means_unset(cls, value: Any) -> Any:
+        """`MAX_TRANSACTION_VALUE_USD=` (blank) or `none` means no ceiling.
+
+        These are optional operator ceilings, not platform policy. An operator who
+        leaves one blank must not silently inherit a built-in cap they never set.
+        """
+        if isinstance(value, str) and value.strip().lower() in ("", "none", "null", "unlimited"):
             return None
         return value
 

@@ -9,8 +9,10 @@ This module is that verifier, plus the service the API and the agent use to requ
 an approval in the first place. Two rules shape it:
 
 * An approval is bound to one transaction (network, chain id, wallet, destination,
-  value, signed-payload hash). Approving "send some ETH" is not a thing; the operator
-  approves a specific, quoted transfer.
+  value, calldata, gas limit). Approving "send some ETH" is not a thing; the operator
+  approves a specific, quoted transfer. The engine decodes the signed bytes and states
+  those fields from what it actually decoded, never from this dictionary, so the
+  comparison below is between what was authorized and what is about to be sent.
 * Approving one transfer never authorises another, and an approval can never be
   replayed. `verify_and_consume` is a single conditional UPDATE, so two concurrent
   broadcasts of the same approval cannot both win.
@@ -67,13 +69,24 @@ def canonical_binding(binding: Mapping[str, Any]) -> Dict[str, str]:
     """Normalise a binding for exact comparison.
 
     Addresses are case-folded because `to` may arrive checksummed from the decoder and
-    lowercase from configuration; everything else is stringified verbatim so `1` and
-    `"1"` cannot compare differently.
+    lowercase from configuration; calldata is case-folded for the same reason - hex digit
+    case is not semantic, and `0xA9059CBB` and `0xa9059cbb` are the same bytes, so
+    comparing them verbatim would refuse a correct transfer whenever an encoder and the
+    decoder disagreed on case. Everything else is stringified verbatim so `1` and `"1"`
+    cannot compare differently.
     """
+    from backend.app.transactions.engine import canonical_calldata
+
     out: Dict[str, str] = {}
     for key, value in binding.items():
+        name = str(key)
         text = "" if value is None else str(value)
-        out[str(key)] = text.strip().lower() if str(key) in ("wallet", "to") else text
+        if name in ("wallet", "to"):
+            out[name] = text.strip().lower()
+        elif name == "data":
+            out[name] = canonical_calldata(text)
+        else:
+            out[name] = text
     return out
 
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -253,8 +254,10 @@ class PlanningError(Exception):
 class PlanConstraints:
     """Hard limits a plan must respect. Enforced in code, not by the prompt."""
 
-    max_cost_usd: float = field(default_factory=lambda: settings.MAX_TRANSACTION_VALUE_USD)
-    max_daily_spend_usd: float = field(default_factory=lambda: settings.MAX_DAILY_GAS_SPEND_USD)
+    max_cost_usd: Optional[float] = field(default_factory=lambda: settings.MAX_TRANSACTION_VALUE_USD)
+    max_daily_spend_usd: Optional[float] = field(
+        default_factory=lambda: settings.MAX_DAILY_GAS_SPEND_USD
+    )
     spent_already_usd: float = 0.0
     max_duration_minutes: int = 240
     deadline: Optional[datetime] = None
@@ -270,14 +273,34 @@ class PlanConstraints:
     allowed_networks: Set[str] = field(default_factory=lambda: {"ethereum", "arbitrum", "optimism", "base", "polygon", "sepolia"})
 
     def remaining_budget_usd(self) -> float:
-        return max(0.0, min(self.max_cost_usd, self.max_daily_spend_usd - self.spent_already_usd))
+        """The budget left for a plan, or ``inf`` when no ceiling is configured.
+
+        Both ceilings default to unset, so an unconstrained plan is not trimmed for a
+        budget nobody asked for. An operator who sets either one gets it applied here
+        exactly as before.
+        """
+        limits = [
+            limit
+            for limit in (
+                self.max_cost_usd,
+                self.max_daily_spend_usd - self.spent_already_usd,
+            )
+            if limit is not None
+        ]
+        if not limits:
+            return math.inf
+        return max(0.0, min(limits))
 
     def to_dict(self) -> Dict[str, Any]:
+        remaining = self.remaining_budget_usd()
         return {
             "max_cost_usd": self.max_cost_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "spent_already_usd": self.spent_already_usd,
-            "remaining_budget_usd": self.remaining_budget_usd(),
+            # `inf` is not JSON-representable and would render as `Infinity`; say
+            # "unbounded" instead of inventing a number.
+            "remaining_budget_usd": None if math.isinf(remaining) else remaining,
+            "budget_is_unbounded": math.isinf(remaining),
             "max_duration_minutes": self.max_duration_minutes,
             "deadline": self.deadline.isoformat() if self.deadline else None,
             "max_steps": self.max_steps,

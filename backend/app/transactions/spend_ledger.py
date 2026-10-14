@@ -50,12 +50,16 @@ class SpendLimitExceeded(Exception):
 
 
 class SpendLedger:
-    """Durable reservations against the rolling daily spend limit."""
+    """Durable reservations of attempted spend over a rolling 24-hour window.
+
+    The ledger is accounting and idempotency infrastructure, not a cap. It enforces a
+    ceiling only when one is passed in; the platform configures none by default, so a
+    legitimate large transfer is never refused for being large.
+    """
 
     def __init__(self, path: Optional[str] = None, clock: Callable[[], float] = time.time) -> None:
         self._explicit_path = path
         self._clock = clock
-        self._initialised_for: Optional[Path] = None
 
     # ------------------------------------------------------------------
     @property
@@ -68,20 +72,24 @@ class SpendLedger:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), timeout=30, isolation_level=None)
         try:
-            if self._initialised_for != path:
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS spend_reservations ("
-                    " id TEXT PRIMARY KEY,"
-                    " amount_usd REAL NOT NULL,"
-                    " status TEXT NOT NULL,"
-                    " created_at REAL NOT NULL,"
-                    " updated_at REAL NOT NULL,"
-                    " ref TEXT)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS ix_spend_created ON spend_reservations(created_at)"
-                )
-                self._initialised_for = path
+            # `CREATE ... IF NOT EXISTS` on every connection rather than once per path.
+            # A path is not proof that the table is there: the file can be rotated,
+            # restored from a backup, or deleted while the process is running, and a
+            # cached "I already created it" flag then turned every later reservation
+            # into `no such table: spend_reservations`. The statement is a cheap no-op
+            # when the table exists, so correctness costs nothing here.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS spend_reservations ("
+                " id TEXT PRIMARY KEY,"
+                " amount_usd REAL NOT NULL,"
+                " status TEXT NOT NULL,"
+                " created_at REAL NOT NULL,"
+                " updated_at REAL NOT NULL,"
+                " ref TEXT)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_spend_created ON spend_reservations(created_at)"
+            )
             yield conn
         finally:
             conn.close()
@@ -104,20 +112,26 @@ class SpendLedger:
         self,
         amount_usd: float,
         *,
-        per_transaction_limit: float,
-        daily_limit: float,
+        per_transaction_limit: Optional[float],
+        daily_limit: Optional[float],
         ref: Optional[str] = None,
     ) -> str:
-        """Atomically check both limits and record a reservation. Returns its id."""
+        """Atomically check any configured ceilings and record a reservation.
+
+        A ``None`` limit means the operator configured no ceiling for it, so nothing is
+        refused on that basis; the reservation is still recorded, because it is the
+        durable evidence of what was attempted and what an ambiguous outcome keeps
+        counting against. There is no built-in default ceiling: imposing one here would
+        be a fixed application-level cap that no operator asked for.
+        """
         if amount_usd is None or amount_usd != amount_usd or amount_usd < 0:
             raise SpendLimitExceeded(
                 f"Invalid estimated cost: {amount_usd!r}.", "INVALID_COST"
             )
-        if amount_usd > per_transaction_limit:
+        if per_transaction_limit is not None and amount_usd > per_transaction_limit:
             raise SpendLimitExceeded(
                 f"Estimated transaction cost ${amount_usd:.2f} exceeds the per-transaction "
-                f"limit of ${per_transaction_limit:.2f}.",
-                "LIMIT_EXCEEDED",
+                f"limit of ${per_transaction_limit:.2f}.", "LIMIT_EXCEEDED",
             )
 
         now = self._clock()
@@ -127,14 +141,14 @@ class SpendLedger:
             # read the total and insert between our check and our insert.
             conn.execute("BEGIN IMMEDIATE")
             try:
-                projected = self._window_total(conn, now - WINDOW_SECONDS) + amount_usd
-                if projected > daily_limit:
-                    conn.execute("ROLLBACK")
-                    raise SpendLimitExceeded(
-                        f"Projected daily spend ${projected:.2f} exceeds the daily limit of "
-                        f"${daily_limit:.2f}.",
-                        "DAILY_LIMIT_EXCEEDED",
-                    )
+                if daily_limit is not None:
+                    projected = self._window_total(conn, now - WINDOW_SECONDS) + amount_usd
+                    if projected > daily_limit:
+                        conn.execute("ROLLBACK")
+                        raise SpendLimitExceeded(
+                            f"Projected daily spend ${projected:.2f} exceeds the daily limit of "
+                            f"${daily_limit:.2f}.", "DAILY_LIMIT_EXCEEDED",
+                        )
                 conn.execute(
                     "INSERT INTO spend_reservations (id, amount_usd, status, created_at, updated_at, ref) "
                     "VALUES (?, ?, ?, ?, ?, ?)",

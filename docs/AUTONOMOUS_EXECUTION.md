@@ -97,7 +97,7 @@ Each rule can bound itself:
 | Field | Effect |
 |---|---|
 | `max_value_native` | Ceiling on the amount, in the native coin. `"0.05"` means 0.05 ETH. |
-| `max_value_usd` | Ceiling in USD. **Unset defers to your existing `MAX_TRANSACTION_VALUE_USD`.** No new limit is invented. |
+| `max_value_usd` | Ceiling in USD. Unset defers to the operator's `MAX_TRANSACTION_VALUE_USD`, which is itself unset by default. If neither is set there is no USD ceiling at all. No new limit is ever invented. |
 | `allowed_networks` | Only these chains. Omitting the network on a restricted rule is refused, not allowed. |
 | `allowed_tokens` | Only these ERC-20 symbols. |
 | `allowed_destinations` | Only these addresses. |
@@ -216,8 +216,9 @@ Autonomy removes the human from the loop. It does not remove consequences:
 
 - A rule that is too broad is acted on immediately and unattended. Start narrow
   (`web.fetch`, `campaign.research`), confirm behaviour, then widen deliberately.
-- `max_value_native` is per transfer, not per day. The existing rolling 24-hour
-  `MAX_DAILY_GAS_SPEND_USD` still applies on top of it.
+- `max_value_native` is per transfer, not per day. If you configure the rolling 24-hour
+  `MAX_DAILY_GAS_SPEND_USD` it applies on top; it is unset by default, and there is no
+  daily transaction-count cap anywhere in the platform.
 - An autonomous approval is bound to the transaction it was issued for. It is not a
   standing permission.
 - Watch `GET /api/v1/agent/autonomy` and the audit log after enabling. Approvals

@@ -87,11 +87,26 @@ Enforced in `transactions/engine.py`, not in prompts:
 
 | Limit | Variable | Default |
 |---|---|---|
-| Per transaction | `MAX_TRANSACTION_VALUE_USD` | $50 |
-| Rolling 24h | `MAX_DAILY_GAS_SPEND_USD` | $25 |
-| Confirmation threshold | `REQUIRE_CONFIRMATION_ABOVE_USD` | $100 |
+| Per transaction | `MAX_TRANSACTION_VALUE_USD` | unset (no ceiling) |
+| Rolling 24h | `MAX_DAILY_GAS_SPEND_USD` | unset (no ceiling) |
 
-`check_spend_limits()` rejects before signing. `record_spend()` accumulates actual cost.
+**There is no fixed application-level transaction amount cap and no daily
+transaction-count cap.** Both ceilings above are optional operator settings: leave them
+blank (or `none` / `unlimited`) and the platform imposes no dollar ceiling at all, so a
+legitimate large autonomous transfer is never refused for being large. Set a number and it
+is enforced atomically across processes by the spend ledger. Spend is recorded either way,
+so a ceiling can be turned on later without losing history.
+
+What the agent is *allowed* to send is governed by the autonomous policy
+(`AUTONOMOUS_POLICY`): networks, source wallets, destinations, tokens and per-rule
+amounts. The Emergency Stop overrides all of it.
+
+`check_spend_limits()` rejects before signing when a ceiling is configured.
+`record_spend()` accumulates actual cost.
+
+`REQUIRE_CONFIRMATION_ABOVE_USD` is declared in settings but is not read anywhere: there
+is no code path that consults it. Approval is transaction-bound rather than amount-based -
+see [AUTONOMOUS_EXECUTION.md](AUTONOMOUS_EXECUTION.md).
 
 **Token prices are never invented.** `estimate_gas()` returns native-denominated cost plus a
 note that USD requires an external price source.

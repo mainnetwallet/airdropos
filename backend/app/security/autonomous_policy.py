@@ -118,9 +118,9 @@ class Rule:
     rule_id: str
     category: str
     action: str = ACTION_ALLOW
-    # Ceilings. None means "defer to the platform's existing configured limit"
-    # (settings.MAX_TRANSACTION_VALUE_USD / MAX_DAILY_GAS_SPEND_USD), never a
-    # number invented here.
+    # Ceilings. None means "no application-imposed ceiling on this rule": the operator
+    # configures limits in settings (MAX_TRANSACTION_VALUE_USD / MAX_DAILY_GAS_SPEND_USD),
+    # which are themselves unset by default. A number here is never invented.
     max_value_usd: Optional[float] = None
     max_value_native: Optional[str] = None
     allowed_networks: Optional[List[str]] = None
@@ -383,15 +383,15 @@ class AutonomousPolicy:
                 )
 
         if value_usd is not None:
+            # An unset ceiling defers to the operator's own configured limit. If that is
+            # also unset there is no application-imposed USD cap at all, and the policy's
+            # own allow/deny decision stands on its own.
             ceiling = rule.max_value_usd
+            source = f"rule '{rule.rule_id}'"
             if ceiling is None:
-                ceiling = float(settings.MAX_TRANSACTION_VALUE_USD)
-            if value_usd > ceiling:
-                source = (
-                    f"rule '{rule.rule_id}'"
-                    if rule.max_value_usd is not None
-                    else "MAX_TRANSACTION_VALUE_USD"
-                )
+                ceiling = settings.MAX_TRANSACTION_VALUE_USD
+                source = "MAX_TRANSACTION_VALUE_USD"
+            if ceiling is not None and value_usd > ceiling:
                 return (
                     f"Value ${value_usd:.2f} exceeds the ${ceiling:.2f} limit from {source}."
                 )

@@ -37,11 +37,12 @@ from backend.app.blockchain.tokens import (
     resolve_token,
 )
 from backend.app.database.session import session_scope
-from backend.app.models import Wallet as WalletRow
+from backend.app.models import BlockchainTransaction, Wallet as WalletRow
 from backend.app.security.autonomous_policy import get_policy, is_policy_approver
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
 from backend.app.tools.wallet_tools import resolve_wallet
+from backend.app.transactions import history
 from backend.app.transactions.approvals import ApprovalService, intent_fingerprint
 from backend.app.transactions.engine import (
     SubmissionAuthorization,
@@ -733,9 +734,6 @@ class SubmitPreparedTransferTool(BaseTool):
                     f"ask the operator to approve it first.",
                     category="APPROVAL_UNKNOWN",
                 )
-            ok, reason = ApprovalService.evaluate(approval)
-            if not ok:
-                return ToolResult.failure(reason, category="APPROVAL_INVALID")
             # `approved_by` is optional. When supplied it must match the approval; when
             # omitted the approval's own identity is used. Either way the value comes
             # from the stored row, so the caller cannot assert someone else's approval.
@@ -748,9 +746,45 @@ class SubmitPreparedTransferTool(BaseTool):
             binding = dict(approval.binding or {})
             approved_by = str(approval.approved_by)
 
+            if binding.get("network") != chain.name:
+                return ToolResult.failure(
+                    f"This approval was issued for '{binding.get('network')}', not "
+                    f"'{chain.name}'.",
+                    category="APPROVAL_CHAIN_MISMATCH",
+                )
+            wallet_address = str(approval.wallet_address)
+
+            # "Was this exact transfer already sent?" is asked before "is this approval
+            # still usable?". A consumed approval is the normal state after a successful
+            # broadcast, so checking usability first would answer a duplicate request with
+            # a bare "already used" and hide the transaction that actually exists. Neither
+            # ordering can send twice - both refuse to sign - but this one can tell the
+            # caller what happened instead of only that something did.
+            prior_row = await history.find_in_flight(
+                db,
+                network=chain.name,
+                from_address=wallet_address,
+                to_address=str(binding.get("to") or ""),
+                value_wei=int(binding.get("value_wei") or 0),
+                data=binding.get("data") or "0x",
+            )
+            prior_status = None
+            if prior_row is not None and prior_row.tx_hash:
+                prior_status = await history.reconcile(db, engine, prior_row)
+            prior_hash = (
+                prior_row.tx_hash
+                if (prior_row is not None and prior_row.tx_hash)
+                else await approvals.already_broadcast(binding)
+            )
+
+            if not prior_hash:
+                ok, reason = ApprovalService.evaluate(approval)
+                if not ok:
+                    return ToolResult.failure(reason, category="APPROVAL_INVALID")
+
             # An autonomous approval is re-authorized against the live policy here,
             # immediately before signing, so a rule narrowed since approval stops it.
-            if is_policy_approver(approved_by):
+            if not prior_hash and is_policy_approver(approved_by):
                 category = transfer_category(binding)
                 decision = get_policy().evaluate(
                     category,
@@ -765,40 +799,32 @@ class SubmitPreparedTransferTool(BaseTool):
                         f"{decision.reason}",
                         category="POLICY_DENIED",
                     )
-            wallet_address = str(approval.wallet_address)
 
-            if binding.get("network") != chain.name:
-                return ToolResult.failure(
-                    f"This approval was issued for '{binding.get('network')}', not "
-                    f"'{chain.name}'.",
-                    category="APPROVAL_CHAIN_MISMATCH",
+            if not prior_hash:
+                wallet_row = await _load_signer(db, wallet_address)
+                if wallet_row is None:
+                    return ToolResult.failure(
+                        f"No wallet is registered at {wallet_address}, so nothing can sign.",
+                        category="WALLET_UNKNOWN",
+                    )
+                service = WalletService(db)
+                if not service.can_sign(wallet_row):
+                    return ToolResult.failure(
+                        f"Wallet '{wallet_row.label}' cannot sign right now (locked, inactive, or "
+                        f"no usable key material).",
+                        category="WALLET_LOCKED",
+                    )
+                material = (
+                    wallet_row.encrypted_secret,
+                    wallet_row.encryption_iv,
+                    wallet_row.encryption_tag,
                 )
+                wallet_label = wallet_row.label
+                wallet_row_id = wallet_row.id
+                # Attribute the broadcast to the task that asked for it, when the approval
+                # names one. Taken from the stored approval, never from the tool call.
+                approval_task_id = approval.task_id
 
-            wallet_row = await _load_signer(db, wallet_address)
-            if wallet_row is None:
-                return ToolResult.failure(
-                    f"No wallet is registered at {wallet_address}, so nothing can sign.",
-                    category="WALLET_UNKNOWN",
-                )
-            service = WalletService(db)
-            if not service.can_sign(wallet_row):
-                return ToolResult.failure(
-                    f"Wallet '{wallet_row.label}' cannot sign right now (locked, inactive, or "
-                    f"no usable key material).",
-                    category="WALLET_LOCKED",
-                )
-            material = (
-                wallet_row.encrypted_secret,
-                wallet_row.encryption_iv,
-                wallet_row.encryption_tag,
-            )
-            wallet_label = wallet_row.label
-
-        # A repeat of an already-sent transfer must not send again. The hash is
-        # recorded at broadcast time (before any receipt wait), so this check is
-        # accurate even if the previous attempt never got to confirm.
-        async with session_scope() as db:
-            prior_hash = await ApprovalService(db).already_broadcast(binding)
         if prior_hash:
             return ToolResult.success(
                 data={
@@ -807,18 +833,26 @@ class SubmitPreparedTransferTool(BaseTool):
                     "wallet_address": wallet_address,
                     "to": binding.get("to"),
                     "value_wei": binding.get("value_wei"),
-                    "status": "ALREADY_BROADCAST",
+                    "status": prior_status or "ALREADY_BROADCAST",
                     "resent": False,
                     "note": (
                         "This exact transfer was already broadcast as "
                         f"{prior_hash}. Nothing was signed or sent again."
+                        + (
+                            f" It is now recorded as {prior_status}."
+                            if prior_status
+                            else " Its settlement has not been determined yet."
+                        )
                     ),
                 },
                 evidence={
-                    "authoritative": False,
+                    # Only a settled receipt is authoritative. Reporting the earlier
+                    # broadcast as proof would be exactly the "pending == confirmed"
+                    # claim this is meant to prevent.
+                    "authoritative": prior_status == history.STATUS_CONFIRMED,
                     "kind": "chain_receipt",
                     "tx_hash": prior_hash,
-                    "status": "ALREADY_BROADCAST",
+                    "status": prior_status or "ALREADY_BROADCAST",
                 },
             )
 
@@ -840,6 +874,35 @@ class SubmitPreparedTransferTool(BaseTool):
         if mismatch:
             return ToolResult.failure(mismatch, category="APPROVAL_BINDING_MISMATCH")
 
+        # Record the intent before sending. If the process dies between here and the
+        # broadcast, the row is still here saying "signed, nothing sent", which is a
+        # different and truthful answer from "sent".
+        try:
+            async with session_scope() as db:
+                tx_row = await history.record_signed(
+                    db,
+                    wallet_id=wallet_row_id,
+                    network=chain.name,
+                    chain_id=chain.chain_id,
+                    from_address=wallet_address,
+                    to_address=str(binding.get("to") or ""),
+                    value_wei=int(binding.get("value_wei") or 0),
+                    data=binding.get("data") or "0x",
+                    gas_limit=int(binding.get("gas_limit") or 0),
+                    task_id=approval_task_id,
+                )
+                tx_row_id = tx_row.id
+        except Exception as exc:
+            # Nothing has been sent yet, so refusing here costs nothing and avoids a
+            # transfer this deployment would not be able to account for.
+            logger.error("Could not record the transfer intent: %s", exc)
+            return ToolResult.failure(
+                "The transfer could not be recorded before sending, so it was not signed "
+                f"or broadcast: {exc}",
+                category="PERSISTENCE_FAILED",
+                retryable=False,
+            )
+
         try:
             tx_hash = await engine.submit_raw(
                 chain.name,
@@ -852,9 +915,18 @@ class SubmitPreparedTransferTool(BaseTool):
                     approval_id=str(params["approval_id"]),
                     human_approved=True,
                     allowed_destinations=frozenset({str(binding.get("to", "")).lower()}),
+                    # The authorized intent, verified field-by-field against the decoded
+                    # signed transaction inside the engine before anything is sent.
+                    expected_chain_id=chain.chain_id,
+                    expected_to=str(binding.get("to") or ""),
+                    expected_value_wei=int(binding.get("value_wei") or 0),
+                    expected_data=binding.get("data") or "0x",
+                    expected_gas_limit=int(binding.get("gas_limit") or 0),
                 ),
             )
         except Exception as exc:
+            async with session_scope() as db:
+                await _settle_unbroadcast(db, tx_row_id, exc)
             return ToolResult.failure(
                 f"{type(exc).__name__}: {exc}",
                 category=getattr(exc, "category", "BROADCAST_FAILED"),
@@ -867,9 +939,22 @@ class SubmitPreparedTransferTool(BaseTool):
                 await ApprovalService(db).record_broadcast(
                     str(params["approval_id"]), tx_hash, "SUBMITTED"
                 )
+                recorded = await db.get(BlockchainTransaction, tx_row_id)
+                if recorded is not None:
+                    await history.record_submitted(db, recorded, tx_hash)
         except Exception as exc:
+            # The node already has this transaction. Reporting success without a durable
+            # record would let a retry send it a second time, so this is a failure - and
+            # an explicit, non-retryable one that carries the hash.
             logger.error("Could not record broadcast hash for approval %s: %s",
                          params["approval_id"], exc)
+            return ToolResult.failure(
+                f"The transaction WAS broadcast as {tx_hash}, but that hash could not be "
+                f"recorded ({exc}). It must not be sent again; reconcile it by hash.",
+                data={"tx_hash": tx_hash, "network": chain.name, "status": "UNRECORDED"},
+                category="BROADCAST_UNRECORDED",
+                retryable=False,
+            )
 
         result: Dict[str, Any] = {
             "tx_hash": tx_hash,
@@ -899,6 +984,18 @@ class SubmitPreparedTransferTool(BaseTool):
         result["receipt"] = receipt
         result["status"] = receipt.get("status", "PENDING")
 
+        # Settle the durable record from the same receipt that decides the answer here,
+        # so what is stored and what is reported can never disagree.
+        try:
+            async with session_scope() as db:
+                recorded = await db.get(BlockchainTransaction, tx_row_id)
+                if recorded is not None:
+                    await history.record_receipt(
+                        db, recorded, None if result["status"] == "PENDING" else receipt
+                    )
+        except Exception as exc:
+            logger.error("Could not record the receipt for %s: %s", tx_hash, exc)
+
         if result["status"] == "CONFIRMED":
             return ToolResult.success(
                 data=result,
@@ -916,6 +1013,20 @@ class SubmitPreparedTransferTool(BaseTool):
                 data=result,
                 error="Broadcast, but not mined yet. Submission alone does not prove success.",
                 error_category="TX_PENDING",
+                evidence={"authoritative": False, "kind": "chain_receipt", "tx_hash": tx_hash},
+            )
+        if result["status"] == "UNKNOWN":
+            # Not a success and not a failure: the platform genuinely does not know.
+            # Reporting either would be a claim the evidence does not support.
+            return ToolResult(
+                status=ToolResultStatus.SUCCESS,
+                data=result,
+                error=(
+                    "The transaction was broadcast but the RPC endpoint could not be reached, "
+                    "so its outcome is unknown. It may already be mined; check again with "
+                    "check_transaction_receipt before treating it as failed."
+                ),
+                error_category="TX_OUTCOME_UNKNOWN",
                 evidence={"authoritative": False, "kind": "chain_receipt", "tx_hash": tx_hash},
             )
         return ToolResult(
@@ -940,6 +1051,35 @@ async def _load_signer(db, address: str):
     )
 
 
+async def _settle_unbroadcast(db, tx_row_id, exc: BaseException) -> None:
+    """Record the outcome of a broadcast attempt that raised.
+
+    The distinction that matters is whether the node could have taken the transaction.
+    A refusal that happened before the RPC call - a refused approval, a binding
+    mismatch, the emergency stop - means nothing was sent and the attempt is FAILED. An
+    RPC timeout or a dropped connection is ambiguous: the node may have accepted it, so
+    the row stays in flight and is reconciled against the chain instead of being
+    declared failed.
+    """
+    try:
+        row = await db.get(BlockchainTransaction, tx_row_id)
+        if row is None:
+            return
+        category = str(getattr(exc, "category", "") or "")
+        if category in ("RPC_FAILURE", "RPC_ERROR", "NO_RPC", "NO_TX_HASH", "RPC_MALFORMED"):
+            logger.warning(
+                "Broadcast outcome for transaction %s is unknown (%s); it stays in flight "
+                "and will be reconciled from the chain.",
+                tx_row_id, category or type(exc).__name__,
+            )
+            return
+        await history.record_failure(
+            db, row, f"{type(exc).__name__}: {exc}", category or "BROADCAST_FAILED"
+        )
+    except Exception as record_exc:  # never mask the original failure
+        logger.error("Could not record the broadcast failure for %s: %s", tx_row_id, record_exc)
+
+
 def _checksum(address: Optional[str]) -> Optional[str]:
     """EIP-55 form, which `eth_account` requires for `to`.
 
@@ -962,33 +1102,54 @@ def _checksum(address: Optional[str]) -> Optional[str]:
 
 
 async def _sign(binding: Dict[str, Any], chain, wallet_address: str, material) -> str:
-    """Sign the approved transaction locally. Nothing is broadcast here."""
-    nonce = await engine.get_nonce(chain.name, wallet_address)
-    gas_limit = int(binding.get("gas_limit") or 0)
-    gas_price_wei = await engine._rpc(chain.name, "eth_gasPrice", [])
-    gas_price = int(gas_price_wei, 16)
-    if gas_limit <= 0:
-        gas_limit = 21_000 if not (binding.get("data") or "0x") or binding["data"] == "0x" else 90_000
+    """Sign the approved transaction locally. Nothing is broadcast here.
 
-    result = vault.sign_transaction(
-        SigningRequest(
-            wallet_address=_checksum(wallet_address),
-            chain_id=chain.chain_id,
-            transaction={
-                "to": _checksum(binding.get("to")),
-                "value": int(binding.get("value_wei") or 0),
-                "data": binding.get("data") or "0x",
-                "gas": gas_limit,
-                "gasPrice": gas_price,
-                "nonce": nonce,
-                "chainId": chain.chain_id,
-            },
-        ),
-        material[0],
-        material[1],
-        material[2],
-        authorized_addresses={wallet_address},
-    )
+    The nonce is reserved before signing so two concurrent workers cannot pick the same
+    one, and the reservation is given back if signing fails. An ambiguous outcome keeps
+    it: a signed transaction whose broadcast result was never seen must not have its
+    nonce handed to a different transfer.
+    """
+    from backend.app.transactions.engine import nonce_manager
+
+    gas_limit = int(binding.get("gas_limit") or 0)
+    if gas_limit <= 0:
+        # No fallback figure. The engine binds the gas limit of the signed bytes to the
+        # authorized intent, so signing with a guessed one would either be refused at
+        # broadcast or, worse, match an approval that never stated it.
+        raise TransactionRejected(
+            "This approval does not state a gas limit, so no transaction can be signed for "
+            "it. Prepare the transfer first, which quotes a real gas limit.",
+            "GAS_LIMIT_NOT_AUTHORIZED",
+        )
+
+    nonce = await engine.get_nonce(chain.name, wallet_address)
+    nonce_manager.reserve(chain.name, wallet_address, nonce)
+    try:
+        gas_price_wei = await engine._rpc(chain.name, "eth_gasPrice", [])
+        gas_price = int(gas_price_wei, 16)
+
+        result = vault.sign_transaction(
+            SigningRequest(
+                wallet_address=_checksum(wallet_address),
+                chain_id=chain.chain_id,
+                transaction={
+                    "to": _checksum(binding.get("to")),
+                    "value": int(binding.get("value_wei") or 0),
+                    "data": binding.get("data") or "0x",
+                    "gas": gas_limit,
+                    "gasPrice": gas_price,
+                    "nonce": nonce,
+                    "chainId": chain.chain_id,
+                },
+            ),
+            material[0],
+            material[1],
+            material[2],
+            authorized_addresses={wallet_address},
+        )
+    except BaseException:
+        nonce_manager.release(chain.name, wallet_address, nonce)
+        raise
     raw = str((result.signed_transaction or {}).get("raw") or "")
     return raw if raw.startswith("0x") else "0x" + raw
 
@@ -996,7 +1157,13 @@ async def _sign(binding: Dict[str, Any], chain, wallet_address: str, material) -
 def _assert_matches_approval(
     raw_tx: str, chain, binding: Dict[str, Any], wallet_address: str
 ) -> Optional[str]:
-    """Compare the signed bytes with the approved intent. Returns a reason, or None."""
+    """Compare the signed bytes with the approved intent. Returns a reason, or None.
+
+    Every field is read from the transaction itself. Nothing here is taken from the
+    approval: the approval says what was authorized, this says what is about to be sent.
+    """
+    from backend.app.transactions.engine import canonical_calldata
+
     try:
         decoded = decode_raw_transaction(raw_tx)
     except TransactionRejected as exc:
@@ -1017,24 +1184,38 @@ def _assert_matches_approval(
             f"The signed transaction moves {decoded.value} wei, but {binding.get('value_wei')} "
             f"wei was approved. Refusing to broadcast."
         )
-    approved_data = str(binding.get("data") or "0x").lower()
-    if ("0x" + decoded.data.hex()).lower() != approved_data:
+    if decoded.data_hex != canonical_calldata(binding.get("data") or "0x"):
         return (
             "The signed transaction's calldata does not match the approved calldata. "
             "Refusing to broadcast."
+        )
+    if decoded.gas_limit != int(binding.get("gas_limit") or 0):
+        return (
+            f"The signed transaction was signed with a gas limit of {decoded.gas_limit}, but "
+            f"{binding.get('gas_limit')} was approved. Refusing to broadcast."
         )
     return None
 
 
 async def _await_receipt(network: str, tx_hash: str, attempts: int = 4) -> Dict[str, Any]:
-    """Poll for a receipt. 'Still pending' is a real answer, never a success."""
+    """Poll for a receipt. 'Still pending' is a real answer, never a success.
+
+    Two different non-answers are kept apart on purpose. A node that answers "no receipt
+    yet" means the transaction is PENDING: it may still be mined. A node that could not
+    be reached at all means the outcome is UNKNOWN: nothing is known about the
+    transaction, and saying "not mined" would be a claim the platform never made.
+    """
     import asyncio
 
+    unreachable = 0
     for attempt in range(attempts):
         try:
             receipt = await engine.get_receipt(network, tx_hash)
         except TransactionRejected:
             receipt = None
+            unreachable += 1
+        else:
+            unreachable = 0
         if receipt is not None:
             try:
                 receipt["confirmations"] = await engine.get_confirmations(network, tx_hash)
@@ -1043,6 +1224,15 @@ async def _await_receipt(network: str, tx_hash: str, attempts: int = 4) -> Dict[
             return receipt
         if attempt < attempts - 1:
             await asyncio.sleep(3)
+    if unreachable >= attempts:
+        return {
+            "status": "UNKNOWN",
+            "confirmations": 0,
+            "note": (
+                "The RPC endpoint could not be reached, so the transaction's state is "
+                "unknown. It may already be mined. Check again with check_transaction_receipt."
+            ),
+        }
     return {
         "status": "PENDING",
         "confirmations": 0,

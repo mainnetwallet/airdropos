@@ -65,6 +65,10 @@ class AuthorizationPolicy:
         self.max_daily_spend_usd = (
             max_daily_spend_usd if max_daily_spend_usd is not None else settings.MAX_DAILY_GAS_SPEND_USD
         )
+        # Both are Optional: the platform ships with no fixed application-level amount or
+        # daily-spend cap, so `None` is a normal, truthful state here rather than a gap.
+        # Reported by `describe()` for the operator UI; enforcement, where configured, is
+        # done atomically by the spend ledger rather than here.
         # Deny-by-default: no wallet id is permitted unless explicitly listed.
         self.allowed_wallet_ids = {str(w).strip() for w in (allowed_wallet_ids or []) if str(w).strip()}
         self.allow_web_interaction = allow_web_interaction
