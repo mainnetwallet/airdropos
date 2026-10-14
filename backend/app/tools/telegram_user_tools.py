@@ -28,7 +28,7 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs
 
 from backend.app.core.config import settings
@@ -542,6 +542,48 @@ async def _recent_messages(client: Any, entity: Any, limit: int) -> List[Dict[st
     return [_describe_message(m) for m in reversed(list(messages))]
 
 
+_BUTTON_SEARCH_LIMIT = 15
+
+
+def _flat_buttons(msg: Any) -> List[Any]:
+    return [b for row in (getattr(msg, "buttons", None) or []) for b in row]
+
+
+async def _locate_button(
+    client: Any, entity: Any, wanted: str, message_id: Any
+) -> Tuple[Any, Any, List[Any]]:
+    """Find the message and button to press: (message, button, buttons_seen).
+
+    A planner writes its steps before the bot has answered, so it cannot know the id of the
+    message that will carry the button; requiring it made every click fail and sent the task
+    into a replan loop that never pressed anything. The id is therefore a hint: it is tried
+    first when given, then the recent messages are searched newest-first for a button whose
+    visible text matches EXACTLY. Nothing about what may be pressed is loosened - the button
+    kind checks still run on whatever is found, and only this chat is searched.
+    """
+    candidates: List[Any] = []
+    if message_id is not None:
+        hinted = await client.get_messages(entity, ids=int(message_id))
+        if hinted is not None:
+            candidates.append(hinted)
+    recent = await client.get_messages(entity, limit=_BUTTON_SEARCH_LIMIT)
+    seen_ids = {getattr(m, "id", None) for m in candidates}
+    for m in sorted(list(recent or []), key=lambda m: getattr(m, "id", 0), reverse=True):
+        if getattr(m, "id", None) not in seen_ids:
+            candidates.append(m)
+    first_seen: List[Any] = []
+    for msg in candidates:
+        flat = _flat_buttons(msg)
+        if flat and not first_seen:
+            first_seen = flat
+        button = next(
+            (b for b in flat if str(getattr(b, "text", "")).strip().lower() == wanted), None
+        )
+        if button is not None:
+            return msg, button, flat
+    return (candidates[0] if candidates else None), None, first_seen
+
+
 async def _wait_for_replies(client: Any, entity: Any, after_id: int, timeout: float = 10.0) -> List[Any]:
     """Poll until the other side answers (or the timeout passes)."""
     deadline = time.monotonic() + timeout
@@ -1037,9 +1079,11 @@ class TelegramClickButtonTool(BaseTool):
     name = "telegram_click_button"
     version = "1.0.0"
     description = (
-        "Press a button under a bot message (found via telegram_open_bot / telegram_read_messages). "
-        "Only plain and callback buttons are pressed; payment, phone/location sharing, mini-app and "
-        "link buttons are never pressed."
+        "Press a button under a bot message. Give the exact visible button_text; message_id is "
+        "OPTIONAL - when omitted (or when that message has no such button) the newest recent message "
+        "in the chat that carries a button with that exact text is pressed, so a plan never needs to "
+        "know a message id in advance. Only plain and callback buttons are pressed; payment, "
+        "phone/location sharing, mini-app and link buttons are never pressed."
     )
     required_permissions = ["telegram.interact"]
     side_effect = SideEffect.WEB_INTERACTION
@@ -1049,12 +1093,14 @@ class TelegramClickButtonTool(BaseTool):
         "type": "object",
         "properties": {
             "chat": {"type": "string", "description": "@name or t.me link", "maxLength": 300},
-            "message_id": {"type": "integer", "description": "Id of the message holding the button",
+            "message_id": {"type": "integer",
+                           "description": "Optional id of the message holding the button; omit it "
+                                          "unless it is already known from a read",
                            "minimum": 1},
             "button_text": {"type": "string", "description": "Exact visible text of the button",
                             "maxLength": 80},
         },
-        "required": ["chat", "message_id", "button_text"],
+        "required": ["chat", "button_text"],
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -1068,14 +1114,14 @@ class TelegramClickButtonTool(BaseTool):
 
         async def action(client: Any) -> ToolResult:
             entity = await client.get_entity(target["value"])
-            msg = await client.get_messages(entity, ids=int(params["message_id"]))
+            msg, button, flat = await _locate_button(
+                client, entity, wanted, params.get("message_id")
+            )
             if msg is None:
                 return ToolResult.failure("Message not found.", category="NOT_FOUND")
-            flat = [b for row in (getattr(msg, "buttons", None) or []) for b in row]
-            button = next((b for b in flat if str(getattr(b, "text", "")).strip().lower() == wanted), None)
             if button is None:
                 return ToolResult.failure(
-                    "No button with that text. Available: "
+                    "No button with that text in the recent messages. Available: "
                     + ", ".join(repr(str(getattr(b, "text", ""))) for b in flat[:12]),
                     category="NOT_FOUND",
                 )
@@ -1093,7 +1139,7 @@ class TelegramClickButtonTool(BaseTool):
                         "button_kind": kind,
                         "url": getattr(button, "url", None),
                         "chat": target["value"],
-                        "message_id": int(params["message_id"]),
+                        "message_id": msg.id,
                         "next_tools": ["telegram_detect_miniapp", "telegram_open_miniapp"],
                     },
                 )
@@ -1107,7 +1153,7 @@ class TelegramClickButtonTool(BaseTool):
                         "button": button.text,
                         "button_kind": kind,
                         "chat": target["value"],
-                        "message_id": int(params["message_id"]),
+                        "message_id": msg.id,
                     },
                 )
             answer = await msg.click(text=button.text)
@@ -1119,7 +1165,7 @@ class TelegramClickButtonTool(BaseTool):
                     "button_kind": kind,
                     "answer": sanitize_external_text(alert or "", 500)["text"] or None,
                     "chat": target["value"],
-                    "message_id": int(params["message_id"]),
+                    "message_id": msg.id,
                     "note": _UNTRUSTED_NOTE,
                 },
                 evidence=_evidence(

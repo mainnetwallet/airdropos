@@ -39,3 +39,16 @@ async def test_planner_commits_before_llm_call():
     planner = Planner(db)
     await planner._release_write_lock()
     db.commit.assert_awaited_once()
+
+
+def test_telegram_sentences_map_to_telegram_methods():
+    assert normalize_verification_method(
+        "check that recent messages and inline keyboard buttons are retrieved"
+    ) == "message_observed"
+    assert normalize_verification_method(
+        "bot messages read and message id with 'continue' button identified"
+    ) == "message_observed"
+    assert normalize_verification_method("continue button was clicked") == "button_clicked"
+    # names both a click and a message read: ambiguous, never guessed
+    text = "continue button clicked and bot messages show the next step"
+    assert normalize_verification_method(text) == text

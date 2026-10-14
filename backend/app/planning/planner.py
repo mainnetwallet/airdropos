@@ -323,6 +323,8 @@ _VERIFICATION_HINTS = (
     (("chain receipt", "transaction receipt", "tx receipt"), "chain_receipt"),
     (("tx hash", "transaction hash"), "tx_hash"),
     (("screenshot",), "screenshot"),
+    (("clicked", "pressed", "button click"), "button_clicked"),
+    (("messages", "message id", "inline keyboard", "bot reply", "bot response"), "message_observed"),
     (("http status", "status code"), "http_status"),
 )
 
@@ -395,8 +397,8 @@ Hard rules:
 12. "verification_method" MUST be one short identifier, not a sentence: chain_receipt,
     tx_hash, simulation, page_observation, post_action_observation, screenshot,
     visible_text, http_status, source_scan, notification_delivered, prepared_transfer,
-    contract_read, wallet_record, record_read, or tool_evidence. Put the detail of what
-    must be true in "expected_evidence", never in "verification_method".
+    contract_read, wallet_record, record_read, message_observed, button_clicked, or
+    tool_evidence. Put the detail of what must be true in "expected_evidence", never in "verification_method".
 13. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """
@@ -414,6 +416,14 @@ Hard rules:
 4. Prefer substituting an alternative tool over retrying a permanently failing one.
 5. If the goal is no longer achievable, set "abandon_objective": true and explain.
 6. Never propose exceeding the stated budget or deadline.
+7. "verification_method" MUST be one short identifier, not a sentence: chain_receipt,
+   tx_hash, simulation, page_observation, post_action_observation, screenshot,
+   visible_text, http_status, source_scan, notification_delivered, prepared_transfer,
+   contract_read, wallet_record, record_read, message_observed, button_clicked, or
+   tool_evidence. Put the detail in "expected_evidence", never in "verification_method".
+8. To press a bot button use telegram_click_button with the chat and the exact button_text.
+   Do NOT add a read step just to find a message id: message_id is optional and the tool
+   finds the newest message carrying that button itself.
 """
 
 
