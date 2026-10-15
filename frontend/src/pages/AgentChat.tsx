@@ -1,6 +1,6 @@
 /** AI Agent Console: natural-language chat with the central agent (dark "Agent Chat" screen on mobile). */
 
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useLocation } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -346,7 +346,7 @@ export default function AgentChat() {
   const [input, setInput] = useState(() => (location.state as { prompt?: string } | null)?.prompt ?? '')
   const [showInfo, setShowInfo] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
 
   const { data: info } = useQuery({ queryKey: ['agent-info'], queryFn: api.agentInfo })
   // Display only: every allow/deny is decided by the backend policy.
@@ -358,6 +358,16 @@ export default function AgentChat() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, pending])
+
+  // ChatGPT-style composer: the box grows with the text up to a cap, then scrolls.
+  useLayoutEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    const max = 200
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`
+    el.style.overflowY = el.scrollHeight > max ? 'auto' : 'hidden'
+  }, [input])
 
   const send = useMutation({
     mutationFn: ({
@@ -576,12 +586,12 @@ export default function AgentChat() {
 
         <form
           onSubmit={handleSubmit}
-          className="flex items-center gap-2 lg:border-t lg:border-surface-300 lg:pt-3"
+          className="flex items-end gap-2 lg:border-t lg:border-surface-300 lg:pt-3"
         >
           <textarea
-            ref={inputRef as unknown as React.Ref<HTMLTextAreaElement>}
+            ref={inputRef}
             rows={1}
-            className="max-h-40 min-h-[2.75rem] min-w-0 flex-1 resize-y rounded-full border border-surface-300 bg-surface-200 px-4 py-3 text-base text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none lg:rounded-lg lg:py-2 lg:text-sm"
+            className="max-h-[200px] min-h-[2.75rem] min-w-0 flex-1 resize-none rounded-3xl border border-surface-300 bg-surface-200 px-4 py-3 text-base text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none lg:rounded-lg lg:py-2 lg:text-sm"
             placeholder="Type a message…"
             aria-label="Message to the agent"
             enterKeyHint="send"
