@@ -858,8 +858,8 @@ class TelegramOpenBotTool(BaseTool):
                                 if b.get("text")
                             ][:20],
                             "chat_id": ref.get("chat_id"),
-                            "note": _UNTRUSTED_NOTE + " The chat already had messages, so /start was "
-                                    "NOT sent. Continue from the latest messages and buttons.",
+                            "safety_note": _UNTRUSTED_NOTE,
+                            "resume_info": "The chat already had messages, so /start was not sent.",
                         },
                         evidence=_evidence("bot_started", resumed=True, reply_count=len(history)),
                     )
@@ -884,7 +884,7 @@ class TelegramOpenBotTool(BaseTool):
                         if b.get("text")
                     ][:20],
                     "chat_id": ref.get("chat_id"),
-                    "note": _UNTRUSTED_NOTE,
+                    "safety_note": _UNTRUSTED_NOTE,
                 },
                 evidence=_evidence("bot_started", message_id=sent.id, reply_count=len(described)),
             )
@@ -979,7 +979,7 @@ class TelegramJoinChatTool(BaseTool):
                     "membership_verified": True,
                     "membership_method": how,
                     **_ref_payload(ref),
-                    "note": _UNTRUSTED_NOTE,
+                    "safety_note": _UNTRUSTED_NOTE,
                 },
                 evidence=_evidence(
                     "membership_verified",
@@ -1054,7 +1054,7 @@ class TelegramReadMessagesTool(BaseTool):
             return ToolResult.success(
                 data={"chat": display, "chat_id": ref.get("chat_id"),
                       "title": ref.get("title"), "messages": messages, "count": len(messages),
-                      "note": _UNTRUSTED_NOTE},
+                      "safety_note": _UNTRUSTED_NOTE},
                 evidence=_evidence("message_observed", chat_id=ref.get("chat_id"), count=len(messages)),
             )
 
@@ -1104,7 +1104,7 @@ class TelegramSendMessageTool(BaseTool):
             described = [_describe_message(m) for m in replies]
             return ToolResult.success(
                 data={"chat": target["value"], "sent_message_id": sent.id, "replies": described,
-                      "note": _UNTRUSTED_NOTE},
+                      "safety_note": _UNTRUSTED_NOTE},
                 evidence=_evidence("message_sent", message_id=sent.id, reply_count=len(described)),
             )
 
@@ -1202,7 +1202,7 @@ class TelegramClickButtonTool(BaseTool):
                     "answer": sanitize_external_text(alert or "", 500)["text"] or None,
                     "chat": target["value"],
                     "message_id": msg.id,
-                    "note": _UNTRUSTED_NOTE,
+                    "safety_note": _UNTRUSTED_NOTE,
                 },
                 evidence=_evidence(
                     "button_clicked", message_id=msg.id, button=button.text, button_kind=kind
@@ -1264,7 +1264,7 @@ class TelegramListDialogsTool(BaseTool):
                 if len(found) >= limit:
                     break
             return ToolResult.success(
-                data={"dialogs": found, "count": len(found), "note": _UNTRUSTED_NOTE},
+                data={"dialogs": found, "count": len(found), "safety_note": _UNTRUSTED_NOTE},
                 evidence=_evidence("dialog_listed", count=len(found)),
             )
 

@@ -100,7 +100,7 @@ class TelegramReturnToBotTool(BaseTool):
                     "messages": messages,
                     "count": len(messages),
                     "available_buttons": [b.get("text") for b in buttons if b.get("text")][:20],
-                    "note": _UNTRUSTED_NOTE,
+                    "safety_note": _UNTRUSTED_NOTE,
                 },
                 evidence=_evidence(
                     "message_observed", chat_id=ref.get("chat_id"), count=len(messages)
@@ -183,7 +183,7 @@ class TelegramWaitForReplyTool(BaseTool):
                     "replies": described,
                     "reply_count": len(described),
                     "timed_out": False,
-                    "note": _UNTRUSTED_NOTE,
+                    "safety_note": _UNTRUSTED_NOTE,
                 },
                 evidence=_evidence(
                     "message_observed", chat_id=ref.get("chat_id"), count=len(described)

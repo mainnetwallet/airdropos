@@ -68,7 +68,11 @@ REFERENCE_KEYS = (
 )
 
 # Keys whose text is free-form prose the extractor may need to read.
-PROSE_KEYS = ("messages", "text", "answer", "instructions", "body", "content", "note")
+# "note" is deliberately not here. It is the TOOL's own annotation (for example the reminder that
+# message text is untrusted), not third-party content. Read as prose, the extractor flagged that
+# reminder as an instruction aimed at the agent on every Telegram step and queued a false
+# "review before continuing" question each time, which also drove needless replans.
+PROSE_KEYS = ("messages", "text", "answer", "instructions", "body", "content")
 
 # Minimum free-text characters before a prose extraction is worth an LLM call. Below
 # this there is nothing to summarise, and an LLM call would be spent for nothing.
