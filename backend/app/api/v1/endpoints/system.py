@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.browser.controller import controller as browser_controller
@@ -657,14 +657,17 @@ async def delete_task(
 
     before = {"title": task.title, "status": task.status}
     public_id = task.task_id
-    # Core DELETE: the database cascades to plans, executions, checkpoints, events
-    # and evidence. (ORM delete would lazy-load relationships, which fails in async.)
+    # Core DELETEs, applied by hand so SQLite (which does not enforce foreign keys here) removes the
+    # plans, executions, checkpoints, events and evidence just as PostgreSQL's cascade does.
+    # (ORM delete would lazy-load relationships, which fails in async.)
     # The task's Agent Inbox conversations, messages and intervention requests go with it.
     # Removed explicitly: the database cannot be relied on to cascade (SQLite does not enforce
     # foreign keys here, and older Inbox tables were created without them), and a surviving
     # conversation would point at a task that no longer exists.
     inbox_removed = await ConversationService(db).delete_for_task(task.id)
-    await db.execute(delete(type(task)).where(type(task).id == task.id))
+    from backend.app.tasks.deletion import delete_task_cascade
+
+    await delete_task_cascade(db, task.id)
     before["inbox_removed"] = inbox_removed
     await write_audit(db, principal, "TASK_DELETE", "task", public_id, before_state=before)
     await db.commit()
