@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
@@ -600,6 +600,10 @@ async def retry_task(
     return {"task_id": task.task_id, "status": task.status, "retry_count": task.retry_count}
 
 
+# A run renews its lease every iteration; one idle this long is a dead worker, not a running one.
+LEASE_STALE_AFTER_MINUTES = 10
+
+
 @router.delete("/tasks/{task_id}", tags=["tasks"])
 async def delete_task(
     task_id: str,
@@ -624,21 +628,29 @@ async def delete_task(
             detail=f"Task {task.task_id} is {task.status}. Cancel it first, then delete it.",
         )
 
-    # A worker holding a live lease is still running this task (even if it was just cancelled and
-    # is finishing an LLM call). Deleting now would pull the row out from under it.
+    # A worker holding a live lease is still running this task (a cancelled run stops at its next
+    # iteration). Deleting now would pull the row out from under it. A lease that has not been
+    # renewed for a while belongs to a worker that died, so it must not block the delete for the
+    # rest of its 30 minute lifetime.
     from backend.app.models import ExecutionLease
 
+    now = datetime.now(timezone.utc)
+    recently_active = now - timedelta(minutes=LEASE_STALE_AFTER_MINUTES)
     live_lease = await db.scalar(
         select(func.count(ExecutionLease.id)).where(
             ExecutionLease.task_id == task.id,
             ExecutionLease.released_at.is_(None),
-            ExecutionLease.expires_at > datetime.now(timezone.utc),
+            ExecutionLease.expires_at > now,
+            func.coalesce(ExecutionLease.renewed_at, ExecutionLease.acquired_at) > recently_active,
         )
     )
     if live_lease:
         raise HTTPException(
             status_code=409,
-            detail=f"Task {task.task_id} is still being stopped by a worker. Try again in a few seconds.",
+            detail=(
+                f"Task {task.task_id} is still being stopped by a worker; it stops after the step "
+                "it is on. Try again in a minute."
+            ),
         )
 
     tx_count = await db.scalar(

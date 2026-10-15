@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.context import TaskContextService, action_fingerprint
@@ -294,6 +295,17 @@ class AgentController:
             # with no iterations left and it could never get past a budget exhaustion.
             run_limit = iteration + budget
             while iteration < run_limit:
+                # The operator can cancel (or delete) the task while this run is in flight. The
+                # cancel only changes the database row, so look at it before every iteration;
+                # without this the run carried on to the end of its budget after "Cancel".
+                stop_reason = await self._external_stop_reason(task)
+                if stop_reason:
+                    logger.info("Task %s stopped: %s", task.task_id, stop_reason)
+                    report.outcome = LoopOutcome.STOPPED
+                    report.blockers.append(stop_reason)
+                    report.duration_ms = int((time.perf_counter() - started) * 1000)
+                    return report  # the `finally` below releases the lease
+
                 iteration += 1
                 iteration_started = time.perf_counter()
 
@@ -360,6 +372,20 @@ class AgentController:
             return report
         finally:
             await self.leases.release(task, lease.lease_token)
+
+    # ------------------------------------------------------------------
+    async def _external_stop_reason(self, task: Task) -> Optional[str]:
+        """Why this run must stop right now, if the operator ended the task from outside.
+
+        Reads the committed status straight from the database (not the in-memory task, which is
+        the status this run started with). Returns None to carry on.
+        """
+        status = await self.db.scalar(select(Task.status).where(Task.id == task.id))
+        if status is None:
+            return "The task was deleted while it was running."
+        if status == TaskStatus.CANCELLED.value:
+            return "The task was cancelled by the operator."
+        return None
 
     # ------------------------------------------------------------------
     async def _settle_budget_exhausted(
