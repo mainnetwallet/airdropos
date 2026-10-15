@@ -25,6 +25,7 @@ from backend.app.tools.telegram_user_tools import (
     _describe_message,
     _evidence,
     _recent_messages,
+    _resolve_entity,
     _session,
     _wait_for_replies,
     parse_target,

@@ -172,9 +172,10 @@ class _TelegramUserSession:
         text = str(chat or "").strip()
         if not text:
             return None
-        if text.lstrip("-").isdigit():
-            return self.resolved_chats.get(int(text))
-        return self.resolved_by_username.get(text.lstrip("@").lower())
+        cleaned = text.lstrip("@")
+        if cleaned.lstrip("-").isdigit():
+            return self.resolved_chats.get(int(cleaned))
+        return self.resolved_by_username.get(cleaned.lower())
 
     def known_chats(self) -> List[Dict[str, Any]]:
         """Distinct resolved chats, for planner/operator visibility."""
@@ -1090,15 +1091,25 @@ class TelegramSendMessageTool(BaseTool):
                 error_category="SECRET_BLOCKED",
                 retryable=False,
             )
-        try:
-            target = parse_target(params["chat"])
-        except ValueError as exc:
-            return ToolResult.failure(str(exc), category="INVALID_INPUT")
-        if target["kind"] != "username":
-            return ToolResult.failure("Use @name or a t.me link as the chat.", category="INVALID_INPUT")
+        raw_chat = str(params["chat"]).strip()
+        numeric = _numeric_chat_id(raw_chat)
+        if numeric is not None:
+            # A numeric chat id the agent resolved earlier (possibly written "@123").
+            target = {"kind": "username", "value": str(numeric), "start_param": None}
+        else:
+            try:
+                target = parse_target(raw_chat)
+            except ValueError as exc:
+                return ToolResult.failure(str(exc), category="INVALID_INPUT")
+            if target["kind"] != "username":
+                return ToolResult.failure("Use @name, a t.me link or a numeric chat id as the chat.",
+                                          category="INVALID_INPUT")
 
         async def action(client: Any) -> ToolResult:
-            entity = await client.get_entity(target["value"])
+            try:
+                entity = await _resolve_entity(client, raw_chat)
+            except ValueError as exc:
+                return ToolResult.failure(str(exc), category="INVALID_INPUT", retryable=False)
             sent = await client.send_message(entity, text)
             replies = await _wait_for_replies(client, entity, sent.id, timeout=8.0)
             described = [_describe_message(m) for m in replies]
@@ -1339,8 +1350,11 @@ async def _resolve_entity(client: Any, chat: str) -> Any:
     hash is explicitly NOT accepted here -- it is not a history target.
     """
     text = str(chat or "").strip()
-    if text.lstrip("-").isdigit():
-        return await client.get_entity(int(text))
+    # A resolved numeric id is often written "@8804778898" by the planner. Telethon would
+    # treat the digit string as a phone number and fail, so it must go through as an int.
+    numeric = _numeric_chat_id(text)
+    if numeric is not None:
+        return await client.get_entity(numeric)
     target = parse_target(text)
     if target["kind"] == "invite":
         raise ValueError(
@@ -1348,6 +1362,14 @@ async def _resolve_entity(client: Any, chat: str) -> Any:
             "telegram_join_chat, then use the resolved chat id or @username it returns."
         )
     return await client.get_entity(target["value"])
+
+
+def _numeric_chat_id(text: str) -> Optional[int]:
+    """The integer behind '123', '-100123' or '@123'; None for anything else."""
+    cleaned = str(text or "").strip().lstrip("@")
+    if cleaned.lstrip("-").isdigit():
+        return int(cleaned)
+    return None
 
 
 def register_telegram_user_tools(registry) -> bool:
