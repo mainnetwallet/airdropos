@@ -394,6 +394,13 @@ class ReplyRouter:
         # --- Everything else is interpreted by the fixed LLM. -------------------
         interpretation, failure = await self._interpret(conversation, task, request, body, message)
         if interpretation is None:
+            if self._reply_confirms_action(request):
+                # The model being unavailable must not hold up a task that is only waiting
+                # for the operator to say they did the step.
+                return await self._verify_then_resume(
+                    conversation, task, owner_email, base, request,
+                    clarification=clarification, interpretation=None, info_saved=False,
+                )
             return await self._park_after_failed_interpretation(
                 conversation, task, base, request, failure
             )
@@ -597,10 +604,13 @@ class ReplyRouter:
                 interpretation=view,
             )
 
+        # Only a blocker that is missing *information* needs a follow-up question. When the
+        # task was waiting for the operator to DO something (a CAPTCHA, a login, an install),
+        # any reply from them means it is done, so it goes straight on to resume below.
         if decision in (
             ReplyDecision.NEEDS_CLARIFICATION,
             ReplyDecision.UNRELATED_OR_INSUFFICIENT_REPLY,
-        ):
+        ) and not self._reply_confirms_action(request):
             return await self._ask_follow_up(conversation, task, base, request, interpretation, view)
 
         # SUFFICIENT_INFORMATION or BLOCKER_REQUIRES_VERIFICATION. The model only classified the
@@ -656,12 +666,13 @@ class ReplyRouter:
                 clarification=clarification, info_provided=info_saved, interpretation=view,
             )
 
-        # No machine check exists for this blocker. For a blocker that is *missing
-        # information*, the operator's answer is the only source of truth: it is recorded as
-        # theirs (never as machine-verified) and the planner is told to use it. A session,
-        # credential or CAPTCHA blocker never takes this route: "I logged in" is a claim.
-        # The answer may have been saved by this reply or by an earlier one for this same
-        # request. Either way `_resume` still runs its own checks before anything is queued.
+        # The automatic check could not confirm the blocker is gone (or said it is not). That
+        # never holds the task back: the operator is the one running this agent, and their
+        # reply is the confirmation. The check result is kept in the message as a note, and
+        # the planner is told the manual step was done so it does not ask for it again.
+        # A blocker that is *missing information* is resumed with that information as before.
+        # `_resume` still runs its own checks (Emergency Stop, retry budget, uncertain side
+        # effects) before anything is queued.
         if (
             not result.checkable
             and request.reason_code in INFORMATION_RESOLVABLE
@@ -677,23 +688,68 @@ class ReplyRouter:
                 clarification=clarification, info_provided=True, interpretation=view,
             )
 
-        question = result.question or (
-            "I re-checked and the blocking condition is still in place. "
-            "Could you tell me what you did and what you saw?"
+        if not self._reply_confirms_action(request):
+            # A blocker that is missing *information*: resuming without it would only park
+            # the task again, so the reply has to actually carry the answer.
+            question = result.question or (
+                "I need the missing information to continue. Could you tell me what to use?"
+            )
+            noted = ""
+            if info_saved:
+                noted = "I have saved the information you gave and will use it once the task can run.\n\n"
+            elif clarification:
+                noted = f"I have recorded your instruction to use {clarification} instead.\n\n"
+            return await self._reply_agent(
+                conversation, task, base,
+                f"{noted}I still need your answer before this task can continue.\n\n"
+                f"Check performed: {result.method}\nResult: {result.outcome}\n\n{question}",
+                status="NEEDS_MORE_INFO",
+                verification=_verification_view(result),
+                interpretation=view,
+            )
+
+        if not info_saved:
+            self._record_operator_confirmation(task, request, base)
+            await self.db.flush()
+        outcome = "Confirmed by the operator in the Agent Inbox."
+        if result.checkable and not result.ok:
+            # A conclusive negative is worth showing; an unchecked one is just noise.
+            outcome += f" (Automatic check said: {result.outcome} Resuming anyway.)"
+        accepted = VerificationResult.satisfied(
+            method="operator_confirmed",
+            outcome=outcome,
+            automatic_check=result.method,
+            automatic_check_checkable=result.checkable,
+            automatic_check_ok=result.ok,
         )
-        noted = ""
-        if info_saved:
-            noted = "I have saved the information you gave and will use it once the task can run.\n\n"
-        elif clarification:
-            noted = f"I have recorded your instruction to use {clarification} instead.\n\n"
-        return await self._reply_agent(
-            conversation, task, base,
-            f"{noted}I checked and this task is still blocked.\n\n"
-            f"Check performed: {result.method}\nResult: {result.outcome}\n\n{question}",
-            status="NEEDS_MORE_INFO",
-            verification=_verification_view(result),
-            interpretation=view,
+        return await self._resume(
+            conversation, task, owner_email, base, request, accepted,
+            clarification=clarification, info_provided=info_saved, interpretation=view,
         )
+
+    def _record_operator_confirmation(self, task: Task, request, base: Dict[str, Any]) -> None:
+        """Tell the planner the operator did the manual step this request was waiting on.
+
+        Goes through the same `operator_instructions` list the worker already folds into its
+        next planning cycle. Skipped when the operator has already answered this request.
+        """
+        if request is None or self._information_on_file(task, request):
+            return
+        step = (request.blocking_step or request.problem_summary or "the manual step").strip()
+        records = list(task.operator_instructions or [])
+        records.append(
+            {
+                "instruction": (
+                    "Operator confirmed in the Agent Inbox that they completed the manual step "
+                    f"this task was waiting on: {step}"
+                )[:300],
+                "at": datetime.now(timezone.utc).isoformat(),
+                "source": "operator_confirmation",
+                "message_id": str(base.get("message_id")),
+                "request_id": request.request_id,
+            }
+        )
+        task.operator_instructions = records
 
     async def _ask_follow_up(
         self, conversation, task, base, request, interpretation: ReplyInterpretation, view
@@ -904,7 +960,7 @@ class ReplyRouter:
             if clarification
             else ""
         )
-        verified = result.method != "operator_provided_information"
+        verified = result.method not in ("operator_provided_information", "operator_confirmed")
         if info_provided:
             noted = (
                 "Thanks, I have saved the information you sent and will use it when I revise "
@@ -1010,6 +1066,22 @@ class ReplyRouter:
         )
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _reply_confirms_action(request) -> bool:
+        """Whether this blocker is waiting for the operator to DO something.
+
+        True for session, login, CAPTCHA, extension and similar blockers: the operator's reply
+        is their confirmation that it is done. False for pauses and approvals, which have
+        their own explicit-instruction flow, and for blockers that are missing information,
+        where the reply has to actually contain it.
+        """
+        if request is None:
+            return False
+        return (
+            request.reason_code not in APPROVAL_GATED
+            and request.reason_code not in INFORMATION_RESOLVABLE
+        )
+
     @staticmethod
     def _information_on_file(task: Task, request) -> bool:
         """Whether the operator has already answered *this* blocker.

@@ -468,7 +468,8 @@ class TestReplyRouting:
             ).status == TaskStatus.NEEDS_USER_ACTION.value
 
     @pytest.mark.asyncio
-    async def test_an_unresolved_condition_prevents_resumption(self, factory, never_ok):
+    async def test_an_unresolved_condition_does_not_hold_the_task_back(self, factory, never_ok):
+        """The automatic check says it is not fixed; the operator's reply still wins."""
         task_id = await _make_task(factory)
         await _park(factory, task_id)
 
@@ -480,21 +481,19 @@ class TestReplyRouting:
                 owner_email=OPERATOR_A, text="I think I fixed it",
             )
             await db.commit()
-            assert outcome.status == "NEEDS_MORE_INFO"
-            assert outcome.resumed is False
-            assert outcome.verification["ok"] is False
+            assert outcome.status == "RESUMED"
+            assert outcome.resumed is True
+            assert outcome.verification["method"] == "operator_confirmed"
+            assert outcome.verification["detail"]["automatic_check_ok"] is False
 
         async with factory() as db:
-            assert (
-                await TaskManager(db).get_by_task_id(task_id)
-            ).status == TaskStatus.NEEDS_USER_ACTION.value
-            request = await InterventionService(db).active_for_task(
-                (await TaskManager(db).get_by_task_id(task_id)).id
-            )
-            assert request is not None, "the request stays open until the condition passes"
+            task = await TaskManager(db).get_by_task_id(task_id)
+            assert task.status == TaskStatus.READY.value
+            request = await InterventionService(db).active_for_task(task.id)
+            assert request is None, "the request is resolved once the operator confirms"
 
     @pytest.mark.asyncio
-    async def test_an_uncheckable_condition_asks_rather_than_assuming(self, factory, uncheckable):
+    async def test_an_uncheckable_condition_does_not_hold_the_task_back(self, factory, uncheckable):
         task_id = await _make_task(factory)
         await _park(factory, task_id)
 
@@ -506,19 +505,19 @@ class TestReplyRouting:
                 owner_email=OPERATOR_A, text="done",
             )
             await db.commit()
-            assert outcome.status == "NEEDS_MORE_INFO"
-            assert outcome.verification["checkable"] is False
+            assert outcome.status == "RESUMED"
+            assert outcome.verification["method"] == "operator_confirmed"
+            assert outcome.verification["detail"]["automatic_check_checkable"] is False
 
         async with factory() as db:
             assert (
                 await TaskManager(db).get_by_task_id(task_id)
-            ).status == TaskStatus.NEEDS_USER_ACTION.value
+            ).status == TaskStatus.READY.value
 
     @pytest.mark.asyncio
-    async def test_a_clarification_alone_does_not_clear_a_blocker_that_remains(
+    async def test_a_clarification_is_recorded_and_the_task_resumes_even_if_the_check_fails(
         self, factory, never_ok
     ):
-        """A directive is not a claim that the blocker was fixed."""
         task_id = await _make_task(factory)
         await _park(factory, task_id)
 
@@ -530,16 +529,16 @@ class TestReplyRouting:
                 owner_email=OPERATOR_A, text="Use BNB Smart Chain instead.",
             )
             await db.commit()
-            assert outcome.status == "NEEDS_MORE_INFO"
-            assert outcome.resumed is False
+            assert outcome.status == "RESUMED"
+            assert outcome.resumed is True
 
         async with factory() as db:
             task = await TaskManager(db).get_by_task_id(task_id)
             instructions = task.operator_instructions or []
             assert any("bnb" in i["instruction"].lower() for i in instructions), (
-                "the instruction is still recorded even though the task did not resume"
+                "the operator's instruction reaches the planner"
             )
-            assert task.status == TaskStatus.NEEDS_USER_ACTION.value
+            assert task.status == TaskStatus.READY.value
 
     @pytest.mark.asyncio
     async def test_a_clarification_is_kept_when_the_blocker_also_clears(self, factory, always_ok):
@@ -1805,34 +1804,19 @@ class TestAgentInboxEndToEnd:
         async with made() as db:
             assert (await TaskManager(db).get_by_task_id(other_id)).status == TaskStatus.IN_PROGRESS.value
 
-        # ----------------------------------- 4. a reply that does not fix anything
-        async with _client(token) as client:
-            bad = await client.post(
-                f"/api/v1/inbox/conversations/{entry['conversation_id']}/messages",
-                json={"message": "I think it is fine now", "client_token": "reply-1"},
-            )
-        assert bad.status_code == 200, bad.text
-        assert bad.json()["resumed"] is False
-        assert bad.json()["verification"]["ok"] is False
-
-        async with made() as db:
-            assert (
-                await TaskManager(db).get_by_task_id(blocked_id)
-            ).status == TaskStatus.NEEDS_USER_ACTION.value
-
-        # ------------------------------ 5. the external condition is fixed for real
-        telegram.sign_in()
-
+        # ------------- 4. the operator's reply resumes it; nothing holds it back
+        # Telegram is not signed in here. The automatic check cannot confirm the fix, and the
+        # operator's word is taken anyway.
         async with _client(token) as client:
             good = await client.post(
                 f"/api/v1/inbox/conversations/{entry['conversation_id']}/messages",
-                json={"message": "Telegram session is ready.", "client_token": "reply-2"},
+                json={"message": "Telegram session is ready.", "client_token": "reply-1"},
             )
         assert good.status_code == 200, good.text
         body = good.json()
         assert body["status"] == "RESUMED"
         assert body["resumed"] is True
-        assert body["verification"]["ok"] is True
+        assert body["verification"]["method"] == "operator_confirmed"
 
         # ------------- 6. the task resumes from its persisted checkpoint, no Retry click
         async with made() as db:
@@ -1851,7 +1835,7 @@ class TestAgentInboxEndToEnd:
         async with _client(token) as client:
             duplicate = await client.post(
                 f"/api/v1/inbox/conversations/{entry['conversation_id']}/messages",
-                json={"message": "Telegram session is ready.", "client_token": "reply-2"},
+                json={"message": "Telegram session is ready.", "client_token": "reply-1"},
             )
         assert duplicate.json()["resumed"] is False
 
@@ -1884,7 +1868,7 @@ class TestAgentInboxEndToEnd:
             final = (await client.get(f"/api/v1/inbox/conversations/{entry['conversation_id']}")).json()
 
         roles = [m["role"] for m in final["messages"]]
-        assert roles.count("user") == 2, "one accepted reply; the duplicate was stored once"
+        assert roles.count("user") == 1, "one accepted reply; the duplicate was stored once"
         assert roles[0] == "assistant"
         assert final["open_request"] is None, "the request is closed once resolved"
         assert any("queued to resume" in m["content"] for m in final["messages"])

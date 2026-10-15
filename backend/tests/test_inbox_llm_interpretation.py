@@ -282,17 +282,20 @@ class TestClaimsAreVerifiedForReal:
             factory, task_id, "Telegram login complete kore disi, ekhon task continue koro."
         )
 
-        assert outcome.resumed is False
-        assert outcome.verification["ok"] is False
-        assert outcome.verification["method"] == "telegram_session_readiness", (
+        # The real check still runs and its finding is kept, but it no longer holds the task
+        # back: the operator's reply is the confirmation.
+        assert outcome.resumed is True and outcome.status == "RESUMED"
+        assert outcome.verification["method"] == "operator_confirmed"
+        assert outcome.verification["detail"]["automatic_check"] == "telegram_session_readiness", (
             "the real check must have run, not a hard-coded pass"
         )
+        assert outcome.verification["detail"]["automatic_check_ok"] is False
         snap = await snapshot(factory, task_id)
-        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
-        assert snap["open_request"] is not None
+        assert snap["status"] == TaskStatus.READY.value
+        assert snap["open_request"] is None
 
     @pytest.mark.asyncio
-    async def test_sufficient_information_still_has_to_pass_the_check(
+    async def test_sufficient_information_resumes_even_when_the_check_fails(
         self, factory, monkeypatch, verifier_failed
     ):
         install_llm(
@@ -304,17 +307,17 @@ class TestClaimsAreVerifiedForReal:
 
         outcome = await reply(factory, task_id, "I signed the agent account in just now")
 
-        assert outcome.resumed is False
+        assert outcome.resumed is True
         snap = await snapshot(factory, task_id)
-        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
-        assert "still blocked" in agent_text(snap)
+        assert snap["status"] == TaskStatus.READY.value
+        assert "still blocked" not in agent_text(snap).lower()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["BLOCKER_REQUIRES_VERIFICATION", "SUFFICIENT_INFORMATION"])
-    async def test_an_uncheckable_session_blocker_is_never_cleared_by_a_claim(
+    async def test_an_uncheckable_session_blocker_does_not_hold_the_task_back(
         self, factory, monkeypatch, verifier_unchecked, kind
     ):
-        """If the platform cannot look, 'I logged in' is not enough for a session blocker."""
+        """If the platform cannot look, the operator's word is taken: the task resumes."""
         install_llm(
             monkeypatch,
             decision(kind, extracted=["Logged in to Telegram"] if kind.startswith("SUFF") else []),
@@ -324,10 +327,11 @@ class TestClaimsAreVerifiedForReal:
 
         outcome = await reply(factory, task_id, "I have logged in to Telegram already, please go on")
 
-        assert outcome.resumed is False
-        assert outcome.verification["checkable"] is False
+        assert outcome.resumed is True
+        assert outcome.verification["method"] == "operator_confirmed"
+        assert outcome.verification["detail"]["automatic_check_checkable"] is False
         snap = await snapshot(factory, task_id)
-        assert snap["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert snap["status"] == TaskStatus.READY.value
 
     @pytest.mark.asyncio
     async def test_a_passing_check_after_a_claim_resumes(
@@ -355,15 +359,53 @@ class TestClaimsAreVerifiedForReal:
         text = "Telegram login complete kore disi, ekhon task continue koro."
         url = f"/api/v1/inbox/conversations/{conversation_id}/messages"
 
+        # Telegram is NOT signed in here, and the reply still resumes the task.
         async with _client(operator_a) as client:
-            before = (await client.post(url, json={"message": text, "client_token": "t-1"})).json()
-        assert before["resumed"] is False and before["verification"]["ok"] is False
-
-        telegram.sign_in()  # the external condition is now really fixed
-        async with _client(operator_a) as client:
-            after = (await client.post(url, json={"message": text, "client_token": "t-2"})).json()
-        assert after["status"] == "RESUMED" and after["verification"]["ok"] is True
+            after = (await client.post(url, json={"message": text, "client_token": "t-1"})).json()
+        assert after["status"] == "RESUMED" and after["resumed"] is True
+        assert after["verification"]["method"] == "operator_confirmed"
         assert after["interpretation"]["decision"] == "BLOCKER_REQUIRES_VERIFICATION"
+
+    @pytest.mark.asyncio
+    async def test_a_human_verification_reply_resumes_even_with_no_session_on_record(
+        self, factory, monkeypatch
+    ):
+        """The reported bug: 'I am complete the verification' got 'still blocked / NOT_CHECKED'."""
+        install_llm(monkeypatch, decision("NEEDS_CLARIFICATION"))
+        task_id = await _make_task(factory)
+        await _park(
+            factory, task_id,
+            error_text="CAPTCHA required: the operator must complete human verification.",
+            error_category=None, force_reason_code="HUMAN_VERIFICATION", integration_ref=None,
+        )
+
+        outcome = await reply(factory, task_id, "i am complete the verification")
+
+        assert outcome.resumed is True and outcome.status == "RESUMED"
+        assert outcome.verification["method"] == "operator_confirmed"
+        snap = await snapshot(factory, task_id)
+        assert snap["status"] == TaskStatus.READY.value
+        assert snap["open_request"] is None
+        text = agent_text(snap).lower()
+        assert "still blocked" not in text and "not_checked" not in text
+        assert any(
+            "completed the manual step" in str(i.get("instruction", ""))
+            for i in snap["instructions"]
+        ), "the planner must be told the manual step was done"
+
+    @pytest.mark.asyncio
+    async def test_a_missing_information_blocker_still_needs_the_actual_answer(
+        self, factory, monkeypatch
+    ):
+        """Only action blockers take the operator's word; an information blocker needs the info."""
+        install_llm(monkeypatch, decision("UNRELATED_OR_INSUFFICIENT_REPLY"))
+        task_id = await _make_task(factory)
+        await park_missing_information(factory, task_id)
+
+        outcome = await reply(factory, task_id, "ok done")
+
+        assert outcome.resumed is False
+        assert (await snapshot(factory, task_id))["status"] == TaskStatus.NEEDS_USER_ACTION.value
 
 
 # ======================================================================
@@ -973,7 +1015,7 @@ class TestLegacyBehaviourIsPreserved:
         assert outcome.status == "RESUMED" and outcome.verification["ok"] is True
 
     @pytest.mark.asyncio
-    async def test_an_explicit_resume_with_a_failing_check_stays_parked(
+    async def test_an_explicit_resume_with_a_failing_check_resumes_anyway(
         self, factory, verifier_failed
     ):
         task_id = await _make_task(factory)
@@ -981,8 +1023,8 @@ class TestLegacyBehaviourIsPreserved:
 
         outcome = await reply(factory, task_id, "resume this task")
 
-        assert outcome.resumed is False and outcome.verification["ok"] is False
-        assert (await snapshot(factory, task_id))["status"] == TaskStatus.NEEDS_USER_ACTION.value
+        assert outcome.resumed is True and outcome.verification["method"] == "operator_confirmed"
+        assert (await snapshot(factory, task_id))["status"] == TaskStatus.READY.value
 
     @pytest.mark.asyncio
     async def test_a_network_directive_is_still_recorded_when_the_model_is_down(self, factory):

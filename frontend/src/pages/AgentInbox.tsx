@@ -84,7 +84,7 @@ const OUTCOME_TONES: Record<string, { tone: 'success' | 'warning' | 'info' | 'er
   RESUMED: { tone: 'success', label: 'Task resumed' },
   CLARIFIED: { tone: 'info', label: 'Instruction recorded' },
   CANCELLED: { tone: 'warning', label: 'Task cancelled' },
-  NEEDS_MORE_INFO: { tone: 'warning', label: 'Still blocked' },
+  NEEDS_MORE_INFO: { tone: 'warning', label: 'Not resumed' },
   RECORDED: { tone: 'info', label: 'Recorded' },
   IGNORED: { tone: 'error', label: 'Not applied' },
 }
@@ -369,11 +369,13 @@ function OutcomeNotice({ result }: { result: InboxReplyResult }) {
       {verification && (
         <p className="text-xs">
           Check: <span className="font-mono">{verification.method}</span> —{' '}
-          {verification.checkable
-            ? verification.ok
-              ? 'confirmed resolved.'
-              : 'not resolved yet.'
-            : 'could not be run from the server, so nothing was assumed.'}
+          {verification.method === 'operator_confirmed'
+            ? 'confirmed by you.'
+            : verification.checkable
+              ? verification.ok
+                ? 'confirmed resolved.'
+                : 'not resolved yet.'
+              : 'could not be run from the server.'}
         </p>
       )}
       {result.detail && <p className="text-xs">{result.detail}</p>}
