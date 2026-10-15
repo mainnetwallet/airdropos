@@ -261,14 +261,10 @@ class PlanConstraints:
     spent_already_usd: float = 0.0
     max_duration_minutes: int = 240
     deadline: Optional[datetime] = None
-    # A Telegram or Mini App airdrop workflow is genuinely multi-stage: open the
-    # bot, start it, read its instructions, join the group, verify membership,
-    # return to the bot, read the new message, act, verify, report. Twelve was
-    # below that, so `enforce_constraints` raised PlanningError and the whole task
-    # failed before a single tool ran. The ceiling is now derived from settings.
-    max_steps: int = field(
-        default_factory=lambda: max(12, int(getattr(settings, "MAX_PLAN_STEPS", 24) or 24))
-    )
+    # No step ceiling: a Telegram or Mini App airdrop workflow is genuinely multi-stage and
+    # replans add stages as requirements are discovered, so any fixed cap eventually rejected a
+    # legitimate plan ("Plan has 26 steps, exceeding the maximum of 24"). None = unlimited.
+    max_steps: Optional[int] = None
     allow_transactions: bool = False
     allowed_networks: Set[str] = field(default_factory=lambda: {"ethereum", "arbitrum", "optimism", "base", "polygon", "sepolia"})
 
@@ -379,7 +375,7 @@ Hard rules:
    airdrop is genuinely multi-stage. If the objective says "open the bot, join the
    group, come back and finish", you MUST emit every stage as its own step, ending
    with a verification step and a reporting step. Do NOT emit a vague step such as
-   "finish the airdrop". The step ceiling is stated in CONSTRAINTS; use it.
+   "finish the airdrop". There is no step limit.
    NEVER drop a required stage merely to keep the plan short.
 9. Use the MOST SPECIFIC "kind" for each step so the executor can handle it:
      research, analyze, navigate, telegram, browser, form, interact,
@@ -597,7 +593,7 @@ Produce EXACTLY this JSON shape:
     # ------------------------------------------------------------------
     def enforce_constraints(self, spec: ExecutionPlanSpec, constraints: PlanConstraints) -> None:
         """Clamp or reject plans that exceed hard limits. Never trusts the model."""
-        if len(spec.steps) > constraints.max_steps:
+        if constraints.max_steps is not None and len(spec.steps) > constraints.max_steps:
             raise PlanningError(
                 f"Plan has {len(spec.steps)} steps, exceeding the maximum of {constraints.max_steps}."
             )

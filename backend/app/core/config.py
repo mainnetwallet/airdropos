@@ -325,17 +325,6 @@ class Settings(BaseSettings):
         default=20,
         description="Prevent runaway Observe-Plan-Act-Verify loops",
     )
-    MAX_PLAN_STEPS: int = Field(
-        default=24,
-        ge=6,
-        le=80,
-        description=(
-            "Maximum steps in one execution plan. A Telegram or Mini App airdrop is "
-            "genuinely multi-stage (open bot, start, read, join, verify membership, "
-            "return to bot, read, act, verify, report), so this must be large enough "
-            "that a legitimate workflow is not rejected outright."
-        ),
-    )
     MAX_PROSE_EXTRACTIONS_PER_RUN: Optional[int] = Field(
         default=None,
         ge=0,
