@@ -1388,7 +1388,7 @@ async def _llm_judgement(
         ),
     ]
     try:
-        parsed = await llm.complete_json(messages, temperature=0.0, max_tokens=1500)
+        parsed = await llm.complete_json(messages, temperature=0.0)
     except LLMError as exc:
         return {}, f"The classification model was unavailable ({exc.category or 'error'})."
     except Exception as exc:  # defensive: a transport layer that is not an LLMError

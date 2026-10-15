@@ -711,7 +711,6 @@ class FixedLLMClient:
         payload = {
             "model": self._model_id,
             "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1,
         }
         started = asyncio.get_event_loop().time()
         try:

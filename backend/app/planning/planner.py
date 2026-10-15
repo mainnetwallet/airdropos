@@ -111,6 +111,31 @@ class ReplanTrigger(str, Enum):
     DISCOVERY = "DISCOVERY"
 
 
+# Task fields that describe the run itself. A plan step must never be gated on them: the
+# worker owns retry counting, and a model that copies an example such as "retry_count<3"
+# would park the step in WAITING as soon as the task reaches its last retry.
+_EXECUTION_STATE_FIELDS = (
+    "retry_count", "max_retries", "retries", "attempt", "attempts", "status", "state",
+)
+
+
+def sanitize_prerequisites(items: Any) -> List[str]:
+    """Drop prerequisites that depend on the task's own retry/execution state."""
+    if not isinstance(items, (list, tuple)):
+        return []
+    kept: List[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        lowered = text.lower()
+        if any(name in lowered for name in _EXECUTION_STATE_FIELDS):
+            logger.warning("Dropped execution-state prerequisite %r from plan step", text)
+            continue
+        kept.append(text)
+    return kept
+
+
 @dataclass
 class PlanStep:
     """One executable step of a plan."""
@@ -414,8 +439,9 @@ Hard rules:
     prove the action happened, NOT that the bot accepted it. To prove acceptance add a separate
     read step (verification_method message_observed) that reads the bot's reply. Never declare
     page_observation or post_action_observation for a Telegram send or click.
-    "prerequisites" must be empty or machine-checkable expressions like "retry_count<3"; never
-    plain-English sentences such as "Bot accepted the URL" (put that in "depends_on" instead).
+    "prerequisites" must be an empty list in almost every step. Never reference retry_count,
+    max_retries, status or any retry/attempt counter, and never write plain-English sentences
+    such as "Bot accepted the URL" (put that in "depends_on" instead).
 13a. Telegram bots: begin with telegram_open_bot. It looks at the existing chat first and only
     sends /start when the chat is empty; when it returns resumed=true the bot was already used, so
     continue from the latest messages and buttons it returned and do NOT plan another /start.
@@ -466,7 +492,8 @@ Hard rules:
    tool_evidence. Put the detail in "expected_evidence", never in "verification_method".
    For Telegram: send -> message_sent, click -> button_clicked, bot reply read -> message_observed.
    Never use page_observation or post_action_observation for a Telegram send or click.
-   "prerequisites" must be empty or machine-checkable (e.g. "retry_count<3"), never plain English.
+   "prerequisites" must be an empty list in almost every step. Never reference retry_count,
+   max_retries, status or any retry/attempt counter, and never use plain English.
 8a. Telegram bots: never plan a fresh /start. telegram_open_bot already resumes an existing chat
    (resumed=true) and starts only an empty one. Continue from the bot's latest messages and buttons.
 8. To press a bot button use telegram_click_button with the chat and the exact button_text.
@@ -550,7 +577,7 @@ Produce EXACTLY this JSON shape:
       "tool": "<exact tool name from the catalog, or null>",
       "parameters": {{}},
       "depends_on": [<0-based indexes>],
-      "prerequisites": ["<condition that must hold before this step>"],
+      "prerequisites": [],
       "verification_method": "<how success is proven>",
       "verification_tool": "<tool name used to verify, or null>",
       "expected_evidence": "<what the evidence must contain>",
@@ -626,7 +653,7 @@ Produce EXACTLY this JSON shape:
                     tool=str(tool) if tool else None,
                     parameters=raw.get("parameters") if isinstance(raw.get("parameters"), dict) else {},
                     depends_on=depends_on,
-                    prerequisites=[str(p) for p in (raw.get("prerequisites") or [])],
+                    prerequisites=sanitize_prerequisites(raw.get("prerequisites")),
                     verification_method=normalize_verification_method(
                         raw.get("verification_method"), description
                     ),
@@ -813,7 +840,7 @@ Produce EXACTLY this JSON shape:
                     tool=raw.get("tool"),
                     parameters=raw.get("parameters") or {},
                     depends_on=[int(d) for d in (raw.get("depends_on") or [])],
-                    prerequisites=raw.get("prerequisites") or [],
+                    prerequisites=sanitize_prerequisites(raw.get("prerequisites")),
                     verification_method=raw.get("verification_method", "unspecified"),
                     verification_tool=raw.get("verification_tool"),
                     expected_evidence=raw.get("expected_evidence"),

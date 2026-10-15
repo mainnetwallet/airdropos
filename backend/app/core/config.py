@@ -152,15 +152,14 @@ class Settings(BaseSettings):
     #   * a 160,017-token prompt was accepted (HTTP 200, usage reported);
     #   * the configured id is not in the provider's model catalog, and the
     #     provider re-routes per request, so the served model is not stable.
-    # 128000 is therefore used: it is below anything observed to fail, and an
-    # operator who has verified a larger window for THEIR endpoint can raise it.
+    # 300000 is the window configured for this deployment; override it with the
+    # LLM_CONTEXT_WINDOW_TOKENS environment variable if your endpoint differs.
     LLM_CONTEXT_WINDOW_TOKENS: int = Field(
-        default=128000,
+        default=300000,
         ge=4096,
         description=(
             "The model's total context window in tokens, counting input and output "
-            "together. Default 128000 is a conservative verified floor, not a claim "
-            "that the configured model supports 300k."
+            "together. Default is 300000."
         ),
     )
     LLM_CONTEXT_RESERVED_OUTPUT_TOKENS: int = Field(
