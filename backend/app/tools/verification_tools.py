@@ -192,10 +192,13 @@ OTP_CHALLENGE = "otp_challenge"
 PAYMENT_APPROVAL = "payment_approval"
 SECURITY_CAPTCHA = "security_captcha"
 IMAGE_CAPTCHA = "image_captcha"
+SIMPLE_BOT_CHALLENGE = "simple_bot_challenge"
 UNSUPPORTED = "unsupported"
 
 # Which categories the agent may complete on its own. Everything else is human-gated.
-AUTOMATICALLY_SOLVABLE = frozenset({ARITHMETIC, ORDINARY_FORM, KNOWLEDGE_QUESTION})
+AUTOMATICALLY_SOLVABLE = frozenset(
+    {ARITHMETIC, ORDINARY_FORM, KNOWLEDGE_QUESTION, SIMPLE_BOT_CHALLENGE}
+)
 
 # Security challenges. These exist to distinguish humans from automation, so the only
 # legitimate response is to pause and hand the challenge to the operator. There is no
@@ -210,6 +213,8 @@ _SECURITY_MARKERS = (
 )
 
 _IMAGE_CAPTCHA_MARKERS = (
+    "in the image", "in the picture", "in the photo", "from the image", "from the picture",
+    "see in the image", "distorted", "characters shown",
     "select all squares with", "click on the image", "choose the image",
     "select the picture", "which picture shows", "click all that",
 )
@@ -225,6 +230,30 @@ _PAYMENT_MARKERS = (
     "billing address", "checkout", "purchase", "buy now", "payment method",
     "connect wallet", "approve spending", "sign transaction", "confirm transaction",
     "signature request", "gas fee to", "unlimited allowance",
+)
+
+# Plain "tap the button" / pick-the-right-option challenges that Telegram bots use as
+# anti-spam. They are answered inside the chat with a button or a short text reply.
+# They are NOT web CAPTCHA providers (those are caught by _SECURITY_MARKERS first).
+_SIMPLE_BOT_MARKERS = (
+    "click the button", "press the button", "tap the button", "click below", "tap below",
+    "press below", "click the button below", "press verify", "click verify", "tap verify",
+    "click to verify", "press to verify", "choose the correct", "select the correct",
+    "pick the correct", "click the emoji", "press the emoji", "which emoji",
+    "type the word", "type the number", "reply with the", "send the number",
+    "send the word", "solve:", "captcha:",
+)
+
+# Phrases that, alone, do not mean a web CAPTCHA widget. Together with a button-tap
+# instruction in a chat they are an ordinary bot gate.
+_SOFT_HUMAN_PHRASES = (
+    "i am not a robot", "i'm not a robot", "verify you are human", "prove you are human",
+)
+
+_ORDINARY_TASK_MARKERS = (
+    "join", "follow", "subscribe", "submit", "send your", "enter your", "bsc address",
+    "wallet address", "bep20", "evm address", "retweet", "like and", "visit", "start",
+    "complete the task", "complete tasks", "task list", "reward", "airdrop", "referral",
 )
 
 _KNOWLEDGE_MARKERS = (
@@ -254,7 +283,40 @@ def classify_verification_challenge(prompt_text: str) -> Dict[str, Any]:
     lowered = text.lower()
 
     # Order matters: a security marker must win over an incidental number in the text.
-    if any(m in lowered for m in _SECURITY_MARKERS):
+    if any(m in lowered for m in _IMAGE_CAPTCHA_MARKERS) and not any(
+        m in lowered for m in _SECURITY_MARKERS
+    ):
+        return {
+            "category": IMAGE_CAPTCHA,
+            "automatic": False,
+            "requires_human": True,
+            "reason": "This is an image-based challenge and requires a human.",
+        }
+    hard_hit = any(
+        m in lowered for m in _SECURITY_MARKERS if m not in _SOFT_HUMAN_PHRASES
+    )
+    soft_only = (
+        not hard_hit
+        and any(m in lowered for m in _SOFT_HUMAN_PHRASES)
+        and any(m in lowered for m in _SIMPLE_BOT_MARKERS)
+    )
+    if soft_only or (
+        not hard_hit
+        and not any(m in lowered for m in _SOFT_HUMAN_PHRASES)
+        and any(m in lowered for m in _SIMPLE_BOT_MARKERS)
+        and not solve_arithmetic(text).answered
+        and not any(m in lowered for m in _PAYMENT_MARKERS + _OTP_MARKERS)
+    ):
+        return {
+            "category": SIMPLE_BOT_CHALLENGE,
+            "automatic": True,
+            "requires_human": False,
+            "reason": (
+                "A simple in-chat bot challenge (tap a button or give a short answer). "
+                "The agent may handle it with its Telegram tools."
+            ),
+        }
+    if hard_hit or any(m in lowered for m in _SOFT_HUMAN_PHRASES):
         return {
             "category": SECURITY_CAPTCHA,
             "automatic": False,
@@ -314,6 +376,17 @@ def classify_verification_challenge(prompt_text: str) -> Dict[str, Any]:
                 "A non-security knowledge question. It may be answered from the campaign's own "
                 "instructions, but no answer is invented here."
             ),
+        }
+
+    # Security, image, payment and OTP markers were all checked above. What is left is
+    # ordinary campaign text ("Join our channel", "Submit your BSC address"): not a
+    # challenge, so it is not human-gated. The agent still acts only through its tools.
+    if any(m in lowered for m in _ORDINARY_TASK_MARKERS):
+        return {
+            "category": ORDINARY_FORM,
+            "automatic": True,
+            "requires_human": False,
+            "reason": "Ordinary campaign instruction; no human-only challenge was detected.",
         }
 
     return {

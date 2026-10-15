@@ -147,7 +147,17 @@ class ClassifyVerificationChallengeTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
-        triage = classify_verification_challenge(str(params["prompt_text"]))
+        prompt_text = str(params.get("prompt_text") or "").strip()
+        if not prompt_text:
+            # Nothing was read yet. This is the agent's ordering mistake, not a challenge
+            # for the operator, so fail retryably instead of parking the task.
+            return ToolResult.failure(
+                "No prompt text was supplied. Read the bot's latest message first, then "
+                "pass its text to this tool.",
+                category="MISSING_INPUT",
+                retryable=True,
+            )
+        triage = classify_verification_challenge(prompt_text)
         data: Dict[str, Any] = {
             "category": triage["category"],
             "automatic": triage["automatic"],
