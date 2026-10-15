@@ -165,7 +165,11 @@ class FixedLLMClient:
         # from every request and the provider's own limit applies.
         self._max_tokens: Optional[int] = settings.LLM_MAX_TOKENS
         self._timeout = settings.LLM_TIMEOUT_SECONDS
-        self._max_retries = settings.LLM_MAX_RETRIES
+        # Retries AFTER the first attempt, hard-capped at one: a failed call (timeout, connection,
+        # 429, 5xx) is tried once more, and if that also fails the error is raised at once. An
+        # older .env with LLM_MAX_RETRIES=3 therefore cannot bring back long retry chains.
+        self._max_retries = max(0, min(int(settings.LLM_MAX_RETRIES), 1))
+        self._max_attempts = self._max_retries + 1
         # Every distinct model the provider has said it served. Exposed so an
         # operator can SEE routing instead of inferring it.
         self._served_models: set = set()
@@ -745,7 +749,7 @@ class FixedLLMClient:
         url = f"{self.base_url}{path}"
         last_error: Optional[LLMError] = None
 
-        for attempt in range(1, self._max_retries + 1):
+        for attempt in range(1, self._max_attempts + 1):
             try:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
                     response = await client.post(url, json=payload, headers=headers)
@@ -819,12 +823,12 @@ class FixedLLMClient:
             except httpx.HTTPError as exc:
                 last_error = LLMError(f"LLM transport error: {exc}", category="TRANSPORT_ERROR", retryable=True)
 
-            if attempt < self._max_retries:
+            if attempt < self._max_attempts:
                 backoff = min(2 ** (attempt - 1), 8)
                 logger.warning(
                     "LLM call attempt %s/%s failed (%s). Retrying in %ss. Model stays locked to %s.",
                     attempt,
-                    self._max_retries,
+                    self._max_attempts,
                     last_error.category if last_error else "unknown",
                     backoff,
                     self._model_id,

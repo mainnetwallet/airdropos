@@ -135,7 +135,8 @@ class Settings(BaseSettings):
         ),
     )
     LLM_TIMEOUT_SECONDS: int = Field(default=60)
-    LLM_MAX_RETRIES: int = Field(default=3)
+    # Retries after the first attempt. Capped at 1 by the client: one retry on error, then fail.
+    LLM_MAX_RETRIES: int = Field(default=1)
 
     # ------------------------------------------------------------------
     # INPUT CONTEXT BUDGET (never an output limit)
