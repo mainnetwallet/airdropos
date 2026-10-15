@@ -29,6 +29,36 @@ from backend.app.wallets.vault import DecryptionError
 logger = logging.getLogger(__name__)
 
 
+# Networks that are NOT EVM. An EVM address is identical on every EVM chain, so a request for
+# "an address on Base / BSC / Monad / ..." is satisfied by any EVM wallet. These names are the
+# exceptions: a request naming one of them needs a wallet of that chain type.
+_NON_EVM_NETWORKS = frozenset(
+    {
+        "solana", "sol", "bitcoin", "btc", "ton", "sui", "aptos", "cosmos", "near", "tron",
+        "cardano", "ada", "polkadot", "dot", "algorand", "stellar", "xrp", "ripple", "starknet",
+        "dogecoin", "doge", "litecoin", "ltc", "kaspa", "iota", "hedera", "icp", "tezos",
+    }
+)
+
+
+def wallet_serves_address_request(row: Wallet, network: Optional[str]) -> bool:
+    """Can this wallet's PUBLIC address be handed out for a request naming `network`?
+
+    Only for giving out an address: signing or sending on a chain still needs that chain in
+    the wallet's declared networks (see `resolve_wallet` without `address_only`).
+    """
+    if not network:
+        return True
+    wanted = str(network).strip().lower()
+    declared = {str(n).lower() for n in (row.supported_networks or [])}
+    if wanted in declared:
+        return True
+    chain_type = str(row.chain_type or "EVM").upper()
+    if wanted in _NON_EVM_NETWORKS:
+        return chain_type == wanted.upper() or chain_type == "SOLANA" and wanted in {"solana", "sol"}
+    return chain_type == "EVM"  # any other (EVM) chain name: the same address works
+
+
 async def resolve_wallet(
     db,
     *,
@@ -36,6 +66,7 @@ async def resolve_wallet(
     label: Optional[str] = None,
     address: Optional[str] = None,
     network: Optional[str] = None,
+    address_only: bool = False,
 ) -> tuple[Optional[Wallet], Optional[str]]:
     """Resolve exactly one wallet, or explain why it could not be determined safely.
 
@@ -80,9 +111,15 @@ async def resolve_wallet(
 
     if network:
         wanted = str(network).strip().lower()
-        rows = [r for r in rows if wanted in {str(n).lower() for n in (r.supported_networks or [])}]
-        if not rows:
-            return None, f"No active wallet declares support for '{network}'."
+        if address_only:
+            # Handing out a public address: any EVM wallet serves any EVM chain.
+            rows = [r for r in rows if wallet_serves_address_request(r, network)]
+            if not rows:
+                return None, f"No active wallet can provide an address for '{network}'."
+        else:
+            rows = [r for r in rows if wanted in {str(n).lower() for n in (r.supported_networks or [])}]
+            if not rows:
+                return None, f"No active wallet declares support for '{network}'."
 
     if not rows:
         return None, (
@@ -175,7 +212,9 @@ class GetWalletAddressTool(BaseTool):
         "Return the PUBLIC address of one of the operator's wallets. Identify it by "
         "wallet id, label, address, or simply 'the only one'. When a task asks for a wallet "
         "address and names none, call this with no arguments (add `network` for the chain the "
-        "task needs): it returns the operator's DEFAULT wallet from the Wallets page. When "
+        "task needs): it returns the operator's DEFAULT wallet from the Wallets page. An EVM "
+        "address is the same on every EVM chain, so any EVM wallet works for any EVM chain "
+        "(BSC, Base, Arbitrum, ...) even if the wallet did not declare it. When "
         "several wallets match and none is the default, the tool says so instead of guessing."
     )
     required_permissions = ["wallet.read"]
@@ -201,24 +240,22 @@ class GetWalletAddressTool(BaseTool):
                 label=params.get("label"),
                 address=params.get("address"),
                 network=params.get("network"),
+                address_only=True,
             )
             if row is None:
                 # Ambiguity is not an error: it is the operator being asked a question.
                 return ToolResult.needs_user(reason or "The wallet could not be identified.")
 
             data = _public(row, service)
-            if params.get("network"):
-                try:
-                    get_chain(params["network"])
-                except ChainError as exc:
-                    return ToolResult.failure(str(exc), category="UNKNOWN_NETWORK")
-                if str(params["network"]).lower() not in {
-                    str(n).lower() for n in (row.supported_networks or [])
-                }:
-                    return ToolResult.needs_user(
-                        f"Wallet '{row.label}' does not declare support for '{params['network']}'. "
-                        f"It supports: {', '.join(row.supported_networks or []) or 'none'}."
-                    )
+            if params.get("network") and not wallet_serves_address_request(row, params["network"]):
+                # Only a different chain FAMILY blocks an address (a Solana wallet asked for a
+                # BSC address). An EVM address is the same on every EVM chain, so a chain the
+                # wallet has not declared, or one this platform has no config for, is fine:
+                # nothing is signed or sent here.
+                return ToolResult.needs_user(
+                    f"Wallet '{row.label}' is a {row.chain_type} wallet, so its address does not "
+                    f"work on '{params['network']}'. Choose a wallet of that chain type."
+                )
 
             return ToolResult.success(
                 data={
@@ -234,6 +271,7 @@ class GetWalletAddressTool(BaseTool):
                     # The frontend's Copy Address button copies exactly this value.
                     "copyable_address": data["address"],
                     "is_default": data.get("is_default", False),
+                    "same_address_on_all_evm_chains": str(row.chain_type or "EVM").upper() == "EVM",
                 },
                 evidence={
                     "authoritative": True,

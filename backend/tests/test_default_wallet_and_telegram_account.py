@@ -122,3 +122,34 @@ async def test_telegram_account_tool_returns_the_logged_in_username(monkeypatch)
 async def test_telegram_account_without_username_asks_the_operator(monkeypatch):
     result = await _run_with_me(monkeypatch, _Me(None))
     assert not result.ok and result.error_category == "HUMAN_INTERVENTION_REQUIRED"
+
+
+# --- An EVM address is the same on every EVM chain ------------------------------------------
+async def test_any_evm_wallet_serves_any_evm_chain_for_an_address():
+    import uuid
+
+    a_id, _ = await _two_wallets(a_networks=("ETH",), b_networks=("ETH",))  # neither declares BSC
+    async with session_scope() as db:
+        service = WalletService(db)
+        await service.set_default(await service.get(uuid.UUID(a_id)))
+        await db.commit()
+    for chain in ("BSC", "Base", "Monad", "SomeNewL2"):
+        result = await GetWalletAddressTool().execute({"network": chain})
+        assert result.ok, chain
+        assert result.data["address"] == A and result.data["same_address_on_all_evm_chains"] is True
+
+
+async def test_transfers_still_require_the_chain_to_be_declared():
+    await _two_wallets(a_networks=("ETH",), b_networks=("ETH",))
+    async with session_scope() as db:
+        row, reason = await resolve_wallet(db, network="BSC")  # signing path: strict
+    assert row is None and "declares support" in reason
+
+
+async def test_a_non_evm_wallet_is_not_offered_for_an_evm_chain():
+    async with session_scope() as db:
+        db.add(Wallet(label="sol", address="So1" + "1" * 40, chain_type="SOLANA",
+                      supported_networks=["solana"]))
+        await db.commit()
+    result = await GetWalletAddressTool().execute({"network": "BSC"})
+    assert not result.ok and "No active wallet can provide an address" in (result.error or "")
