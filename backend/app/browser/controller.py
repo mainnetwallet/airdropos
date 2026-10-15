@@ -528,12 +528,10 @@ class BrowserController:
         executable = profile.resolved_executable() if profile.browser_type == "chrome" else ""
         if profile.browser_type == "chromium":
             options.pop("user_agent", None)  # Chromium reports its own build
-        # Extensions need a real window. Headless is only used when the operator asked
-        # for it AND left the new headless mode enabled, because Chrome's old headless
-        # mode cannot load extensions at all.
+        # Headless is honoured as asked: the NEW headless mode (--headless=new) loads
+        # extensions too, and nothing is drawn on the operator's PC. The session is
+        # watched and clicked through Live Broadcast (screenshot frames + input).
         headless = bool(profile.headless)
-        if headless and not settings.BROWSER_HEADLESS_EXTENSIONS:
-            headless = False
 
         args = chrome.build_chrome_args(
             headless=headless,

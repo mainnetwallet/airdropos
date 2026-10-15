@@ -90,7 +90,7 @@ class BrowserProfile:
     launch_mode: str = "managed"       # "managed" = AirdropOS launches it; "attach" = existing Chrome
     executable_path: str = ""          # empty = auto-detect Google Chrome
     user_data_dir: str = ""            # empty = <profile root>/<id>, resolved on create
-    headless: bool = False             # managed mode only; extensions need a real window
+    headless: bool = True              # managed mode only; True = hidden on the PC (default), False = real window on the PC
     debugger_host: str = ""            # attach mode only; must be loopback
     debugger_port: int = 0             # attach mode only
     unpacked_extensions: str = ""      # comma-separated developer extension directories
@@ -336,7 +336,7 @@ def _clean_settings(data: Dict[str, Any], profile_id: str = "") -> Dict[str, Any
         out["user_data_dir"] = _clean_user_data_dir(data["user_data_dir"], profile_id)
     if "headless" in data:
         if data["headless"] is None:
-            out["headless"] = False
+            out["headless"] = True
         else:
             out["headless"] = bool(data["headless"])
     if "debugger_host" in data or "debugger_port" in data:

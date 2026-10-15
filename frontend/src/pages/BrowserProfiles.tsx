@@ -42,7 +42,7 @@ const EMPTY: BrowserProfileInput = {
   launch_mode: 'managed',
   executable_path: '',
   user_data_dir: '',
-  headless: null,
+  headless: true, // hidden on the PC by default
   debugger_host: '',
   debugger_port: 0,
   unpacked_extensions: '',
@@ -165,10 +165,11 @@ function ProfileForm({
               </span>
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-xs text-slate-300">
-              <input type="checkbox" checked={v.headless === true} onChange={(e) => set('headless', e.target.checked ? true : null)} />
-              Run headless
+              <input type="checkbox" checked={v.headless === false} onChange={(e) => set('headless', !e.target.checked)} />
+              Show browser on PC
               <span className="text-[11px] text-slate-500">
-                Off by default: Chrome extensions only work reliably in a real window.
+                Off by default: the browser runs hidden and is watched and clicked through Live Broadcast. Turn on to
+                also open a real Chrome window on this PC.
               </span>
             </label>
             <label className="block text-xs font-medium text-slate-400">
@@ -531,7 +532,7 @@ export default function BrowserProfiles() {
                     {p.viewport_width && p.viewport_height ? `${p.viewport_width}×${p.viewport_height}` : 'Default viewport'}
                   </span>
                   {p.locale && <span className="rounded-md bg-surface-200 px-2 py-0.5">{p.locale}</span>}
-                  {p.headless ? <span className="rounded-md bg-surface-200 px-2 py-0.5">Headless</span> : null}
+                  <span className="rounded-md bg-surface-200 px-2 py-0.5">{p.headless ? 'Hidden on PC' : 'Opens on PC'}</span>
                   {p.is_default_agent && <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-amber-300">Agent default</span>}
                 </div>
 
@@ -612,7 +613,7 @@ export default function BrowserProfiles() {
             viewport_height: editing.viewport_height, locale: editing.locale, timezone_id: editing.timezone_id,
             start_url: editing.start_url, browser_type: editing.browser_type, launch_mode: editing.launch_mode,
             executable_path: editing.executable_path, user_data_dir: editing.user_data_dir,
-            headless: editing.headless ? true : null, debugger_host: editing.debugger_host,
+            headless: editing.headless !== false, debugger_host: editing.debugger_host,
             debugger_port: editing.debugger_port, unpacked_extensions: editing.unpacked_extensions,
           }}
           onClose={() => setEditing(null)}

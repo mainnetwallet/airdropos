@@ -24,8 +24,9 @@ AirdropOS launches the **installed Google Chrome** with
 - Chrome enforces the directory lock: a second Chrome cannot open a profile another
   Chrome owns. AirdropOS checks the lock first and reports a conflict honestly rather
   than working around it.
-- Extensions need a real window, so a managed profile is headed by default.
-  `BROWSER_HEADLESS_EXTENSIONS=true` allows `--headless=new`, which does support them.
+- **Show browser on PC** is a per-profile switch. Off (the default): Chrome runs hidden
+  (`--headless=new`, which supports extensions) and nothing opens on the PC; watch and
+  click it from Live Broadcast. On: a real Chrome window also opens on the PC.
 
 ### Mode B — Connect to an existing Chrome
 
