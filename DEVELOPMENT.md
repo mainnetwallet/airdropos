@@ -398,6 +398,41 @@ Then open http://localhost:5173 on your PC.
 | Check for missing DB columns (SQLite; startup already fixes them) | stop the server, then `.venv/bin/python scripts/sqlite_add_missing_columns.py` (dry run), then add `--apply` |
 | Backup | copy `.env`, the `data/` folder, and `airdropos.db` (if SQLite) |
 
+### 3.11 Phone (Termux + proot-distro Ubuntu)
+
+Start (every time):
+
+```bash
+proot-distro login ubuntu
+cd ~/airdropos
+git pull origin main
+python3 run.py
+```
+
+Open http://localhost:5173 in Chrome on the same phone.
+
+- `run.py` starts the dashboard with `npm run dev:mobile` (Vite with its WebSocket off). Without this, Chrome drops the socket
+  when you minimize it and Vite **reloads the page** when you come back. `server.hmr: false` alone is not enough; it needs `server.ws: false`.
+- Trade-off: in this mode a code change needs a manual refresh in Chrome. For live updates on a PC use `python3 run.py --hmr`.
+- In development mode the page shows an orange badge for 10 seconds after a reload, saying whether Chrome discarded the tab (low memory) or something else reloaded it.
+
+**Faster dashboard (production build).** The Vite dev server loads hundreds of small files, which is slow on a phone.
+A production build is one small bundle. Use two proot sessions (or `tmux`):
+
+```bash
+# session 1: backend + worker only
+cd ~/airdropos
+python3 run.py --no-frontend
+
+# session 2: build once, then serve the built files (same port 5173, same /api proxy)
+cd ~/airdropos/frontend
+npm run build
+npm run preview -- --host --port 5173 --strictPort
+```
+
+Open http://localhost:5173 as usual. After every `git pull` that changes `frontend/`, run `npm run build` again and restart the preview.
+Keep the port at 5173: the backend only allows that origin by default (`CORS_ORIGINS` in `backend/app/core/config.py`).
+
 ---
 
 ## 4. VPS (Ubuntu 22.04 / 24.04, Docker)
