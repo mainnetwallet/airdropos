@@ -1,7 +1,7 @@
 /** AI Agent Console: natural-language chat with the central agent (dark "Agent Chat" screen on mobile). */
 
 import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Activity,
@@ -342,6 +342,7 @@ export default function AgentChat() {
     agentChatStore.getSnapshot,
   )
   const location = useLocation()
+  const navigate = useNavigate()
   // Other screens can hand over a draft (e.g. "define a goal"); it is never auto-sent.
   const [input, setInput] = useState(() => (location.state as { prompt?: string } | null)?.prompt ?? '')
   const [showInfo, setShowInfo] = useState(false)
@@ -377,8 +378,14 @@ export default function AgentChat() {
       message: string
       history: Array<{ role: 'user' | 'assistant'; content: string }>
     }) => api.agentChat(message, history),
-    onMutate: () => agentChatStore.setPending(true),
-    onSuccess: (response) => {
+    onMutate: () => {
+      agentChatStore.setPending(true)
+      // Remember which conversation this request belongs to.
+      return { epoch: agentChatStore.getEpoch() }
+    },
+    onSuccess: (response, _vars, context) => {
+      // The chat was cleared while the agent was still working: drop the late reply.
+      if (context && context.epoch !== agentChatStore.getEpoch()) return
       // Everything rendered below comes from this response, which came from real
       // tool invocations. The UI does not infer success from the prose.
       agentChatStore.add({
@@ -393,7 +400,8 @@ export default function AgentChat() {
         truncated: response.truncated,
       })
     },
-    onError: (error: Error) => {
+    onError: (error: Error, _vars, context) => {
+      if (context && context.epoch !== agentChatStore.getEpoch()) return
       agentChatStore.add({
         role: 'agent',
         content: `Request failed: ${error.message}`,
@@ -424,7 +432,12 @@ export default function AgentChat() {
   }
 
   const clearChat = () => {
-    if (window.confirm('Clear this conversation?')) agentChatStore.clear()
+    if (!window.confirm('Clear this conversation?')) return
+    agentChatStore.clear()
+    // Also drop the draft in the box and any prompt handed over by another page (it lives in the
+    // router's history state and would otherwise come back on reload).
+    setInput('')
+    if (location.state) navigate(location.pathname, { replace: true, state: null })
   }
 
   const fillPrompt = (prompt: string) => {

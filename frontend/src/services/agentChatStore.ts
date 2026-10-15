@@ -74,6 +74,19 @@ function load(): ChatMessage[] {
 
 let state: ChatState = { messages: load(), pending: false }
 const listeners = new Set<() => void>()
+// Bumped every time the conversation is cleared. A request that was already in flight remembers
+// the value it started with, so its late reply can be recognised as belonging to a cleared chat.
+let epoch = 0
+
+// The same conversation can be open in several tabs. Without this, a tab that was not the one
+// clearing keeps showing (and re-saving) the old messages, which brings the chat back.
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (event) => {
+    if (event.key !== null && event.key !== CHAT_STORAGE_KEY) return
+    state = { ...state, messages: load() }
+    listeners.forEach((listener) => listener())
+  })
+}
 
 function commit(next: ChatState): void {
   state = next
@@ -106,11 +119,24 @@ export const agentChatStore = {
     state = { ...state, pending }
     listeners.forEach((listener) => listener())
   },
+  /** Changes whenever the chat is cleared; see `epoch` above. */
+  getEpoch(): number {
+    return epoch
+  },
   clear(): void {
-    commit({ messages: [], pending: state.pending })
+    epoch += 1
+    state = { messages: [], pending: false }
+    try {
+      // Remove the key outright rather than storing "[]", so nothing of the chat stays behind.
+      localStorage.removeItem(CHAT_STORAGE_KEY)
+    } catch {
+      // ignore
+    }
+    listeners.forEach((listener) => listener())
   },
   /** Called on logout so the next operator never sees this conversation. */
   reset(): void {
+    epoch += 1
     state = { messages: [], pending: false }
     try {
       localStorage.removeItem(CHAT_STORAGE_KEY)
