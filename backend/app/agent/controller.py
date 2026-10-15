@@ -25,6 +25,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.context import TaskContextService, action_fingerprint
+from backend.app.agent.guidance import (
+    MAX_RENDERED_CHARS,
+    reflect_on_guidance,
+    render_guidance,
+    render_reflection,
+)
 from backend.app.agent.discovery import (
     DiscoveryBudget,
     extract_from_result,
@@ -674,6 +680,26 @@ class AgentController:
                 return existing
 
             reason = "Operator guidance received in the Agent Inbox: " + "; ".join(instructions)
+            # Second LLM call: the inbox call only classified the reply. This one reads the
+            # blocker, the reply and the plan together and says what the answer changes. It
+            # is best effort; if it fails the replan below runs on the guidance alone.
+            reflection = await reflect_on_guidance(
+                title=task.title or "",
+                objective=existing.objective,
+                steps=[
+                    {
+                        "index": s.index,
+                        "description": s.description,
+                        "kind": s.kind.value,
+                        "status": s.status,
+                        "failure": s.failure_reason,
+                    }
+                    for s in existing.steps
+                ],
+                guidance=instructions,
+            )
+            if reflection is not None:
+                reason += "\n\n" + render_reflection(reflection)
             try:
                 revised = await self.planner.replan(
                     task,
@@ -735,8 +761,9 @@ class AgentController:
         texts: List[str] = []
         for record in records:
             text = record.get("instruction") if isinstance(record, dict) else record
+            text = render_guidance(record) if isinstance(record, dict) else text
             if text:
-                texts.append(str(text)[:300])
+                texts.append(str(text)[:MAX_RENDERED_CHARS])
         return texts
 
     def _transactions_allowed(self) -> bool:

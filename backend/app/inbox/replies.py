@@ -29,6 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox import events
+from backend.app.agent.guidance import build_record_context
 from backend.app.inbox.interpretation import (
     InterpretationError,
     ReplyDecision,
@@ -375,7 +376,9 @@ class ReplyRouter:
                 interpretation is not None
                 and interpretation.kind is ReplyDecision.SUFFICIENT_INFORMATION
             ):
-                await self._persist_information(task, interpretation, clarification, message)
+                await self._persist_information(
+                    task, interpretation, clarification, message, request=request
+                )
                 persisted = True
             # A pause or an approval is cleared only by this explicit instruction.
             if request.reason_code in APPROVAL_GATED:
@@ -477,6 +480,7 @@ class ReplyRouter:
         interpretation: ReplyInterpretation,
         clarification: Optional[str],
         message: ConversationMessage,
+        request=None,
     ) -> None:
         """Save the operator's answer where the worker's planner will read it.
 
@@ -504,6 +508,9 @@ class ReplyRouter:
                 # The blocker this answer is for. A later bare "resume" only counts an answer
                 # given to the *current* request, never one left over from another.
                 "request_id": getattr(message, "intervention_request_id", None),
+                # Why the task was parked, the blocked step and the operator's own words, so
+                # the worker's planner is not left to guess what this answer is an answer to.
+                **build_record_context(request, message.content, interpretation),
             }
         )
         task.operator_instructions = records
@@ -555,7 +562,9 @@ class ReplyRouter:
         # the model concluded; the operator must use the explicit authorisation flow.
         if request.reason_code in APPROVAL_GATED:
             if decision is ReplyDecision.SUFFICIENT_INFORMATION:
-                await self._persist_information(task, interpretation, clarification, message)
+                await self._persist_information(
+                    task, interpretation, clarification, message, request=request
+                )
             if decision is ReplyDecision.CANCEL_REQUESTED:
                 return await self._confirm_cancellation(conversation, task, base, view)
             saved = (
@@ -621,7 +630,9 @@ class ReplyRouter:
         # does not have to add "resume" to an answer.
         sufficient = decision is ReplyDecision.SUFFICIENT_INFORMATION
         if sufficient:
-            await self._persist_information(task, interpretation, clarification, message)
+            await self._persist_information(
+                    task, interpretation, clarification, message, request=request
+                )
 
         return await self._verify_then_resume(
             conversation, task, owner_email, base, request,
@@ -747,6 +758,7 @@ class ReplyRouter:
                 "source": "operator_confirmation",
                 "message_id": str(base.get("message_id")),
                 "request_id": request.request_id,
+                **build_record_context(request, ""),
             }
         )
         task.operator_instructions = records
