@@ -243,3 +243,12 @@ export interface ChatHistory {
   is_bot: boolean
   messages: ChatMessage[]
 }
+
+export interface LiveTelegramAccount {
+  label: string
+  name: string | null
+  username: string | null
+  is_default: boolean
+  session_ready: boolean
+  open: boolean
+}

@@ -245,6 +245,15 @@ def build_app() -> FastAPI:
         except Exception as exc:
             raise _guard(exc)
 
+    @app.get("/telegram/accounts", dependencies=deps)
+    async def telegram_accounts_list() -> Dict[str, Any]:
+        try:
+            return {"accounts": await _provider("telegram").accounts()}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
     # ------------------------------------------------------------------ browser profiles
     # Profile lifecycle lives with the browsers, in this worker. The API never talks to
     # Chrome directly; it asks here and returns exactly what the worker observed.

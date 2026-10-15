@@ -159,9 +159,10 @@ async def events(
 # Start / pause / resume / stop
 # ---------------------------------------------------------------------------
 class CreateSession(BaseModel):
-    integration: Literal["browser"] = "browser"
-    profile_id: str = Field(min_length=1, max_length=64)
-    url: Optional[str] = Field(default=None, max_length=2048)
+    integration: Literal["browser", "telegram"] = "browser"
+    profile_id: Optional[str] = Field(default=None, min_length=1, max_length=64)  # browser
+    url: Optional[str] = Field(default=None, max_length=2048)  # browser
+    account: Optional[str] = Field(default=None, max_length=40)  # telegram account label
 
 
 @router.post("/sessions", status_code=201)
@@ -172,12 +173,14 @@ async def create_session(
     principal: Principal = Depends(require_task_write),
 ) -> Dict[str, Any]:
     enforce_rate_limit(request, "write")
+    if body.integration == "browser" and not body.profile_id:
+        raise HTTPException(status_code=422, detail="Choose a browser profile.")
     if emergency_stop.is_stopped:
         raise HTTPException(status_code=409, detail={"error": "Emergency stop is active. Release it before starting a session."})
     result = await _gateway(client.post_json("/sessions", {**body.model_dump(), **_owner(principal)}))
     sid = result["session"]["id"]
     await write_audit(db, principal, "LIVE_SESSION_START", "live_session", sid,
-                      after_state={"profile_id": body.profile_id})
+                      after_state={"profile_id": body.profile_id, "account": body.account})
     await db.commit()
     return result
 
@@ -371,3 +374,9 @@ async def chat_click(
     await write_audit(db, principal, "LIVE_CHAT_CLICK", "live_session", f"{integration}:{key}",
                       after_state={"message_id": body.message_id})
     return result
+
+
+@router.get("/telegram/accounts")
+async def telegram_accounts(principal: Principal = Depends(require_read)) -> Dict[str, Any]:
+    """Logged-in Telegram accounts that can be opened in Live Broadcast."""
+    return await _gateway(client.get_json("/telegram/accounts"))

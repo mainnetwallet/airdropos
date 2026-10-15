@@ -30,7 +30,21 @@ export default function NewSessionModal({
   })
 
   const selected = profileId || free[0]?.id || ''
-  const others = integrations.filter((i) => i.id !== 'browser')
+  const others = integrations.filter((i) => i.id !== 'browser' && i.id !== 'telegram')
+  const hasTelegram = integrations.some((i) => i.id === 'telegram')
+
+  const tgAccounts = useQuery({ queryKey: ['live-telegram-accounts'], queryFn: api.liveTelegramAccounts, enabled: hasTelegram, retry: false })
+  const accounts = (tgAccounts.data?.accounts ?? []).filter((a) => a.session_ready)
+  const [account, setAccount] = useState('')
+  const tgSelected = account || accounts.find((a) => a.is_default)?.label || accounts[0]?.label || ''
+  const openTg = useMutation({
+    mutationFn: () => api.liveOpenTelegram(tgSelected),
+    onSuccess: ({ session }) => {
+      void qc.invalidateQueries({ queryKey: ['live'] })
+      void qc.invalidateQueries({ queryKey: ['live-telegram-accounts'] })
+      onCreated(session)
+    },
+  })
 
   return (
     <Modal title="New session" onClose={onClose}>
@@ -83,6 +97,46 @@ export default function NewSessionModal({
             </div>
           )}
         </div>
+
+        {hasTelegram && (
+          <div className="border-t border-surface-300 pt-3">
+            <p className="mb-1 text-sm font-semibold text-slate-200">Telegram account</p>
+            <p className="mb-3 text-xs text-slate-500">
+              Opens a logged-in Telegram account as a live chat view you can read and reply in. The agent does not have to use it first.
+            </p>
+            {tgAccounts.isLoading ? (
+              <p className="text-sm text-slate-500">Loading accounts…</p>
+            ) : tgAccounts.isError ? (
+              <p className="rounded-lg bg-surface-200 p-3 text-sm text-status-error">
+                {(tgAccounts.error as Error).message}
+              </p>
+            ) : accounts.length === 0 ? (
+              <p className="rounded-lg bg-surface-200 p-3 text-sm text-slate-400">
+                No logged-in Telegram account yet. Run <span className="font-mono">python scripts/telegram_login.py</span> once in a terminal.
+              </p>
+            ) : (
+              <div className="space-y-3">
+                <label className="block text-xs font-medium text-slate-400">
+                  Account
+                  <select className="input mt-1 w-full" value={tgSelected} onChange={(e) => setAccount(e.target.value)}>
+                    {accounts.map((a) => (
+                      <option key={a.label} value={a.label}>
+                        {a.name || a.label}
+                        {a.username ? ` (@${a.username})` : ''}
+                        {a.is_default ? ' · default' : ''}
+                        {a.open ? ' · open' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {openTg.error && <p className="text-sm text-status-error">{(openTg.error as Error).message}</p>}
+                <button type="button" disabled={openTg.isPending || !tgSelected} onClick={() => openTg.mutate()} className="btn btn-primary w-full">
+                  {openTg.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : null} Open Telegram account
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="border-t border-surface-300 pt-3">
           <p className="mb-2 text-sm font-semibold text-slate-200">Other integrations</p>

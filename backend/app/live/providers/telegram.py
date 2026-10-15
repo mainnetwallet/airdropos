@@ -109,6 +109,82 @@ class TelegramProvider(SessionProvider):
             },
         }
 
+    @staticmethod
+    def _key_for(label: str, tg: Any) -> str:
+        """The key this account's card uses (the legacy single account keeps 'agent')."""
+        return next((k for k, s in _sessions() if s is tg), None) or "agent"
+
+    async def accounts(self) -> List[Dict[str, Any]]:
+        """Every logged-in Telegram account that can be opened, with whether it is open now."""
+        from backend.app.integrations import telegram_accounts
+        from backend.app.tools.telegram_user_tools import session_for
+
+        out: List[Dict[str, Any]] = []
+        for acc in telegram_accounts.list_accounts():
+            tg = session_for(acc["label"])
+            card = self._card(self._key_for(acc["label"], tg), tg, 0) if tg.ever_used else None
+            out.append(
+                {
+                    "label": acc["label"],
+                    "name": acc.get("profile_name"),
+                    "username": acc.get("username"),
+                    "is_default": bool(acc.get("is_default")),
+                    "session_ready": bool(acc.get("session_ready")),
+                    "open": card is not None and card["status"] != "stopped",
+                }
+            )
+        return out
+
+    async def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Open a Telegram account in Live Broadcast, the way a browser profile is opened.
+
+        The account does not have to have been used by the agent first. Opening connects to
+        Telegram (proving the saved login still works) and clears a previous operator
+        stop/pause on this account. Opening an already open account just returns it.
+        """
+        from backend.app.integrations import telegram_accounts
+        from backend.app.live import telegram_chat
+        from backend.app.tools.telegram_user_tools import UnknownAccount, session_for
+
+        if not self.configured():
+            raise Conflict(
+                "Telegram is not enabled. Set TELEGRAM_USER_ENABLED, TELEGRAM_API_ID and TELEGRAM_API_HASH first.",
+                "not_configured",
+            )
+        label = str(payload.get("account") or "").strip()
+        account = telegram_accounts.get_account(label or None)
+        if account is None:
+            raise Conflict(
+                "No logged-in Telegram account. Run `python scripts/telegram_login.py` once in a terminal.",
+                "no_account",
+            )
+        if not account.get("session_ready"):
+            raise Conflict(
+                f"Account '{account['label']}' has no saved login. Run `python scripts/telegram_login.py` again.",
+                "not_logged_in",
+            )
+        try:
+            tg = session_for(account["label"])
+        except UnknownAccount as exc:
+            raise Conflict(str(exc), "no_account")
+
+        was_closed = tg.stopped or not tg.ever_used
+        prev_stopped, prev_paused = tg.stopped, tg.paused
+        tg.stopped = False  # opening an account is an explicit operator action: it lifts their own stop
+        tg.paused = False
+        try:
+            await telegram_chat._with_client(tg, lambda client: client.get_me())  # connects; proves the login works
+        except Exception:
+            tg.stopped, tg.paused = prev_stopped, prev_paused  # a failed open changes nothing
+            raise
+        if not tg.ever_used:
+            tg.ever_used = True
+            tg.started_at = time.time()
+        if was_closed:
+            tg._emit("session.started", f"Opened by {payload.get('operator') or 'operator'}", "ok")
+        self._stopped_seen.pop(self._key_for(account["label"], tg), None)
+        return await self.get_session(self._key_for(account["label"], tg))
+
     async def chat(self, key: str, op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         from backend.app.live import telegram_chat
 

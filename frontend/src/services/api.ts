@@ -36,6 +36,7 @@ import type {
   InstalledExtension,
   ChatDialog,
   ChatHistory,
+  LiveTelegramAccount,
   LiveEventsResponse,
   LiveOverview,
   LiveSession,
@@ -622,6 +623,12 @@ Object.assign(api, {
       method: 'POST',
       body: JSON.stringify({ token }),
     }),
+  liveTelegramAccounts: () => request<{ accounts: LiveTelegramAccount[] }>('/live/telegram/accounts'),
+  liveOpenTelegram: (account: string) =>
+    request<{ session: LiveSession }>('/live/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ integration: 'telegram', account }),
+    }),
   liveChatDialogs: (integration: string, key: string, search?: string) =>
     request<{ dialogs: ChatDialog[] }>(`${ref(integration, key)}/chat/dialogs`, {
       method: 'POST',
@@ -717,6 +724,8 @@ export type LiveApi = {
   liveRenewControl: (i: string, k: string, token: string) => Promise<Record<string, unknown>>
   liveReleaseControl: (i: string, k: string, token: string) => Promise<{ released: boolean; counts?: Record<string, number> }>
   liveInput: (i: string, k: string, token: string, seq: number, e: InputEvent) => Promise<Record<string, unknown>>
+  liveTelegramAccounts: () => Promise<{ accounts: LiveTelegramAccount[] }>
+  liveOpenTelegram: (account: string) => Promise<{ session: LiveSession }>
   liveChatDialogs: (i: string, k: string, search?: string) => Promise<{ dialogs: ChatDialog[] }>
   liveChatHistory: (i: string, k: string, peer: string) => Promise<ChatHistory>
   liveChatSend: (i: string, k: string, peer: string, text: string, replyTo?: number) => Promise<{ sent_id: number }>

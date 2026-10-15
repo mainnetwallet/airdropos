@@ -422,4 +422,9 @@ time (they share one lock), and **Stop** still disconnects the account.
 - Text that looks like a private key or seed phrase is refused, as for the agent.
 - Only plain and callback buttons are pressed. Links open in your browser when you click them;
   payment, phone/location sharing, login and Mini App buttons are refused.
-- The session card appears once the account has been used by the agent in this worker process.
+- **Open an account yourself:** Live Broadcast → **New session** → *Telegram account* → pick the
+  account → **Open Telegram account**. The agent does not have to use it first. Opening connects
+  to Telegram, proves the saved login works, and lifts your own earlier Stop/Pause on that
+  account. Opening an account that is already open just returns it. Accounts come from
+  `python scripts/telegram_login.py`; an account without a saved login is not listed.
+- A card also appears on its own when the agent first uses an account.
