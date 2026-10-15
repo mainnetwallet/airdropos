@@ -599,6 +599,9 @@ Produce EXACTLY this JSON shape:
                 f"Decomposition failed: the fixed LLM is unavailable ({exc.category})."
             ) from exc
 
+        logger.warning(
+            "PLANNER RAW RESULT keys=%s body=%s", list(result.keys()), _json(result)[:3000]
+        )
         steps = self._parse_steps(result.get("steps") or [])
         if not steps:
             raise PlanningError("Decomposition produced no executable steps.")
