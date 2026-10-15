@@ -30,7 +30,9 @@ export default defineConfig(({ mode }) => ({
   server: {
     port: 5173,
     host: true,
+    // hmr:false alone keeps the WebSocket (and its reload-on-reconnect); ws:false removes it.
     hmr: mode === 'mobile' ? false : undefined,
+    ws: mode === 'mobile' ? false : undefined,
     proxy: {
       '/api': {
         target: 'http://localhost:8000',
