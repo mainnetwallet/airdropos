@@ -22,7 +22,7 @@ from backend.app.models import (
     TaskEvidence,
     TaskExecution,
 )
-from backend.app.tasks.id_generator import format_task_id, next_sequence, parse_task_id
+from backend.app.tasks.id_generator import format_task_id, parse_task_id, reserve_sequence
 from backend.app.tasks.state_machine import (
     VALID_TRANSITIONS,
     TaskStatus,
@@ -81,10 +81,8 @@ class TaskManager:
             raise ValueError("priority must be between 1 (highest) and 10 (lowest)")
 
         year = datetime.now(timezone.utc).year
-        max_seq = await self.db.scalar(
-            select(func.max(Task.id)).where(Task.task_id.like(f"AIR-{year}-%"))
-        )
-        # Max sequence parsed from existing IDs of this year.
+        # Highest sequence among tasks that still exist; only used to seed the persistent counter
+        # for databases that predate it. The counter, not this value, decides the next ID.
         existing = await self.db.execute(
             select(Task.task_id).where(Task.task_id.like(f"AIR-{year}-%"))
         )
@@ -100,7 +98,7 @@ class TaskManager:
             found = await self.db.scalar(select(Task.id).where(Task.task_id == candidate))
             return found is not None
 
-        sequence = await next_sequence(max_sequence=highest, year=year, is_taken=is_taken)
+        sequence = await reserve_sequence(self.db, year, floor=highest, is_taken=is_taken)
         task_id = format_task_id(sequence, year)
 
         task = Task(

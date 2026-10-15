@@ -134,3 +134,16 @@ class TaskEvidence(Base):
     blockchain_transaction: Mapped[Optional["BlockchainTransaction"]] = relationship(
         "BlockchainTransaction", back_populates="evidence"
     )
+
+
+class TaskIdCounter(Base):
+    """High-water mark of the AIR-YYYY-NNNNNN sequence, one row per year.
+
+    Task IDs are minted from this counter, never from ``max(existing task_id)``. The counter
+    only ever goes up, so deleting a task can never cause its ID to be handed out again.
+    """
+
+    __tablename__ = "task_id_counters"
+
+    year: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
+    last_value: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

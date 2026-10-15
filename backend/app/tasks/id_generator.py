@@ -2,8 +2,9 @@
 
 Format: AIR-YYYY-NNNNNN  e.g. AIR-2026-000001
 
-Collision safety is enforced with a PostgreSQL unique index on tasks.task_id plus
-an in-process lock and a retry loop, so concurrent workers cannot mint the same ID.
+IDs come from a persistent, ever-increasing counter (task_id_counters), so a deleted
+task's ID is never issued again. Collision safety is additionally enforced by the unique
+index on tasks.task_id plus a retry loop.
 """
 
 from __future__ import annotations
@@ -13,6 +14,9 @@ import inspect
 import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
+
+from sqlalchemy import case, insert, select, update
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -97,3 +101,54 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+
+async def reserve_sequence(
+    db: Any,
+    year: int,
+    floor: int = 0,
+    is_taken: Optional[Callable[[str], Any]] = None,
+    max_attempts: int = 25,
+) -> int:
+    """Reserve the next sequence number for ``year`` from the persistent counter.
+
+    The counter is advanced inside the caller's transaction with a single atomic UPDATE, which
+    row-locks it, so concurrent creators are serialised and each gets a distinct number. It
+    never moves backwards: deleting tasks does not free their numbers. ``floor`` seeds/raises
+    the counter to the highest ID already in the tasks table (for databases that predate it).
+    """
+    from backend.app.models.tasks import TaskIdCounter
+
+    exists = await db.scalar(select(TaskIdCounter.id).where(TaskIdCounter.year == year))
+    if exists is None:
+        try:
+            async with db.begin_nested():
+                await db.execute(insert(TaskIdCounter).values(year=year, last_value=0))
+        except IntegrityError:
+            pass  # another creator seeded it first
+
+    for _ in range(max_attempts):
+        stmt = (
+            update(TaskIdCounter)
+            .where(TaskIdCounter.year == year)
+            .values(
+                last_value=case(
+                    (TaskIdCounter.last_value < floor, floor),
+                    else_=TaskIdCounter.last_value,
+                )
+                + 1
+            )
+            .returning(TaskIdCounter.last_value)
+            .execution_options(synchronize_session=False)
+        )
+        candidate = (await db.execute(stmt)).scalar_one()
+        if candidate > 999_999:
+            raise RuntimeError(
+                f"Task ID space for {year} is exhausted; archive old records or roll to a new year."
+            )
+        if is_taken is None or not await _maybe_await(is_taken(format_task_id(candidate, year))):
+            return candidate
+        logger.warning("Task ID %s already exists; advancing counter", format_task_id(candidate, year))
+        floor = candidate
+    raise RuntimeError("Could not allocate a collision-free task ID after repeated attempts.")

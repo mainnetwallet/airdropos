@@ -14,6 +14,7 @@ from backend.app.models.tasks import (
     TaskCheckpoint,
     TaskEvent,
     TaskEvidence,
+    TaskIdCounter,
 )
 from backend.app.models.wallets import Wallet
 from backend.app.models.transactions import (
