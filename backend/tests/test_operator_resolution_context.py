@@ -101,3 +101,53 @@ async def test_the_digest_and_prompt_context_carry_the_operator_story():
     assert "RULES THE OPERATOR GAVE" in digest
     prompt = resolved.to_prompt_dict()
     assert "i solved it" in prompt["human_intervention"]["summary"]
+
+
+async def test_information_the_operator_supplied_is_kept_in_the_story():
+    async with session_scope() as db:
+        task = await _task(db)
+        svc = TaskContextService(db)
+        await svc.record_human_intervention(task, required=True, reason="which network?")
+        await svc.record_human_intervention(
+            task, required=False, reason="x", resolved=True,
+            resolution={
+                "operator_reply": "Base e koro",
+                "outcome": "Information supplied by the operator.",
+                "extracted_information": ["Base e koro", " "],
+            },
+        )
+        state = (await svc.get(task)).human_intervention
+    assert state["resolution"]["extracted_information"] == ["Base e koro"]
+    assert "Information the operator supplied: Base e koro" in state["summary"]
+
+
+async def test_interpretation_context_sees_earlier_blockers_and_rules():
+    from backend.app.inbox.interpretation import build_context
+    from backend.app.inbox.service import ConversationService
+
+    class _Req:
+        reason_code = "MANUAL_STEP"
+        problem_summary = "needs captcha"
+        detailed_explanation = ""
+        required_action = ""
+        blocking_step = ""
+        integration_ref = ""
+
+    async with session_scope() as db:
+        task = await _task(db)
+        conversation = await ConversationService(db).get_or_create_for_task(
+            task, "op@example.test"
+        )
+        svc = TaskContextService(db)
+        await svc.record_human_intervention(task, required=True, reason="first captcha")
+        await svc.record_human_intervention(
+            task, required=False, reason="x", resolved=True,
+            resolution={"operator_reply": "i solved it", "outcome": "Confirmed."},
+        )
+        await svc.add_standing_rules(task, ["Simple math questions may be answered"])
+        ctx = await build_context(
+            db, task=task, request=_Req(), conversation=conversation, reply="same again"
+        )
+
+    assert any("first captcha" in b for b in ctx["earlier_resolved_blockers"])
+    assert "Simple math questions may be answered" in ctx["operator_standing_rules"]

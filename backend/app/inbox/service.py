@@ -574,10 +574,16 @@ class InterventionService:
                             "operator_reply": operator_reply,
                             "interpretation": (interpretation or {}).get("explanation"),
                             "decision": (interpretation or {}).get("decision"),
+                            "extracted_information": list(
+                                (interpretation or {}).get("extracted_information") or []
+                            )[:6],
                         },
                     )
             except Exception as exc:  # never let bookkeeping block the resume
-                logger.debug("Could not clear the task context blocker: %s", exc)
+                logger.warning(
+                    "Could not record the resolved blocker in the task context for %s: %s",
+                    request.task_id, exc,
+                )
 
     async def cancel_for_task(self, task_pk: Any, *, reason: str) -> int:
         """Close every open request on a task. Used when the task is cancelled."""

@@ -639,6 +639,18 @@ class AgentController:
         instructions = self._take_operator_instructions(task)
         existing = await self.planner.load_plan_spec(task)
 
+        if instructions:
+            # The guidance is also kept in the task context right away. Otherwise it only
+            # lived in the replan reason, so a task that resumed without a replan (or whose
+            # reflection call failed, or that already completed an irreversible step) lost
+            # what the operator said before any later LLM call could read it.
+            try:
+                await self.context.add_standing_rules(task, instructions)
+            except Exception as exc:  # bookkeeping must never block planning
+                logger.warning(
+                    "Could not store the operator's guidance for %s: %s", task.task_id, exc
+                )
+
         # The context is the first thing established, before any decision is taken from
         # it: the goal, and what "done" means, are recorded so every later decision can
         # be read against them.
@@ -705,7 +717,9 @@ class AgentController:
                     # know the rules the operator gave.
                     await self.context.add_standing_rules(task, reflection["standing_rules"])
                 except Exception as exc:  # bookkeeping must never block the replan
-                    logger.debug("Could not store the operator's rules: %s", exc)
+                    logger.warning(
+                        "Could not store the operator's rules for %s: %s", task.task_id, exc
+                    )
             try:
                 revised = await self.planner.replan(
                     task,

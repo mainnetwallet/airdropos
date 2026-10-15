@@ -1134,12 +1134,23 @@ class TaskContextService:
             for key in ("operator_reply", "outcome", "interpretation"):
                 if key in res:
                     res[key] = self._screened_text(str(res[key]), limit=600)
+            info = [
+                self._screened_text(str(i), limit=300)
+                for i in (res.get("extracted_information") or [])
+                if str(i).strip()
+            ]
+            if info:
+                res["extracted_information"] = info
+            else:
+                res.pop("extracted_information", None)
             blocker = state.get("reason") or "an operator action"
             parts = [f"The task was parked because: {blocker}."]
             if res.get("operator_reply"):
                 parts.append(f'The operator replied: "{res["operator_reply"]}".')
             if res.get("interpretation"):
                 parts.append(f"Reading of the reply: {res['interpretation']}.")
+            if res.get("extracted_information"):
+                parts.append("Information the operator supplied: " + "; ".join(res["extracted_information"]) + ".")
             if res.get("outcome"):
                 parts.append(f"Accepted as: {res['outcome']}")
             parts.append(
