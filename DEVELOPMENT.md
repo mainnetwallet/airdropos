@@ -414,7 +414,6 @@ Open http://localhost:5173 in Chrome on the same phone.
 - `run.py` starts the dashboard with `npm run dev:mobile` (Vite with its WebSocket off). Without this, Chrome drops the socket
   when you minimize it and Vite **reloads the page** when you come back. `server.hmr: false` alone is not enough; it needs `server.ws: false`.
 - Trade-off: in this mode a code change needs a manual refresh in Chrome. For live updates on a PC use `python3 run.py --hmr`.
-- In development mode the page shows an orange badge for 10 seconds after a reload, saying whether Chrome discarded the tab (low memory) or something else reloaded it.
 
 **Faster dashboard (production build).** The Vite dev server loads hundreds of small files, which is slow on a phone.
 A production build is one small bundle. Use two proot sessions (or `tmux`):
