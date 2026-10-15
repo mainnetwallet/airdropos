@@ -624,6 +624,23 @@ async def delete_task(
             detail=f"Task {task.task_id} is {task.status}. Cancel it first, then delete it.",
         )
 
+    # A worker holding a live lease is still running this task (even if it was just cancelled and
+    # is finishing an LLM call). Deleting now would pull the row out from under it.
+    from backend.app.models import ExecutionLease
+
+    live_lease = await db.scalar(
+        select(func.count(ExecutionLease.id)).where(
+            ExecutionLease.task_id == task.id,
+            ExecutionLease.released_at.is_(None),
+            ExecutionLease.expires_at > datetime.now(timezone.utc),
+        )
+    )
+    if live_lease:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task {task.task_id} is still being stopped by a worker. Try again in a few seconds.",
+        )
+
     tx_count = await db.scalar(
         select(func.count(BlockchainTransaction.id)).where(
             BlockchainTransaction.task_id == task.id

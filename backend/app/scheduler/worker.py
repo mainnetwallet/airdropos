@@ -417,6 +417,21 @@ async def task_execution_loop() -> None:
             logger.info("Task loop cancelled for %s", WORKER_ID)
             raise
         except Exception as exc:
+            # The task row can vanish while this run is in flight (deleted from the dashboard
+            # during a long LLM call). The next write then matches 0 rows, which is not a
+            # failure of the task: there is nothing left to retry or settle.
+            if current_task_pk is not None:
+                try:
+                    async with AsyncSessionLocal() as check_db:
+                        still_exists = await check_db.get(Task, current_task_pk) is not None
+                except Exception:
+                    still_exists = True  # cannot tell: fall through to the normal failure path
+                if not still_exists:
+                    logger.warning(
+                        "Task %s was deleted while it was running; run discarded.", current_task_id
+                    )
+                    worker_state.polled(f"discarded {current_task_id} (deleted while running)")
+                    continue
             logger.exception("Task execution error: %s", exc)
             worker_state.failed(exc, current_task_id)
             if current_task_pk is not None:
