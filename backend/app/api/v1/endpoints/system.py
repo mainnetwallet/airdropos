@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -17,6 +16,8 @@ from backend.app.core.config import settings
 from backend.app.database.session import get_db
 from backend.app.airdrops.verifier import ChangeDetector
 from backend.app.inbox.service import ConversationService
+from backend.app.integrations import telegram_accounts
+from backend.app.integrations import telegram_login
 from backend.app.integrations.telegram import telegram_bot
 from backend.app.learning.engine import LearningEngine
 from backend.app.llm.client import llm
@@ -1091,13 +1092,14 @@ def _telegram_readiness() -> Dict[str, Any]:
     except Exception:
         telethon_installed = False
 
-    session_file = Path(f"{settings.TELEGRAM_SESSION_PATH}.session")
+    accounts = telegram_accounts.list_accounts()
     checks = {
         "enabled": bool(settings.TELEGRAM_USER_ENABLED),
         "api_id_set": bool(settings.TELEGRAM_API_ID),
         "api_hash_set": bool(settings.TELEGRAM_API_HASH),
         "telethon_installed": telethon_installed,
-        "session_file_exists": session_file.exists(),
+        "session_file_exists": any(a["session_ready"] for a in accounts),
+        "accounts_count": sum(1 for a in accounts if a["session_ready"]),
     }
     hint: Optional[str] = None
     if not checks["enabled"]:
@@ -1109,6 +1111,179 @@ def _telegram_readiness() -> Dict[str, Any]:
     elif not checks["session_file_exists"]:
         hint = "Not logged in yet. Run scripts/telegram_login.py once in a terminal."
     return {**checks, "ready": hint is None, "hint": hint}
+
+
+@router.get("/telegram/accounts", tags=["system"])
+async def telegram_accounts_list(
+    request: Request,
+    principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    """Logged-in Telegram accounts: label and profile name only, never phone or session data."""
+    enforce_rate_limit(request, "read")
+    return {
+        "accounts": [
+            {
+                "label": a["label"],
+                "profile_name": a.get("profile_name"),
+                "first_name": a.get("first_name"),
+                "last_name": a.get("last_name"),
+                "username": a.get("username"),
+                "user_id": a.get("user_id"),
+                "is_default": bool(a.get("is_default")),
+                "logged_in": a["session_ready"],
+                "legacy": bool(a.get("legacy")),
+                "added_at": a.get("added_at"),
+            }
+            for a in telegram_accounts.list_accounts()
+        ]
+    }
+
+
+# --- Telegram accounts: add / set default / remove from the UI ------------------------------
+# Adding an account needs the phone, login code and 2FA password to pass through this API.
+# They live in memory for one request (see integrations/telegram_login.py): no logging, no audit
+# detail, no LLM. Validation here is done in code, not with pydantic constraints, because a
+# pydantic 422 echoes the offending input back.
+
+class TelegramLoginStart(BaseModel):
+    label: str
+    phone: str
+    make_default: bool = False
+
+
+class TelegramLoginCode(BaseModel):
+    login_id: str
+    code: str
+
+
+class TelegramLoginPassword(BaseModel):
+    login_id: str
+    password: str
+
+
+class TelegramLoginCancel(BaseModel):
+    login_id: str
+
+
+def _login_http_error(exc: "telegram_login.LoginError") -> HTTPException:
+    return HTTPException(status_code=exc.status, detail={"error": exc.message, "field": exc.field})
+
+
+@router.post("/telegram/accounts/login/start", tags=["system"])
+async def telegram_login_start(
+    body: TelegramLoginStart,
+    request: Request,
+    principal: Principal = Depends(require_system_admin),
+) -> Dict[str, Any]:
+    """Step 1: Telegram sends a login code to the phone."""
+    enforce_rate_limit(request, "write")
+    try:
+        return await telegram_login.start(body.label, body.phone, body.make_default)
+    except telegram_login.LoginError as exc:
+        raise _login_http_error(exc) from None
+
+
+@router.post("/telegram/accounts/login/code", tags=["system"])
+async def telegram_login_code(
+    body: TelegramLoginCode,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_system_admin),
+) -> Dict[str, Any]:
+    """Step 2: the login code. Answers stage 'password' when the account has 2FA, else 'done'."""
+    enforce_rate_limit(request, "write")
+    try:
+        result = await telegram_login.submit_code(body.login_id, body.code)
+    except telegram_login.LoginError as exc:
+        raise _login_http_error(exc) from None
+    if result.get("stage") == "done":
+        await write_audit(db, principal, "TELEGRAM_ACCOUNT_ADD", "telegram_account", result["label"])
+        await db.commit()
+    return result
+
+
+@router.post("/telegram/accounts/login/password", tags=["system"])
+async def telegram_login_password(
+    body: TelegramLoginPassword,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_system_admin),
+) -> Dict[str, Any]:
+    """Step 3 (only with 2FA): the two-step password."""
+    enforce_rate_limit(request, "write")
+    try:
+        result = await telegram_login.submit_password(body.login_id, body.password)
+    except telegram_login.LoginError as exc:
+        raise _login_http_error(exc) from None
+    await write_audit(db, principal, "TELEGRAM_ACCOUNT_ADD", "telegram_account", result["label"])
+    await db.commit()
+    return result
+
+
+@router.post("/telegram/accounts/login/cancel", tags=["system"])
+async def telegram_login_cancel(
+    body: TelegramLoginCancel,
+    request: Request,
+    principal: Principal = Depends(require_system_admin),
+) -> Dict[str, Any]:
+    enforce_rate_limit(request, "write")
+    await telegram_login.cancel(body.login_id)
+    return {"cancelled": True}
+
+
+@router.post("/telegram/accounts/{label}/default", tags=["system"])
+async def telegram_account_set_default(
+    label: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_system_admin),
+) -> Dict[str, Any]:
+    enforce_rate_limit(request, "write")
+    account = telegram_accounts.get_account(label)
+    if account is None:
+        raise HTTPException(status_code=404, detail={"error": "No such Telegram account."})
+    if account.get("legacy"):
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "This is the original single-account session; it is already the default."},
+        )
+    telegram_accounts.set_default(account["label"])
+    await write_audit(db, principal, "TELEGRAM_ACCOUNT_SET_DEFAULT", "telegram_account", account["label"])
+    await db.commit()
+    return {"label": account["label"], "is_default": True}
+
+
+@router.delete("/telegram/accounts/{label}", tags=["system"])
+async def telegram_account_remove(
+    label: str,
+    request: Request,
+    revoke: bool = Query(True, description="Also log the session out on Telegram's side."),
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_system_admin),
+) -> Dict[str, Any]:
+    """Forget an account and delete its session file. The agent can no longer use it."""
+    enforce_rate_limit(request, "write")
+    account = telegram_accounts.get_account(label)
+    if account is None:
+        raise HTTPException(status_code=404, detail={"error": "No such Telegram account."})
+    # Disconnect any client this process holds before the file goes away.
+    from backend.app.tools import telegram_user_tools as tools
+
+    held = tools._extra_sessions.pop(account["label"].lower(), None)
+    if account.get("legacy"):
+        held = tools._session
+    if held is not None:
+        await held.disconnect_quietly()
+    revoked = False
+    if revoke:
+        revoked = await telegram_login.revoke_and_delete(account["session_path"])
+    else:
+        telegram_login._delete_session_files(telegram_accounts.resolve_path(account["session_path"]))
+    if not account.get("legacy"):
+        telegram_accounts.remove_account(account["label"])
+    await write_audit(db, principal, "TELEGRAM_ACCOUNT_REMOVE", "telegram_account", account["label"])
+    await db.commit()
+    return {"removed": account["label"], "revoked_on_telegram": revoked}
 
 
 @router.get("/worker/status", tags=["system"])

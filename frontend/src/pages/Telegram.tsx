@@ -1,9 +1,13 @@
 /** Telegram Integration: readiness of the Telegram user client, from the worker's real status. */
 
-import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { CheckCircle2, ChevronRight, Info, Send, XCircle } from 'lucide-react'
+import { CheckCircle2, ChevronRight, Info, Plus, Send, Star, Trash2, UserRound, XCircle } from 'lucide-react'
 import { api } from '@/services/api'
+import AddAccountModal from '@/components/telegram/AddAccountModal'
+import RemoveAccountModal from '@/components/telegram/RemoveAccountModal'
+import type { TelegramAccount } from '@/types'
 import { Card, ErrorState, IconTile, Loading, PageHeader, Pill } from '@/components/ui'
 
 export default function Telegram() {
@@ -11,6 +15,20 @@ export default function Telegram() {
     queryKey: ['worker-status-mini'],
     queryFn: api.workerStatus,
     refetchInterval: 5000,
+  })
+
+  const accountsQuery = useQuery({
+    queryKey: ['telegram-accounts'],
+    queryFn: api.telegramAccounts,
+    refetchInterval: 15000,
+  })
+  const accounts = accountsQuery.data?.accounts ?? []
+  const qc = useQueryClient()
+  const [adding, setAdding] = useState(false)
+  const [removing, setRemoving] = useState<TelegramAccount | null>(null)
+  const makeDefault = useMutation({
+    mutationFn: (label: string) => api.telegramSetDefault(label),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['telegram-accounts'] }),
   })
 
   if (isLoading) return <Loading label="Checking Telegram" />
@@ -71,6 +89,79 @@ export default function Telegram() {
           </div>
         ))}
       </Card>
+
+      {/* Accounts */}
+      <Card
+        title={`Telegram accounts (${accounts.length})`}
+        action={
+          <button type="button" onClick={() => setAdding(true)} className="btn btn-primary !px-3 !py-1.5 text-xs">
+            <Plus className="h-4 w-4" /> Add account
+          </button>
+        }
+      >
+        {accountsQuery.isLoading ? (
+          <p className="py-4 text-center text-sm text-slate-500">Loading accounts…</p>
+        ) : accountsQuery.error ? (
+          <p className="py-4 text-center text-sm text-status-warning">Could not load Telegram accounts.</p>
+        ) : accounts.length === 0 ? (
+          <p className="py-4 text-center text-sm text-slate-500">No account is logged in yet. Tap “Add account”.</p>
+        ) : (
+          <ul className="divide-y divide-surface-300/70">
+            {accounts.map((a) => (
+              <li key={a.label} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+                <IconTile tone={a.logged_in ? 'blue' : 'slate'} className="h-10 w-10">
+                  <UserRound />
+                </IconTile>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold text-slate-100">
+                    {a.profile_name ?? 'Unnamed profile'}
+                  </p>
+                  <p className="truncate text-xs text-slate-500">
+                    {a.username ? `@${a.username}` : 'no username'}
+                    {a.user_id ? ` · id ${a.user_id}` : ''}
+                  </p>
+                </div>
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <Pill tone="blue">{a.label}</Pill>
+                  <div className="flex gap-1">
+                    {a.is_default && <Pill tone="green">Default</Pill>}
+                    {!a.logged_in && <Pill tone="red">Logged out</Pill>}
+                  </div>
+                </div>
+                <div className="flex shrink-0 gap-1">
+                  {!a.is_default && !a.legacy && (
+                    <button
+                      type="button"
+                      title="Make default"
+                      aria-label={`Make ${a.label} the default account`}
+                      disabled={makeDefault.isPending}
+                      onClick={() => makeDefault.mutate(a.label)}
+                      className="rounded-lg p-2 text-slate-400 hover:bg-surface-200 hover:text-slate-100"
+                    >
+                      <Star className="h-4 w-4" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    title="Remove"
+                    aria-label={`Remove ${a.label}`}
+                    onClick={() => setRemoving(a)}
+                    className="rounded-lg p-2 text-slate-400 hover:bg-surface-200 hover:text-status-error"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {makeDefault.error && <p className="mt-3 text-xs text-status-error">{(makeDefault.error as Error).message}</p>}
+        <p className="mt-3 text-xs text-slate-500">
+          The agent uses the default account unless a task names a label.
+        </p>
+      </Card>
+      {adding && <AddAccountModal hasAccounts={accounts.length > 0} onClose={() => setAdding(false)} />}
+      {removing && <RemoveAccountModal account={removing} onClose={() => setRemoving(null)} />}
 
       {/* Setup checks */}
       <Card title="Setup">

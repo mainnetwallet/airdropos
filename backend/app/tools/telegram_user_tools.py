@@ -32,6 +32,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs
 
 from backend.app.core.config import settings
+from backend.app.integrations import telegram_accounts
+from backend.app.integrations.telegram_accounts import resolve_path
 from backend.app.live import hub
 from backend.app.live.events import redact_text
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
@@ -114,10 +116,22 @@ class _RateLimited(Exception):
     pass
 
 
-class _TelegramUserSession:
-    """One shared, lazily connected Telethon client."""
+class UnknownAccount(Exception):
+    """The requested Telegram account label is not registered."""
 
-    def __init__(self) -> None:
+
+class _TelegramUserSession:
+    """One lazily connected Telethon client for one Telegram account.
+
+    Every account has its own session file, lock, pacing and daily counter, so two
+    accounts never share a connection and one account's flood limit never slows another.
+    """
+
+    def __init__(self, label: str = "default", session_path: Optional[str] = None,
+                 session_id: Optional[str] = None) -> None:
+        self.label = label
+        self.session_path = session_path  # None = the legacy TELEGRAM_SESSION_PATH
+        self.SESSION_ID = session_id or self.SESSION_ID
         self._client: Any = None
         self._lock = asyncio.Lock()
         self._last_action = 0.0
@@ -225,7 +239,7 @@ class _TelegramUserSession:
             raise ImportError("telethon is not installed (pip install telethon)")
         if self._client is None:
             self._client = TelegramClient(
-                settings.TELEGRAM_SESSION_PATH,
+                str(resolve_path(self.session_path)) if self.session_path else settings.TELEGRAM_SESSION_PATH,
                 int(settings.TELEGRAM_API_ID),
                 str(settings.TELEGRAM_API_HASH),
             )
@@ -367,7 +381,48 @@ class _TelegramUserSession:
                                           retryable=True)
 
 
-_session = _TelegramUserSession()
+_session = _TelegramUserSession()  # the legacy single account (TELEGRAM_SESSION_PATH)
+_extra_sessions: Dict[str, _TelegramUserSession] = {}  # one per additionally registered account
+
+ACCOUNT_PROPERTY = {
+    "type": "string",
+    "description": (
+        "Optional label of the Telegram account to act as (see telegram_get_my_account). "
+        "Leave empty to use the default account."
+    ),
+    "maxLength": 40,
+}
+
+
+def all_sessions() -> List[_TelegramUserSession]:
+    """Every session object that exists in this process (legacy first)."""
+    return [_session, *_extra_sessions.values()]
+
+
+def session_for(label: Optional[str] = None) -> _TelegramUserSession:
+    """The session for an account label; the default account when no label is given.
+
+    With nothing registered this is the legacy session, so a single-account setup behaves
+    exactly as before. Raises UnknownAccount for a label that is not registered.
+    """
+    label = (label or "").strip() or None
+    account = telegram_accounts.get_account(label)
+    if account is None:
+        if label is None:
+            return _session
+        known = ", ".join(a["label"] for a in telegram_accounts.list_accounts()) or "none"
+        raise UnknownAccount(f"Unknown Telegram account '{label[:40]}'. Logged-in accounts: {known}.")
+    if account.get("legacy") or account["session_path"] == settings.TELEGRAM_SESSION_PATH:
+        _session.label = account["label"]
+        return _session
+    key = account["label"].lower()
+    sess = _extra_sessions.get(key)
+    if sess is None or sess.session_path != account["session_path"]:
+        slug = telegram_accounts.slugify(account["label"])
+        sess = _extra_sessions[key] = _TelegramUserSession(
+            account["label"], account["session_path"], session_id=f"telegram:{slug}"
+        )
+    return sess
 
 
 def _is_group_or_channel(entity: Any) -> bool:
@@ -821,6 +876,10 @@ class TelegramOpenBotTool(BaseTool):
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
         try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
+        try:
             target = parse_target(params["bot"])
         except ValueError as exc:
             return ToolResult.failure(str(exc), category="INVALID_INPUT")
@@ -845,8 +904,8 @@ class TelegramOpenBotTool(BaseTool):
                 history = await _recent_messages(client, entity, 10)
                 if history:
                     ref = _describe_entity(entity)
-                    _session.remember_chat(ref)
-                    _session.current_bot = target["value"]
+                    session.remember_chat(ref)
+                    session.current_bot = target["value"]
                     return ToolResult.success(
                         data={
                             "bot": target["value"],
@@ -869,10 +928,10 @@ class TelegramOpenBotTool(BaseTool):
             replies = await _wait_for_replies(client, entity, sent.id)
             described = [_describe_message(m) for m in replies]
             ref = _describe_entity(entity)
-            _session.remember_chat(ref)
+            session.remember_chat(ref)
             # Anchor the workflow here. "Return to the bot" is a later step, and it must
             # be able to find this bot without the LLM having remembered the name.
-            _session.current_bot = target["value"]
+            session.current_bot = target["value"]
             return ToolResult.success(
                 data={
                     "bot": target["value"],
@@ -890,7 +949,7 @@ class TelegramOpenBotTool(BaseTool):
                 evidence=_evidence("bot_started", message_id=sent.id, reply_count=len(described)),
             )
 
-        return await _session.run(action, interactive=True, label=f"Opened bot @{target['value']}")
+        return await session.run(action, interactive=True, label=f"Opened bot @{target['value']}")
 
 
 class TelegramJoinChatTool(BaseTool):
@@ -915,6 +974,10 @@ class TelegramJoinChatTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         try:
             target = parse_target(params["chat"])
         except ValueError as exc:
@@ -962,7 +1025,7 @@ class TelegramJoinChatTool(BaseTool):
                     retryable=False,
                 )
             ref = _describe_entity(entity)
-            _session.remember_chat(ref)
+            session.remember_chat(ref)
 
             if state is not True:
                 return ToolResult.failure(
@@ -995,7 +1058,7 @@ class TelegramJoinChatTool(BaseTool):
             if target["kind"] == "username"
             else "Joined a chat via a private invitation link"
         )
-        return await _session.run(action, interactive=True, label=label)
+        return await session.run(action, interactive=True, label=label)
 
 
 class TelegramReadMessagesTool(BaseTool):
@@ -1024,6 +1087,10 @@ class TelegramReadMessagesTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         raw_chat = str(params["chat"]).strip()
         # A numeric chat id is a legitimate target: it is the ONLY address for a private
         # group joined by invitation, which has no public @username.
@@ -1051,7 +1118,7 @@ class TelegramReadMessagesTool(BaseTool):
                 return ToolResult.failure(str(exc), category="INVALID_INPUT")
             messages = await _recent_messages(client, entity, limit)
             ref = _describe_entity(entity)
-            _session.remember_chat(ref)
+            session.remember_chat(ref)
             return ToolResult.success(
                 data={"chat": display, "chat_id": ref.get("chat_id"),
                       "title": ref.get("title"), "messages": messages, "count": len(messages),
@@ -1059,7 +1126,7 @@ class TelegramReadMessagesTool(BaseTool):
                 evidence=_evidence("message_observed", chat_id=ref.get("chat_id"), count=len(messages)),
             )
 
-        return await _session.run(action, interactive=False, label=f"Read messages from {display[:60]}")
+        return await session.run(action, interactive=False, label=f"Read messages from {display[:60]}")
 
 
 class TelegramSendMessageTool(BaseTool):
@@ -1083,6 +1150,10 @@ class TelegramSendMessageTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         text = params["text"]
         if looks_like_secret(text):
             return ToolResult(
@@ -1119,7 +1190,7 @@ class TelegramSendMessageTool(BaseTool):
                 evidence=_evidence("message_sent", message_id=sent.id, reply_count=len(described)),
             )
 
-        return await _session.run(action, interactive=True, label=f"Sent a message to @{target['value']} ({len(text)} chars)")
+        return await session.run(action, interactive=True, label=f"Sent a message to @{target['value']} ({len(text)} chars)")
 
 
 class TelegramClickButtonTool(BaseTool):
@@ -1151,6 +1222,10 @@ class TelegramClickButtonTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         try:
             target = parse_target(params["chat"])
         except ValueError as exc:
@@ -1220,7 +1295,7 @@ class TelegramClickButtonTool(BaseTool):
                 ),
             )
 
-        return await _session.run(action, interactive=True, label=f"Pressed a button in @{target['value']}")
+        return await session.run(action, interactive=True, label=f"Pressed a button in @{target['value']}")
 
 
 class TelegramGetMyAccountTool(BaseTool):
@@ -1230,7 +1305,7 @@ class TelegramGetMyAccountTool(BaseTool):
     version = "1.0.0"
     description = (
         "Return the @username (and display name and numeric id) of the Telegram account this "
-        "agent is logged in as. When a task or a bot asks for 'your Telegram username' and "
+        "agent is logged in as (pass `account` to ask about another logged-in account). When a task or a bot asks for 'your Telegram username' and "
         "none is given, call this and use exactly the username it returns. Never returns the "
         "phone number."
     )
@@ -1241,6 +1316,10 @@ class TelegramGetMyAccountTool(BaseTool):
     input_schema = {"type": "object", "properties": {}}
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         async def action(client: Any) -> ToolResult:
             me = await client.get_me()
             if me is None:
@@ -1253,6 +1332,7 @@ class TelegramGetMyAccountTool(BaseTool):
             first = getattr(me, "first_name", None) or ""
             last = getattr(me, "last_name", None) or ""
             data = {
+                "account_label": session.label,
                 "username": username,
                 "handle": f"@{username}" if username else None,
                 "display_name": f"{first} {last}".strip() or None,
@@ -1268,7 +1348,7 @@ class TelegramGetMyAccountTool(BaseTool):
                 data=data, evidence=_evidence("account_read", username=username)
             )
 
-        return await _session.run(action, interactive=False, label="Read Telegram account")
+        return await session.run(action, interactive=False, label="Read Telegram account")
 
 
 class TelegramListDialogsTool(BaseTool):
@@ -1300,6 +1380,10 @@ class TelegramListDialogsTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         limit = int(params.get("limit") or 20)
         search = str(params.get("search") or "").strip().lower()
         bots_only = bool(params.get("bots_only"))
@@ -1317,7 +1401,7 @@ class TelegramListDialogsTool(BaseTool):
                 haystack = f"{ref.get('title') or ''} {ref.get('username') or ''}".lower()
                 if search and search not in haystack:
                     continue
-                _session.remember_chat(ref)
+                session.remember_chat(ref)
                 found.append({**ref, "is_bot": is_bot,
                               "unread": int(getattr(dialog, "unread_count", 0) or 0)})
                 if len(found) >= limit:
@@ -1327,7 +1411,7 @@ class TelegramListDialogsTool(BaseTool):
                 evidence=_evidence("dialog_listed", count=len(found)),
             )
 
-        return await _session.run(action, interactive=False, label="Listed Telegram dialogs")
+        return await session.run(action, interactive=False, label="Listed Telegram dialogs")
 
 
 class TelegramCheckMembershipTool(BaseTool):
@@ -1353,8 +1437,12 @@ class TelegramCheckMembershipTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         chat = str(params["chat"]).strip()
-        known = _session.resolve_ref(chat)
+        known = session.resolve_ref(chat)
         if known is not None and known.get("chat_id"):
             # Prefer an already-resolved id: a private chat joined by invitation has no
             # public username, so its id is the only addressable reference.
@@ -1372,7 +1460,7 @@ class TelegramCheckMembershipTool(BaseTool):
                     retryable=False,
                 )
             ref = _describe_entity(entity)
-            _session.remember_chat(ref)
+            session.remember_chat(ref)
             state, how = await _membership_state(client, entity)
             is_member = state is True
             return ToolResult.success(
@@ -1387,7 +1475,7 @@ class TelegramCheckMembershipTool(BaseTool):
                                    is_member=is_member, method=how),
             )
 
-        return await _session.run(action, interactive=False, label=f"Checked membership of {chat[:60]}")
+        return await session.run(action, interactive=False, label=f"Checked membership of {chat[:60]}")
 
 
 async def _resolve_entity(client: Any, chat: str) -> Any:
@@ -1450,8 +1538,7 @@ def register_telegram_user_tools(registry) -> bool:
     # the continuation tools import from it, so a top-level import would be circular.
     from backend.app.tools.telegram_continuation_tools import CONTINUATION_TOOLS
 
-    registry.register_or_replace_many(
-        [
+    tools = [
             TelegramOpenBotTool(),
             TelegramJoinChatTool(),
             TelegramReadMessagesTool(),
@@ -1461,8 +1548,10 @@ def register_telegram_user_tools(registry) -> bool:
             TelegramGetMyAccountTool(),
             TelegramCheckMembershipTool(),
             *[tool() for tool in CONTINUATION_TOOLS],
-        ]
-    )
+    ]
+    for tool in tools:
+        tool.input_schema.setdefault("properties", {}).setdefault("account", ACCOUNT_PROPERTY)
+    registry.register_or_replace_many(tools)
     return True
 
 
@@ -1508,8 +1597,10 @@ def telegram_capability_report() -> Dict[str, Any]:
     from backend.app.tools.telegram_continuation_tools import CONTINUATION_TOOLS
 
     report["tools"] += sorted(tool.name for tool in CONTINUATION_TOOLS)
-    if _session.is_connected():
-        report["session"] = "connected"
-    else:
-        report["session"] = "not_connected"
+    report["session"] = "connected" if any(x.is_connected() for x in all_sessions()) else "not_connected"
+    report["accounts"] = [
+        {"label": a["label"], "profile_name": a.get("profile_name"), "logged_in": a["session_ready"],
+         "default": bool(a.get("is_default"))}
+        for a in telegram_accounts.list_accounts()
+    ]
     return report
