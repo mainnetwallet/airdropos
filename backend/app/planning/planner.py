@@ -396,6 +396,13 @@ Hard rules:
     visible_text, http_status, source_scan, notification_delivered, prepared_transfer,
     contract_read, wallet_record, record_read, message_observed, button_clicked, or
     tool_evidence. Put the detail of what must be true in "expected_evidence", never in "verification_method".
+    For Telegram work match the method to what the tool really proves: telegram_send_message ->
+    message_sent, telegram_click_button -> button_clicked, starting a bot -> bot_started. Those only
+    prove the action happened, NOT that the bot accepted it. To prove acceptance add a separate
+    read step (verification_method message_observed) that reads the bot's reply. Never declare
+    page_observation or post_action_observation for a Telegram send or click.
+    "prerequisites" must be empty or machine-checkable expressions like "retry_count<3"; never
+    plain-English sentences such as "Bot accepted the URL" (put that in "depends_on" instead).
 13. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """
@@ -418,6 +425,9 @@ Hard rules:
    visible_text, http_status, source_scan, notification_delivered, prepared_transfer,
    contract_read, wallet_record, record_read, message_observed, button_clicked, or
    tool_evidence. Put the detail in "expected_evidence", never in "verification_method".
+   For Telegram: send -> message_sent, click -> button_clicked, bot reply read -> message_observed.
+   Never use page_observation or post_action_observation for a Telegram send or click.
+   "prerequisites" must be empty or machine-checkable (e.g. "retry_count<3"), never plain English.
 8. To press a bot button use telegram_click_button with the chat and the exact button_text.
    Do NOT add a read step just to find a message id: message_id is optional and the tool
    finds the newest message carrying that button itself.

@@ -962,6 +962,10 @@ class AgentController:
                     LoopOutcome.PARTIALLY_COMPLETED,
                 )
 
+        # Anything flushed so far holds SQLite's single write lock until commit. A tool call can
+        # take many seconds (Telegram, browser), so release the lock first or the API, scheduler
+        # and heartbeat writers time out with "database is locked".
+        await self._release_write_lock()
         tool_result = await self.registry.invoke(
             step.tool, step.parameters, policy=self.policy, task_id=task.task_id
         )
@@ -1196,6 +1200,7 @@ class AgentController:
 
         # Newly discovered requirements change the context, so this is a new planning
         # cycle: the revision key means the memo cannot serve a stale payload here.
+        await self._release_write_lock()  # the replan below is a slow LLM call
         context_payload, campaign_payload = await self._resolved_planning_context(task)
 
         try:
@@ -1467,6 +1472,8 @@ class AgentController:
                 LoopOutcome.PARTIALLY_COMPLETED,
             )
 
+        await self._release_write_lock()  # the replan below is a slow LLM call
+
         # Budget pressure is a distinct trigger worth reporting accurately.
         # The per-transaction ceiling is optional; with none configured there is no
         # budget to be under pressure from.
@@ -1705,6 +1712,17 @@ class AgentController:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    async def _release_write_lock(self) -> None:
+        """Commit pending work so SQLite's write lock is not held across a slow call.
+
+        The loop already commits per iteration; this closes the gap inside one iteration, where a
+        flush followed by a tool or LLM call kept the lock for tens of seconds.
+        """
+        try:
+            await self.db.commit()
+        except Exception as exc:  # never let lock hygiene abort the step itself
+            logger.warning("Could not release the DB write lock early: %s", exc)
+
     async def _checkpoint(self, task: Task, iteration: int, name: str) -> None:
         try:
             plan = await self.planner.current_plan(task)
