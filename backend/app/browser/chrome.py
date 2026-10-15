@@ -543,29 +543,126 @@ def _looks_like_component_extension(meta: Dict[str, Any], ext_id: str) -> bool:
     return bool(ext_id) and not _EXTENSION_ID_RE.match(ext_id)
 
 
-def installed_extensions(user_data_dir: str) -> List[InstalledExtension]:
-    """Extensions INSTALLED into this Chrome profile, read from its own Preferences file.
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        logger.debug("Unreadable Chrome file %s: %s", path, type(exc).__name__)
+        return {}
+    return data if isinstance(data, dict) else {}
 
-    This is the profile's real state, not an inference from a page. Chrome writes the
-    installed list here; an extension that was only passed with ``--load-extension``
-    is absent from it, which is exactly why it is reported as a limitation.
+
+def _extension_settings(user_data_dir: str) -> Dict[str, Any]:
+    """Install records for the profile's extensions, from every file Chrome keeps them in.
+
+    Current Chrome records user-installed extensions in ``Secure Preferences``, not in
+    ``Preferences``; reading only the latter reports a correct Web Store install as absent.
+    Both are merged, ``Secure Preferences`` winning because it is the one Chrome protects.
     """
-    settings_blob = (read_preferences(user_data_dir).get("extensions") or {}).get("settings") or {}
+    base = expand(user_data_dir) / "Default"
+    merged: Dict[str, Any] = {}
+    for name in ("Preferences", "Secure Preferences"):
+        blob = (_read_json_file(base / name).get("extensions") or {}).get("settings") or {}
+        if isinstance(blob, dict):
+            merged.update({k: v for k, v in blob.items() if isinstance(v, dict)})
+    return merged
+
+
+def _localized(manifest: Dict[str, Any], value: str, extension_dir: Path) -> str:
+    """Resolve a ``__MSG_key__`` manifest string from the extension's own locale file."""
+    match = re.fullmatch(r"__MSG_(.+?)__", value or "")
+    if not match:
+        return value
+    key = match.group(1)
+    locales = [str(manifest.get("default_locale") or ""), "en", "en_US"]
+    for locale in locales:
+        if not locale:
+            continue
+        data = _read_json_file(extension_dir / "_locales" / locale / "messages.json")
+        # Chrome treats message keys case-insensitively.
+        for k, v in data.items():
+            if str(k).lower() == key.lower() and isinstance(v, dict) and v.get("message"):
+                return str(v["message"])
+    return value
+
+
+def _extensions_on_disk(user_data_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Extensions unpacked under ``Default/Extensions/<id>/<version>`` with their manifest.
+
+    Written the moment an install completes, so it sees an extension even before Chrome has
+    flushed its preference files. Chrome only moves a package here after a successful install.
+    """
+    root = expand(user_data_dir) / "Default" / "Extensions"
+    found: Dict[str, Dict[str, Any]] = {}
+    if not root.is_dir():
+        return found
+    for ext_dir in root.iterdir():
+        if not ext_dir.is_dir() or not _EXTENSION_ID_RE.match(ext_dir.name):
+            continue
+        versions = sorted((p for p in ext_dir.iterdir() if p.is_dir()), key=lambda p: p.name, reverse=True)
+        for version_dir in versions:
+            manifest = _read_json_file(version_dir / "manifest.json")
+            if manifest:
+                manifest = dict(manifest)
+                manifest["name"] = _localized(manifest, str(manifest.get("name") or ""), version_dir)
+                manifest["description"] = _localized(
+                    manifest, str(manifest.get("description") or ""), version_dir
+                )
+                manifest.setdefault("version", version_dir.name)
+                found[ext_dir.name] = manifest
+                break
+    return found
+
+
+def installed_extensions(user_data_dir: str) -> List[InstalledExtension]:
+    """Extensions INSTALLED into this Chrome profile, from the profile's own files.
+
+    This is the profile's real state, not an inference from a page: Chrome's install records
+    (``Secure Preferences`` and ``Preferences``) plus the unpacked ``Extensions`` folder. An
+    extension that was only passed with ``--load-extension`` is absent from all of them, which
+    is exactly why it is reported as a limitation.
+    """
+    settings_blob = _extension_settings(user_data_dir)
+    on_disk = _extensions_on_disk(user_data_dir)
     out: List[InstalledExtension] = []
+    seen = set()
+
     for ext_id, meta in settings_blob.items():
-        if not isinstance(meta, dict) or not _EXTENSION_ID_RE.match(str(ext_id)):
+        if not _EXTENSION_ID_RE.match(str(ext_id)):
             continue
         if _looks_like_component_extension(meta, str(ext_id)):
             continue
-        manifest = meta.get("manifest") or {}
+        manifest = meta.get("manifest") or on_disk.get(str(ext_id)) or {}
+        seen.add(str(ext_id))
         out.append(
             InstalledExtension(
                 id=str(ext_id),
-                name=str(manifest.get("name") or ""),
+                name=str(manifest.get("name") or on_disk.get(str(ext_id), {}).get("name") or ""),
                 version=str(manifest.get("version") or ""),
                 # Chrome's extension state: 1 = enabled, 0 = disabled, 2 = blacklisted.
                 enabled=int(meta.get("state", 1)) == 1,
                 from_webstore=bool(meta.get("from_webstore")),
+                description=str(manifest.get("description") or ""),
+                homepage=str(manifest.get("homepage_url") or ""),
+                manifest_version=int(manifest.get("manifest_version") or 0),
+                permissions=[str(p) for p in (manifest.get("permissions") or []) if isinstance(p, str)],
+            )
+        )
+
+    # Unpacked on disk but not (yet) in an install record: a completed install Chrome has not
+    # flushed to its preference files.
+    for ext_id, manifest in on_disk.items():
+        if ext_id in seen:
+            continue
+        out.append(
+            InstalledExtension(
+                id=ext_id,
+                name=str(manifest.get("name") or ""),
+                version=str(manifest.get("version") or ""),
+                enabled=True,
+                from_webstore="google.com" in str(manifest.get("update_url") or ""),
                 description=str(manifest.get("description") or ""),
                 homepage=str(manifest.get("homepage_url") or ""),
                 manifest_version=int(manifest.get("manifest_version") or 0),
