@@ -23,6 +23,7 @@ import type {
   TaskSummary,
   ToolDescriptor,
   WalletView,
+  TelegramAccount,
   WorkerStatus,
 } from '@/types'
 import type {
@@ -222,6 +223,7 @@ export const api = {
   readiness: () => request<Record<string, unknown>>('/readiness'),
   diagnostics: () => request<DiagnosticsResponse>('/diagnostics'),
   workerStatus: () => request<WorkerStatus>('/worker/status'),
+  telegramAccounts: () => request<{ accounts: TelegramAccount[] }>('/telegram/accounts'),
   clearWorkerLogs: () =>
     request<{ cleared: number; cleared_at: string | null }>('/worker/logs/clear', { method: 'POST' }),
 

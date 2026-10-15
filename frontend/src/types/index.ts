@@ -559,10 +559,23 @@ export interface WorkerStatus {
     api_hash_set: boolean
     telethon_installed: boolean
     session_file_exists: boolean
+    accounts_count?: number
     ready: boolean
     hint: string | null
   }
   emergency_stop: boolean
   problems: string[]
   logs: WorkerLogLine[]
+}
+
+export interface TelegramAccount {
+  label: string
+  profile_name: string | null
+  first_name: string | null
+  last_name: string | null
+  username: string | null
+  user_id: number | null
+  is_default: boolean
+  logged_in: boolean
+  added_at: string | null
 }

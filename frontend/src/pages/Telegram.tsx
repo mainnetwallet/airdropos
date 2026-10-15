@@ -2,7 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { CheckCircle2, ChevronRight, Info, Send, XCircle } from 'lucide-react'
+import { CheckCircle2, ChevronRight, Info, Send, UserRound, XCircle } from 'lucide-react'
 import { api } from '@/services/api'
 import { Card, ErrorState, IconTile, Loading, PageHeader, Pill } from '@/components/ui'
 
@@ -12,6 +12,13 @@ export default function Telegram() {
     queryFn: api.workerStatus,
     refetchInterval: 5000,
   })
+
+  const accountsQuery = useQuery({
+    queryKey: ['telegram-accounts'],
+    queryFn: api.telegramAccounts,
+    refetchInterval: 15000,
+  })
+  const accounts = accountsQuery.data?.accounts ?? []
 
   if (isLoading) return <Loading label="Checking Telegram" />
   if (error || !data) return <ErrorState error={error} onRetry={() => refetch()} />
@@ -70,6 +77,48 @@ export default function Telegram() {
             <p className="text-xs text-slate-500">{item.label}</p>
           </div>
         ))}
+      </Card>
+
+      {/* Accounts */}
+      <Card title={`Telegram accounts (${accounts.length})`}>
+        {accountsQuery.isLoading ? (
+          <p className="py-4 text-center text-sm text-slate-500">Loading accounts…</p>
+        ) : accountsQuery.error ? (
+          <p className="py-4 text-center text-sm text-status-warning">Could not load Telegram accounts.</p>
+        ) : accounts.length === 0 ? (
+          <p className="py-4 text-center text-sm text-slate-500">
+            No account is logged in yet. Run <span className="font-mono">python scripts/telegram_login.py</span> in a terminal.
+          </p>
+        ) : (
+          <ul className="divide-y divide-surface-300/70">
+            {accounts.map((a) => (
+              <li key={a.label} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+                <IconTile tone={a.logged_in ? 'blue' : 'slate'} className="h-10 w-10">
+                  <UserRound />
+                </IconTile>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold text-slate-100">
+                    {a.profile_name ?? 'Unnamed profile'}
+                  </p>
+                  <p className="truncate text-xs text-slate-500">
+                    {a.username ? `@${a.username}` : 'no username'}
+                    {a.user_id ? ` · id ${a.user_id}` : ''}
+                  </p>
+                </div>
+                <div className="flex shrink-0 flex-col items-end gap-1">
+                  <Pill tone="blue">{a.label}</Pill>
+                  <div className="flex gap-1">
+                    {a.is_default && <Pill tone="green">Default</Pill>}
+                    {!a.logged_in && <Pill tone="red">Logged out</Pill>}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-3 text-xs text-slate-500">
+          Add another account: <span className="font-mono">python scripts/telegram_login.py --label NAME</span>
+        </p>
       </Card>
 
       {/* Setup checks */}

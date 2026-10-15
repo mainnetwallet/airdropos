@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -17,6 +16,7 @@ from backend.app.core.config import settings
 from backend.app.database.session import get_db
 from backend.app.airdrops.verifier import ChangeDetector
 from backend.app.inbox.service import ConversationService
+from backend.app.integrations import telegram_accounts
 from backend.app.integrations.telegram import telegram_bot
 from backend.app.learning.engine import LearningEngine
 from backend.app.llm.client import llm
@@ -1091,13 +1091,14 @@ def _telegram_readiness() -> Dict[str, Any]:
     except Exception:
         telethon_installed = False
 
-    session_file = Path(f"{settings.TELEGRAM_SESSION_PATH}.session")
+    accounts = telegram_accounts.list_accounts()
     checks = {
         "enabled": bool(settings.TELEGRAM_USER_ENABLED),
         "api_id_set": bool(settings.TELEGRAM_API_ID),
         "api_hash_set": bool(settings.TELEGRAM_API_HASH),
         "telethon_installed": telethon_installed,
-        "session_file_exists": session_file.exists(),
+        "session_file_exists": any(a["session_ready"] for a in accounts),
+        "accounts_count": sum(1 for a in accounts if a["session_ready"]),
     }
     hint: Optional[str] = None
     if not checks["enabled"]:
@@ -1109,6 +1110,31 @@ def _telegram_readiness() -> Dict[str, Any]:
     elif not checks["session_file_exists"]:
         hint = "Not logged in yet. Run scripts/telegram_login.py once in a terminal."
     return {**checks, "ready": hint is None, "hint": hint}
+
+
+@router.get("/telegram/accounts", tags=["system"])
+async def telegram_accounts_list(
+    request: Request,
+    principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    """Logged-in Telegram accounts: label and profile name only, never phone or session data."""
+    enforce_rate_limit(request, "read")
+    return {
+        "accounts": [
+            {
+                "label": a["label"],
+                "profile_name": a.get("profile_name"),
+                "first_name": a.get("first_name"),
+                "last_name": a.get("last_name"),
+                "username": a.get("username"),
+                "user_id": a.get("user_id"),
+                "is_default": bool(a.get("is_default")),
+                "logged_in": a["session_ready"],
+                "added_at": a.get("added_at"),
+            }
+            for a in telegram_accounts.list_accounts()
+        ]
+    }
 
 
 @router.get("/worker/status", tags=["system"])

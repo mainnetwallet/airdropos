@@ -11,7 +11,7 @@ group and then stopped. Two things were missing from the toolset:
 
 Both live here rather than in ``telegram_user_tools`` so the existing session,
 pacing, rate-limit and redaction machinery is reused unchanged: every tool runs
-through ``_session.run(...)`` exactly like the original five.
+through ``session.run(...)`` exactly like the original five.
 """
 
 from __future__ import annotations
@@ -26,7 +26,8 @@ from backend.app.tools.telegram_user_tools import (
     _evidence,
     _recent_messages,
     _resolve_entity,
-    _session,
+    UnknownAccount,
+    session_for,
     _wait_for_replies,
     parse_target,
 )
@@ -64,9 +65,13 @@ class TelegramReturnToBotTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         limit = int(params.get("limit") or 10)
         requested = str(params.get("bot") or "").strip()
-        target_name = requested or (_session.current_bot or "")
+        target_name = requested or (session.current_bot or "")
         if not target_name:
             return ToolResult.failure(
                 "No bot is known for this task and none was named. Open it first with "
@@ -89,8 +94,8 @@ class TelegramReturnToBotTool(BaseTool):
             # could discard progress already made in this task.
             messages = await _recent_messages(client, entity, limit)
             ref = _describe_entity(entity)
-            _session.remember_chat(ref)
-            _session.current_bot = target["value"]
+            session.remember_chat(ref)
+            session.current_bot = target["value"]
             buttons: List[Dict[str, Any]] = [
                 b for m in messages for b in (m.get("buttons") or [])
             ]
@@ -108,7 +113,7 @@ class TelegramReturnToBotTool(BaseTool):
                 ),
             )
 
-        return await _session.run(
+        return await session.run(
             action, interactive=False, label=f"Returned to bot @{target['value']}"
         )
 
@@ -146,8 +151,12 @@ class TelegramWaitForReplyTool(BaseTool):
     }
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        try:
+            session = session_for(params.get("account"))
+        except UnknownAccount as exc:
+            return ToolResult.failure(str(exc), category="INVALID_INPUT")
         chat = str(params["chat"]).strip()
-        known = _session.resolve_ref(chat)
+        known = session.resolve_ref(chat)
         if known is not None and known.get("chat_id"):
             chat = str(known["chat_id"])
         after_id = int(params.get("after_message_id") or 0)
@@ -161,7 +170,7 @@ class TelegramWaitForReplyTool(BaseTool):
             fresh = await _wait_for_replies(client, entity, after_id, timeout=timeout)
             described = [_describe_message(m) for m in fresh]
             ref = _describe_entity(entity)
-            _session.remember_chat(ref)
+            session.remember_chat(ref)
             if not described:
                 # Timing out is a reported fact, not a failure: the caller decides next.
                 return ToolResult.success(
@@ -191,7 +200,7 @@ class TelegramWaitForReplyTool(BaseTool):
                 ),
             )
 
-        return await _session.run(
+        return await session.run(
             action, interactive=False, label=f"Waited for a reply from {chat[:60]}"
         )
 
