@@ -153,6 +153,10 @@ EVIDENCE_KINDS: Dict[str, frozenset] = {
     "message_sent": frozenset({"message_sent"}),
     "dialog_listed": frozenset({"dialog_listed"}),
     "chat_resolved": frozenset({"chat_resolved", "membership_verified"}),
+    # `telegram_get_my_account` emitted an `account_read` kind that no method could
+    # ever match, so reading the account the agent acts as could never verify a step.
+    # The audit called this out and it survived until a test asserted the mapping.
+    "account_read": frozenset({"account_read"}),
     # A Telegram read is genuinely an observation of remote state, so it also
     # satisfies the generic page-observation methods the planner tends to write.
     "miniapp_opened": frozenset({"miniapp_launch_detected"}),
@@ -163,6 +167,30 @@ EVIDENCE_KINDS: Dict[str, frozenset] = {
     "human_intervention_requested": frozenset({"human_intervention_requested"}),
     "verification_completed": frozenset({"verification_completed", "membership_verified", "post_action_observation"}),
     "task_resumed": frozenset({"task_resumed"}),
+    # ------------------------------------------------------------------
+    # Telegram campaign engine (telegram_campaign_tools).
+    #
+    # Same reasoning as the block above: a campaign step that was genuinely carried
+    # out must be able to satisfy the method the planner declared, otherwise the
+    # item is recorded UNVERIFIED, never closed, and a multi-stage airdrop stalls on
+    # the first step that actually worked.
+    #
+    # Note what is deliberately NOT here: `task_checklist_built` proves a checklist
+    # was *derived* from what the bot said, and `campaign_identified` proves a chat
+    # was matched to a campaign. Neither is evidence that any task was completed, so
+    # neither is allowed to satisfy a completion-shaped method -- only the specific
+    # methods that genuinely mean "this was understood, not this was done".
+    # ------------------------------------------------------------------
+    "campaign_identified": frozenset({"campaign_identified"}),
+    "checklist_built": frozenset({"task_checklist_built"}),
+    "task_checklist_built": frozenset({"task_checklist_built"}),
+    "task_verified": frozenset({"task_verified", "message_observed", "membership_verified",
+                                "button_clicked", "bot_started", "miniapp_task_verified"}),
+    "campaign_resumed": frozenset({"campaign_resumed", "task_resumed"}),
+    # A Mini App task is only ever verified from state observed INSIDE the page.
+    # `miniapp_launch_detected` stays mapped to `miniapp_opened` alone, so having
+    # merely opened a Mini App can never satisfy a completion method.
+    "miniapp_task_verified": frozenset({"miniapp_task_verified"}),
 }
 
 from backend.app.agent.prompts import AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402

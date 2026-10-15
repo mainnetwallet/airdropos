@@ -21,6 +21,15 @@ from backend.app.tools.miniapp_tools import MINIAPP_TOOLS
 from backend.app.tools.notification_tools import register_notification_tools
 from backend.app.tools.registry import AuthorizationPolicy, registry
 from backend.app.tools.task_tools import register_task_tools
+# The Telegram tool family. All five register behind the SAME Telegram gate as the
+# core user tools (TELEGRAM_USER_ENABLED + api id/hash + telethon) and each one
+# re-checks it for itself, so a module imported here but registered later never
+# ends up half-present in the catalog.
+from backend.app.tools.telegram_bot_tools import register_bot_tools
+from backend.app.tools.telegram_campaign_tools import register_campaign_tools
+from backend.app.tools.telegram_group_tools import register_group_tools
+from backend.app.tools.telegram_message_tools import register_message_tools
+from backend.app.tools.telegram_session_tools import register_session_tools
 from backend.app.tools.telegram_user_tools import register_telegram_user_tools
 from backend.app.tools.transfer_tools import register_transfer_tools
 from backend.app.tools.wallet_tools import register_wallet_tools
@@ -56,6 +65,23 @@ def bootstrap_tools() -> None:
     register_airdrop_tools(registry)
     register_transfer_tools(registry)
     telegram_user_enabled = register_telegram_user_tools(registry)
+
+    # The rest of the Telegram family: session/account, bot discovery and commands,
+    # message and history access, group/channel management, and the campaign workflow
+    # engine. Gated on the core user tools coming up, so the planner never sees a
+    # campaign tool without the Telegram reads it depends on.
+    #
+    # The Mini App tools below are the deliberate exception: they are registered
+    # unconditionally, because detecting a launch and handing it to a browser need no
+    # Telegram credentials. When Telegram is off, 8 of those 11 still require
+    # `telegram.read`, so the policy drops them from `catalog_for_llm` and refuses them
+    # at invoke; the 3 that need only `browser.read` stay usable. Measured, not assumed.
+    if telegram_user_enabled:
+        register_session_tools(registry)
+        register_bot_tools(registry)
+        register_message_tools(registry)
+        register_group_tools(registry)
+        register_campaign_tools(registry)
 
     # Deterministic verification helpers. Always available: they need no external
     # dependency and are what stop an ordinary arithmetic question from being either

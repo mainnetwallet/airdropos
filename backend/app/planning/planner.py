@@ -425,6 +425,23 @@ Hard rules:
     one get_wallet_address step with no wallet argument (the operator's default wallet is
     used). When it asks for the operator's Telegram username, plan one telegram_get_my_account
     step and use the username it returns. Never invent either value.
+13c. A multi-task airdrop campaign: prefer the campaign engine over hand-writing every step.
+    Start with telegram_build_task_checklist, which derives the checklist from what the bot
+    actually said and PERSISTS it on the task, then telegram_get_next_action to pick each
+    following step, and telegram_execute_campaign_step to carry one out. The checklist is
+    what makes the campaign survive a restart and stop repeating completed work.
+13d. Telegram has no scrolling UI. Reading further back in a chat is API history paging:
+    telegram_load_older_messages (older page), telegram_scroll_to_message (a window around a
+    known message id), telegram_get_chat_history_page (explicit cursors). Never plan a step
+    that asks to "scroll down" in Telegram; scrolling is only real for Mini Apps and web
+    pages, via telegram_scroll_miniapp or the browser tools.
+13e. After any external action (joining a channel, sending a command) the bot must be
+    re-read before the next decision: telegram_return_to_bot gets back to the exact chat,
+    telegram_get_bot_response or telegram_get_conversation_state reads what changed, and
+    only then is a button worth pressing. The bot may reveal new instructions only after a
+    verification, may EDIT its instruction message in place, and may replace its buttons --
+    so never assume the next task is the next numbered item, and never press a button whose
+    label you have not just read from the current state.
 13. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """

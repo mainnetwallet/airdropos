@@ -59,9 +59,24 @@ def test_continuation_module_has_resolve_entity():
     assert telegram_continuation_tools._resolve_entity is _resolve_entity
 
 
-def test_send_tool_accepts_numeric_target_without_invalid_input():
+async def test_send_tool_accepts_numeric_target_without_invalid_input(client):
+    """A numeric chat id must be treated as an id, not parsed as a username.
+
+    This used to run against no client at all and assert only that the category was
+    not INVALID_INPUT -- which passed for the wrong reason: the tool failed later,
+    at connection time. With a fake client installed the numeric target now resolves
+    and the send actually succeeds, which is the real assertion.
+    """
+    client.entities[8804778898] = client.group
     tool = TelegramSendMessageTool()
-    # Secret screening and target parsing run before any network call; a numeric id
-    # must get past them (the session then fails only because no client is configured).
-    result = _run(tool.execute({"chat": "@8804778898", "text": "https://x.com/user"}))
+    result = await tool.execute({"chat": "@8804778898", "text": "https://x.com/user"})
     assert getattr(result, "error_category", None) != "INVALID_INPUT"
+    assert result.status.value == "success"
+    assert client.group.id in client.messages
+
+
+async def test_send_tool_still_rejects_a_genuinely_malformed_target(client):
+    """The complementary case: a target that is neither a username nor an id is refused."""
+    tool = TelegramSendMessageTool()
+    result = await tool.execute({"chat": "not a valid target!!", "text": "hello"})
+    assert result.error_category == "INVALID_INPUT"

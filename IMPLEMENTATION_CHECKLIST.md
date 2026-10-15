@@ -495,3 +495,321 @@ See [`docs/EXECUTION_CONTEXT.md`](./docs/EXECUTION_CONTEXT.md) for the reference
       through an extension, and nothing fabricates a signature or receipt.
 - [ ] No visual/screenshot-driven element resolution beyond `browser_click_at` for
       interfaces with no usable DOM. There is no claim of human-level visual automation.
+
+## Phase 16 — Telegram Airdrop Automation (added 2026-10-16)
+
+**Baseline, recorded before any change** (HEAD `7ffcb4a`, branch `main`, clean tree):
+
+```
+.venv\Scripts\python.exe -m pytest backend/tests -q
+```
+
+→ `1 failed, 365 passed`. **After this phase: `1 failed, 544 passed`** (545 collected),
+measured 2026-10-16 on Windows / Python 3.11. The one failure is the same
+pre-existing one and was deliberately left failing — see *Known gaps (Telegram)*.
+
+> **Run the suite from the repository root.** The same command from `backend/` fails with
+> `ModuleNotFoundError: No module named 'backend'`. This is a real trap in this repo, not
+> a typo: the suite imports the project by its full package path.
+
+No lint or typecheck config exists in this repo (no ruff/mypy/black, no CI). Frontend
+checks remain `cd frontend; npm run lint` and `npm run build`.
+
+### What was actually wrong before this
+
+- **Exactly 12 Telegram tools existed.** No history pagination anywhere: `get_messages` was
+  only ever called with `limit=`, and `iter_messages`, `min_id`, `max_id`, `offset_id` and
+  `search` appeared **nowhere in the codebase**. A client built that way can never see an
+  older message, so no prompt could fix it.
+- **`callback_data` was never surfaced**, and `telegram_click_button` captured only the
+  callback *popup* (`answer.message`), never the bot's post-click reply. A verification step
+  therefore had nothing to check.
+- **No checklist concept existed in code at all.**
+- No campaign state machine, no persistence of per-item state, and nothing that survives a
+  restart.
+
+### Shared service layer
+
+- [x] `app/tools/telegram_service.py` (new, **contains no tools**). Paginated history,
+      entity resolution, button location **plus a pressability assertion**, bounded and
+      cancellable waits, membership tri-state, task-line extraction, bot-state read, secret
+      and rate-limit guards.
+- [x] It **delegates** to the pre-existing `_membership_state`, `_locate_button`,
+      `_button_kind`, `CLICKABLE_BUTTON_KINDS` and `sanitize_external_text` rather than
+      re-deriving them, so safety rules live in exactly one place.
+- [x] **Order-independence is enforced, not hoped for.** `_order_chronological` sorts by
+      message id and `load_older` anchors on the **minimum** over a window rather than on a
+      single message, because `get_messages(limit=1)` returns the newest on real Telethon
+      and the oldest on some other clients. That order-dependence is what made button
+      location flaky before.
+- [x] `callback_data` is never returned raw. Buttons carry an opaque `callback_ref` digest
+      — stable enough to refer to the same button across calls, useless as a replay token.
+
+### New tool surface — 12 tools → 90
+
+- [x] `telegram_session_tools.py` (9) — connection state, login tri-state, account
+      profile, session status, reconnect / disconnect / resume, rate-limit budget, pending
+      user action. The reads inspect the session object **directly** and never touch the
+      network, so a diagnostic cannot answer its own question by silently connecting.
+- [x] `telegram_bot_tools.py` (12) — `telegram_search_bots`, `telegram_parse_bot_link`,
+      `telegram_get_bot_info`, `telegram_get_bot_commands`, `telegram_get_bot_menu`,
+      `telegram_start_bot`, `telegram_send_command`, `telegram_get_start_response`,
+      `telegram_get_bot_response`, `telegram_get_conversation_state`,
+      `telegram_get_available_actions`, `telegram_wait_for_bot_response`. `SetBotCommands`
+      is never called: a bot's menu is server-side config for its owner, and rewriting a
+      third party's published menu is not a read.
+- [x] `telegram_message_tools.py` (23) — chat details, paginated history, a single message,
+      in-chat search, buttons and callback results, entities, URLs, task instructions,
+      pending question, last-interaction memory, bot-interaction verification, open-by-id,
+      current chat, the four `scroll_*` page-navigation tools, visible messages, the two
+      real browser-backed scroll tools, reply-to-message.
+- [x] `telegram_group_tools.py` (7) — leave, membership, explicit group/channel
+      verification, chat permissions, invite-link inspection that **never joins** to find
+      out, join results.
+- [x] `telegram_campaign_tools.py` (18) — thin shells around the engine.
+- [x] `miniapp_tools.py` (2 → 11) — added `telegram_get_miniapp_info`,
+      `telegram_check_miniapp_auth_support`, `telegram_get_miniapp_launch_context`,
+      `telegram_get_miniapp_page_state`, `telegram_get_miniapp_visible_actions`,
+      `telegram_wait_for_miniapp_result`, `telegram_verify_miniapp_task`,
+      `telegram_resume_miniapp_task`, `telegram_handoff_miniapp_to_user`.
+- [x] `telegram_capability_report()` now lists the whole family, and the **dead**
+      `needs_user` branch in `NavigateTool`'s result was fixed — it read
+      `data["visible_text"]` / `data["title"]`, which never exist; the real keys are
+      `observation["text_excerpt"]` / `observation["title"]`.
+
+### "Scrolling" means API pagination, and the results say so
+
+- [x] A Telethon client is **not a user interface**. There is no viewport, no scrollbar and
+      no scroll position. `telegram_scroll_messages`, `telegram_scroll_to_message`,
+      `telegram_scroll_to_latest` and `telegram_load_older_messages` are honest names over
+      **page navigation** (`min_id` / `max_id` / `offset_id`).
+- [x] Every such result carries `navigation: "api_pagination"` plus a note, so neither the
+      model nor a human can mistake a paginated read for a UI scroll.
+- [x] The only genuine UI scrolling is `telegram_scroll_miniapp` and
+      `telegram_scroll_to_element`, inside the browser session a Mini App was handed to.
+      Planner guidance rule **13d** states the same rule to the model.
+- [x] A page walk is capped (`MAX_PAGES = 5`, `MAX_PAGE_SIZE = 100`) so "search a busy
+      channel" cannot become an unbounded scan that floods the context window.
+
+### Campaign engine
+
+- [x] `telegram_campaign_service.py` (new, **contains no tools**).
+- [x] **A separate 12-state machine** from `TaskStatus`, because they answer different
+      questions and move independently: `DISCOVERED`, `ANALYZING`, `READY`, `EXECUTING`,
+      `VERIFYING`, `COMPLETED`, `WAITING_FOR_USER`, `BLOCKED`, `FAILED`, `UNVERIFIED`,
+      `EXPIRED`, `CANCELLED`. `VALID_TRANSITIONS` is enforced by `set_state` →
+      `assert_transition`, not documented and hoped for.
+- [x] **Attempted is never completed.** `verify_item` requires the item's declared
+      `verification_method` to be satisfied by *authoritative* evidence whose `kind` is in
+      that method's accepted set. Anything short of that stays `UNVERIFIED` and is recorded
+      as an `OUTCOME_UNVERIFIED` observation. There is no code path that turns "we pressed
+      the button" into "the task is done".
+- [x] `UNVERIFIED` can never jump straight to `COMPLETED` — the only route that claims
+      success is a real `VERIFYING → COMPLETED` pass, walked by `advance_through`.
+- [x] `COMPLETED` may be **downgraded** to `UNVERIFIED`/`EXPIRED` (live state can
+      contradict it) but never silently back to `READY`.
+- [x] `TASK_TAXONOMY` is the single source of truth for what the system can actually do,
+      **including the types it cannot**: `quiz` and `social_task` are `supported: false`
+      with a stated reason, `miniapp_task` is flagged `detection_only`, and the
+      cross-platform types are `handoff`.
+- [x] **Reconciliation, not resumption.** `reconcile_state` re-checks memberships against
+      Telegram's participant record, detects a bot that **edited** its instruction message
+      (items go back to `ANALYZING`), detects a **stale button** (items are blocked, which
+      is what stops a retired `Verify` being pressed twice), and reports tasks the bot
+      revealed after the checklist was built. `next_action` reconciles *first* and only
+      then chooses — the order number is never the answer.
+- [x] The LLM is **judgement-only**: it labels already-extracted candidates, it cannot
+      invent a requirement, it cannot say something is done, every string it returns goes
+      through `sanitize_external_text`, and any failure degrades to the deterministic path
+      with the reason recorded rather than filling the gap.
+- [x] Bounded by construction: `MAX_CHECKLIST_ITEMS = 25`, `MAX_ITEM_RETRIES = 3`,
+      `MAX_CANDIDATE_LINES = 40`, an 8s post-action wait, and a single reconciliation page.
+- [x] The task id is never a tool parameter — it comes from `get_current_task_id()`. A
+      campaign tool with no running task returns `INVALID_INPUT` naming the reason rather
+      than falling back to a global checklist, because a checklist with no owning task
+      cannot be resumed, reported on, or cleared.
+
+### Persistence
+
+- [x] The checklist is persisted into the **existing `task_requirements` table** via
+      `TaskContextService`, using the JSONB `evidence` column for the structured item.
+      **No new table, no Alembic revision, no competing database.**
+      `app/migrations/versions` still ends at `8_wallet_default` and `task_requirements`
+      is unchanged since `6_task_context`.
+- [x] Writes go through `record_requirement` / `satisfy_requirement` / `mark_requirement`,
+      because `TaskContextService` already secret-screens on the way in, refreshes the
+      denormalised outstanding list and notifies the context watcher. The only direct
+      column writes are idempotent evidence-JSONB updates on a row this engine already
+      owns (`evidence["task_key"]`).
+- [x] Idempotent by construction, so `resume_campaign` is safe to call as often as it
+      likes; `load_checklist` reads back **only** rows carrying a `task_key`, so a
+      `TaskRequirement` written by the claim interpreter or the airdrop tools is left
+      strictly alone.
+- [x] `ChecklistItem.from_evidence` tolerates older/unknown shapes by downgrading an
+      unrecognised `state` to `UNVERIFIED` — the state that claims nothing.
+
+### Wiring (all in already-existing files)
+
+- [x] `app/tools/bootstrap.py` registers all five `register_*_tools` **behind the
+      existing Telegram gate**, so the catalog is all-or-nothing rather than half
+      present.
+- [x] `app/agent/controller.py` — six evidence kinds added to `EVIDENCE_KINDS`:
+      `campaign_identified`, `checklist_built`, `task_checklist_built`, `task_verified`,
+      `campaign_resumed`, `miniapp_task_verified`. **This was not cosmetic.** The
+      controller's table is a closed set that gates plan steps: a tool producing an unknown
+      kind records the step `UNVERIFIED` and it never closes, so without these a genuinely
+      proven multi-stage Telegram step was indistinguishable from one that did nothing.
+      `task_checklist_built` and `campaign_identified` are deliberately **not** allowed to
+      satisfy a completion-shaped method — they prove something was *understood*, not
+      *done*.
+- [x] `app/planning/planner.py` — guidance rules **13c** (prefer the campaign engine),
+      **13d** (Telegram has no scroll UI) and **13e** (re-read the bot after every external
+      action).
+- [x] `telegram_user_tools.TELEGRAM_EVIDENCE_KINDS` extended with `account_read` and
+      `miniapp_task_verified`; `telegram_capability_report()` now lists the whole family
+      (the five new modules plus the Mini App tools), imported lazily because this module
+      owns the shared Telethon session and a top-level import would be circular.
+- [x] **No new permission strings.** Only the existing `telegram.read`,
+      `telegram.interact`, `airdrop.read`, `task.read`, `task.write` and `browser.*` are
+      used, so the permissions list in `bootstrap.py` is unchanged.
+
+### Defects found and fixed while building this
+
+These are live assertions, not xfails. Each one is a bug the work itself uncovered.
+
+- [x] **A bare button press could close a `verify_with_bot` step.**
+      `VERIFICATION_EVIDENCE_KINDS` accepted `button_clicked` for `message_observed`, so a
+      press whose callback toast said "Accepted" satisfied a verification method that means
+      "the bot answered". This is precisely the reported "joins the group, presses Verify,
+      claims done" failure. `button_clicked` is no longer accepted for `message_observed`
+      anywhere (engine or `ACCEPTED_TOOLS`), and `_exec_verify_with_bot` waits for a **new**
+      bot message after the press.
+- [x] **An injection-flagged requirement silently vanished from the checklist.**
+      `sanitize_external_text` rewrites a suspicious line to
+      `[UNTRUSTED-CONTENT-FLAGGED: …] …`, and the candidate extractor then re-tested the
+      already-rewritten string — so the numbered-bullet pattern no longer matched. The
+      worst possible outcome for safety: the injection was flagged *and* the requirement it
+      was hiding disappeared from the record. `strip_flag_prefix` now removes the
+      annotation **for matching only**; the returned line keeps its flag.
+- [x] **`classify_launch` and `_button_kind` disagreed about what a button is.**
+      `classify_launch` read `type(raw).__name__` alone, and in the pinned Telethon the
+      variant lives on `raw.type` — so a real `webapp` button was reported as "not a Mini
+      App" and `telegram_detect_miniapp` returned no launch **and no evidence**. It now
+      resolves the variant the same way `_button_kind` does.
+- [x] **The Mini App `needs_user` branch was dead code** (wrong observation keys, above).
+
+### Test harness
+
+- [x] `backend/tests/fake_telegram.py` was **dead code** — nothing imported it, and its
+      `__call__` raised `AssertionError` for anything beyond
+      `JoinChannelRequest`/`ImportChatInviteRequest`/`GetParticipantRequest`. It now
+      implements the surface the tools actually call, honours `min_id`/`max_id`/`limit`
+      paging, and answers `LeaveChannelRequest` and `EditMessageRequest`.
+- [x] The duplicate `tg` import and the class-level `FakeClient.last_clicked` leak (one
+      test's presses visible to the next) are gone.
+- [x] `backend/tests/conftest.py` gained the `client` and `telegram_state` fixtures that
+      nothing provided before, plus an **autouse** `_telegram_never_reaches_the_network`
+      fixture. That last one closes a genuinely dangerous hole: a Telegram tool invoked
+      without the `client` fixture built a **real** Telethon client from the credentials in
+      the repo's `.env`, and during development a "unit" test resolved a handle to a live
+      channel and read it with the operator's own account.
+
+### Tests
+
+- [x] `test_telegram_airdrop_workflow.py` (21) — the full journey from `/start` to restart
+      without repeating the join; in-place instruction rewrites; a task revealed that is
+      not the next number; a timeout reported as a timeout rather than a failure; a press
+      the bot never answers staying `UNVERIFIED`; membership Telegram will not confirm never
+      being read as success; expired invite links; FloodWait surfaced as rate-limited with
+      nothing bypassing it; three distinct resume paths; and an injection-shaped bot message
+      gaining nothing.
+- [x] `test_telegram_campaign_engine.py` (97) — classification, dependency inference,
+      state-machine transitions (including "UNVERIFIED can never jump to COMPLETED"), the
+      persistence mapping and resume.
+- [x] `test_telegram_tool_surface.py` (60) — registration under both gate states, the
+      all-or-nothing catalog, no duplicate names, non-empty descriptions that say what a
+      tool does not do, enforced schema keywords, no `task_id` parameter, permission
+      declarations matching the surface each tool actually uses, and refusal of every
+      non-clickable button kind.
+- [x] **178 Telegram tests**; the full backend suite is `1 failed, 544 passed`.
+- [~] Observed on this Windows host: running the three Telegram suites alone sometimes
+      prints `RuntimeError: Event loop is closed` **after** the summary line. It is an
+      event-loop teardown artifact, not a test failure — the summary still reads
+      `178 passed` and the exit code is still 0. Reproduced across repeated runs; not
+      investigated further here.
+
+### Docs
+
+- [x] `docs/TELEGRAM_SETUP.md` — the existing operator-bot content is untouched under a new
+      "Part I" heading; a separate **Part II** covers the agent's user client: the
+      bot-vs-user-client distinction and why one bot cannot talk to another, the env vars
+      and what "off by default" means in code, the one-time terminal login and why no tool
+      ever handles the code, multi-account labels and default resolution, an explicit
+      **works / cannot be automated** capability split, the campaign workflow in the order
+      the agent actually performs it, the safety model, and the repository-root
+      test-command trap.
+- [x] `docs/ARCHITECTURE.md` — new "Telegram Tool Surface" section: the module map, the
+      service-layer boundary, "scrolling is API pagination", the campaign state machine and
+      where each rule is enforced, the `task_requirements` persistence decision and its
+      trade, the evidence → `verification_method` contract, reconciliation, and what
+      Telegram alone cannot verify. The stale `439 passed` testing figure was corrected to
+      the measured `1 failed, 544 passed`.
+- [x] `IMPLEMENTATION_CHECKLIST.md` — this section.
+- [ ] `CONTINUATION.md` §14 status report — **not updated here**; that file is owned
+      elsewhere and was deliberately not touched.
+
+### Known gaps (Telegram)
+
+- [~] **One pre-existing failure remains, deliberately.**
+      `test_inbox_llm_interpretation.py::TestClaimsAreVerifiedForReal::test_a_login_claim_is_checked_by_the_real_telegram_readiness_check`
+      fails with `assert 'telegram_worker_session' == 'telegram_session_readiness'`. It
+      fails identically at `7ffcb4a`, before any of this work, and was left failing rather
+      than "fixed" as a side effect of unrelated work.
+- [~] **Not every airdrop can be completed automatically, and that is the honest ceiling.**
+      A campaign containing a quiz, a poll, a social task (like / retweet / follow on
+      another platform) or an authenticated Mini App stops at that step, correctly, and
+      reports which step and why. There is no authorised integration for those, and
+      inventing one would mean fabricating verification.
+- [~] **Telegram alone can never verify an action performed on another platform.** Those
+      task types are `handoff`: the engine names the tool that owns the work and leaves the
+      item `READY` until that tool's own evidence exists.
+- [~] **Mini Apps needing the authenticated Telegram WebView cannot be automated.**
+      `initData` and its signature are never fabricated — not the payload, not `auth_date`,
+      not a `window.Telegram.WebApp` object. The result is a `NEEDS_USER_ACTION` handoff
+      via `telegram_handoff_miniapp_to_user`, not a fake success.
+- [~] **`telegram_search_bots` searches only the account's existing dialogs.** Telegram has
+      no "search all bots" API, so a bot the account has never opened cannot be found this
+      way. The tool says so in its own result rather than returning a plausible empty one.
+- [~] **The deterministic classifier reads one line.** A requirement split across two lines
+      is classified from whichever carries the verb; "Check" is classified from the word
+      alone and cannot know whether it means membership or claim status; non-English bot
+      messages classify as `unsupported` rather than being guessed. None of this is
+      papered over: an unmatched line becomes `unsupported` at `confidence 0.0`, which
+      routes to the operator.
+- [~] **The campaign engine calls the service layer directly, not `ToolRegistry.invoke`**
+      for its inner actions. In exchange it holds one lock per step and can run a bounded
+      multi-item loop without the model choosing each tool; the cost is that an inner
+      tool's own `required_permissions` are not re-checked per action. The mitigation is
+      structural: the campaign tool declares `telegram.interact + task.write`, a superset
+      of every inner action's requirements, and permissions, the emergency stop and the
+      tool timeout are all still enforced once at the boundary. A future action needing a
+      permission outside that set must go through its own tool.
+- [~] **The Mini App browser calls instantiate browser tools directly** rather than going
+      through the registry for the inner call. The browser tool's own gates still run; what
+      is bypassed is the outer registry envelope for the inner call only. Documented on
+      every tool that does it, and kept as narrow as possible: one navigation, one
+      inspection, one wait — never a loop of raw Playwright calls.
+- [~] **The checklist lives in a JSONB blob, not in typed columns.** The database cannot
+      enforce its shape, and a backwards-incompatible change to the item payload needs a
+      tolerant reader (`from_evidence`) rather than a migration. That was the deliberate
+      trade for adding no table and no revision.
+- [~] **A campaign made only of Telegram-native steps can run unattended; one that touches
+      any gate above cannot.** A checklist of joins, commands, button presses and bot
+      verifications completes without an operator. A campaign that also contains an
+      authenticated Mini App, a quiz, a social task, a payment button or a phone/location
+      share stops at that item, correctly, and says which one. There is no claim that an
+      arbitrary airdrop completes end to end.
+- [~] **No Telegram tool has been exercised against a real live Telegram account** in this
+      work. Every test runs against `backend/tests/fake_telegram.py`, which implements only
+      the surface the tools call. Behaviour against a real MTProto server — genuine
+      FloodWaits, real permission modes, real bot quirks — is unverified by the suite.

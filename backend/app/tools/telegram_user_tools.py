@@ -834,6 +834,8 @@ TELEGRAM_EVIDENCE_KINDS = frozenset(
         "dialog_listed",         # the account's dialogs were listed
         "chat_resolved",         # a target was resolved to a usable entity
         "miniapp_launch_detected",  # a Mini App launch was identified
+        "account_read",          # the account's own identity was read
+        "miniapp_task_verified", # a Mini App task was verified from in-page state
     }
 )
 
@@ -1597,6 +1599,28 @@ def telegram_capability_report() -> Dict[str, Any]:
     from backend.app.tools.telegram_continuation_tools import CONTINUATION_TOOLS
 
     report["tools"] += sorted(tool.name for tool in CONTINUATION_TOOLS)
+    # The rest of the Telegram family. Imported lazily for the same reason as the
+    # continuation tools: this module owns the shared Telethon session, so a
+    # top-level import from a module that imports this one would be circular.
+    for module_path, attribute in (
+        ("backend.app.tools.telegram_session_tools", "SESSION_TOOLS"),
+        ("backend.app.tools.telegram_bot_tools", "BOT_TOOLS"),
+        ("backend.app.tools.telegram_message_tools", "MESSAGE_TOOLS"),
+        ("backend.app.tools.telegram_group_tools", "GROUP_TOOLS"),
+        ("backend.app.tools.telegram_campaign_tools", "CAMPAIGN_TOOLS"),
+    ):
+        try:
+            module = __import__(module_path, fromlist=[attribute])
+            report["tools"] += sorted(tool().name for tool in getattr(module, attribute, ()))
+        except Exception:  # a module that fails to import must not hide the core tools
+            logger.debug("Telegram capability report could not list %s", module_path)
+    try:
+        from backend.app.tools.miniapp_tools import MINIAPP_TOOLS
+
+        report["tools"] += sorted(tool().name for tool in MINIAPP_TOOLS)
+    except Exception:
+        logger.debug("Telegram capability report could not list the Mini App tools")
+    report["tools"] = sorted(set(report["tools"]))
     report["session"] = "connected" if any(x.is_connected() for x in all_sessions()) else "not_connected"
     report["accounts"] = [
         {"label": a["label"], "profile_name": a.get("profile_name"), "logged_in": a["session_ready"],
