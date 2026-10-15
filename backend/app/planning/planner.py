@@ -403,6 +403,11 @@ Hard rules:
     page_observation or post_action_observation for a Telegram send or click.
     "prerequisites" must be empty or machine-checkable expressions like "retry_count<3"; never
     plain-English sentences such as "Bot accepted the URL" (put that in "depends_on" instead).
+13a. Telegram bots: begin with telegram_open_bot. It looks at the existing chat first and only
+    sends /start when the chat is empty; when it returns resumed=true the bot was already used, so
+    continue from the latest messages and buttons it returned and do NOT plan another /start.
+    Never write a separate "send /start" step. Bots differ, so read what the bot actually shows
+    and choose the next step from that.
 13. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """
@@ -428,6 +433,8 @@ Hard rules:
    For Telegram: send -> message_sent, click -> button_clicked, bot reply read -> message_observed.
    Never use page_observation or post_action_observation for a Telegram send or click.
    "prerequisites" must be empty or machine-checkable (e.g. "retry_count<3"), never plain English.
+8a. Telegram bots: never plan a fresh /start. telegram_open_bot already resumes an existing chat
+   (resumed=true) and starts only an empty one. Continue from the bot's latest messages and buttons.
 8. To press a bot button use telegram_click_button with the chat and the exact button_text.
    Do NOT add a read step just to find a message id: message_id is optional and the tool
    finds the newest message carrying that button itself.

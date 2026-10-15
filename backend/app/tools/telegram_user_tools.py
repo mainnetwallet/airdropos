@@ -794,8 +794,11 @@ class TelegramOpenBotTool(BaseTool):
     name = "telegram_open_bot"
     version = "1.0.0"
     description = (
-        "Start a Telegram bot from the operator's account (like opening a t.me/<bot>?start=<code> link) "
-        "and return the bot's first replies including their buttons."
+        "Open a Telegram bot from the operator's account (like opening a t.me/<bot>?start=<code> link). "
+        "It FIRST looks at the existing chat with the bot: if earlier messages exist it does NOT send "
+        "/start, it returns those messages and buttons (resumed=true) so the work continues from where "
+        "it stopped. Only when the chat is empty does it send /start and return the bot's first "
+        "replies. Pass restart=true to deliberately send /start again."
     )
     required_permissions = ["telegram.interact"]
     side_effect = SideEffect.WEB_INTERACTION
@@ -808,6 +811,9 @@ class TelegramOpenBotTool(BaseTool):
                     "maxLength": 300},
             "start_param": {"type": "string", "description": "Optional start/referral code",
                             "maxLength": 64},
+            "restart": {"type": "boolean",
+                        "description": "Send /start even though the chat already has messages. "
+                                       "Only when the bot's flow is stuck or must be restarted."},
         },
         "required": ["bot"],
     }
@@ -828,6 +834,36 @@ class TelegramOpenBotTool(BaseTool):
             entity = await client.get_entity(target["value"])
             if not getattr(entity, "bot", False):
                 return ToolResult.failure(f"@{target['value']} is not a bot.", category="INVALID_INPUT")
+
+            # Look before starting. A chat that already has messages means this bot was used
+            # before (an earlier task, or this one before a restart). Sending /start again would
+            # restart the bot's flow and can throw away progress, so the work continues from the
+            # existing conversation instead. Bots differ a lot, so what to do next is the
+            # agent's call, made from these messages and buttons.
+            if not params.get("restart"):
+                history = await _recent_messages(client, entity, 10)
+                if history:
+                    ref = _describe_entity(entity)
+                    _session.remember_chat(ref)
+                    _session.current_bot = target["value"]
+                    return ToolResult.success(
+                        data={
+                            "bot": target["value"],
+                            "resumed": True,
+                            "start_sent": False,
+                            "replies": history,
+                            "reply_count": len(history),
+                            "available_buttons": [
+                                b.get("text") for m in history[-5:] for b in (m.get("buttons") or [])
+                                if b.get("text")
+                            ][:20],
+                            "chat_id": ref.get("chat_id"),
+                            "note": _UNTRUSTED_NOTE + " The chat already had messages, so /start was "
+                                    "NOT sent. Continue from the latest messages and buttons.",
+                        },
+                        evidence=_evidence("bot_started", resumed=True, reply_count=len(history)),
+                    )
+
             sent = await client.send_message(entity, f"/start {start}" if start else "/start")
             replies = await _wait_for_replies(client, entity, sent.id)
             described = [_describe_message(m) for m in replies]
