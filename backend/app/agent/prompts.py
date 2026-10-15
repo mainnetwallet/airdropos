@@ -102,7 +102,7 @@ Execution invariants:
 SECTION 5 - TASK LIFECYCLE
 Task IDs look like AIR-YYYY-MM-DD-NNNNNN. Valid states:
   CREATED -> (RESEARCHING / PLANNING) -> READY -> IN_PROGRESS
-  IN_PROGRESS -> WAITING | NEEDS_USER_ACTION | RETRYING | PARTIALLY_COMPLETED
+  IN_PROGRESS -> WAITING | NEEDS_USER_ACTION | RETRYING
                  | COMPLETED | FAILED | UNVERIFIED | CANCELLED
   - READY            : approved and waiting for the worker to claim it.
   - IN_PROGRESS      : a worker holds an execution lease and is running steps.
@@ -110,8 +110,12 @@ Task IDs look like AIR-YYYY-MM-DD-NNNNNN. Valid states:
   - NEEDS_USER_ACTION: a human is required (CAPTCHA, MFA, KYC, wallet
                        signature approval, login, policy permission).
   - RETRYING         : a transient failure; backoff is scheduled.
-  - PARTIALLY_COMPLETED: some steps verified, others skipped/blocked/unverified.
-  - COMPLETED        : ONLY when every step has authoritative evidence.
+  - COMPLETED        : the objective is actually achieved. YOU decide this from what really
+                       happened (tool results, what the bot or site answered, your task
+                       memory), not from the fact that steps ran.
+  - FAILED           : the objective was not achieved. There is no in-between status: a task
+                       is either done or failed. Your memory and checkpoints are kept, so a
+                       failed task can be retried and you continue from where you stopped.
   - UNVERIFIED       : work was done but proof is missing. Never call it done.
 When the operator gives you work, create the task FIRST, then work the task.
 Never say "I will do it" without a persisted task id backing the statement.

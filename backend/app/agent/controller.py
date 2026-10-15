@@ -398,12 +398,11 @@ class AgentController:
 
         * If the persisted plan is in fact fully processed (finalization simply needs one more
           iteration than the steps themselves), finalize it. That path verifies against evidence,
-          so it yields COMPLETED only when every step was proven, otherwise PARTIALLY_COMPLETED.
-        * Otherwise work remains: PARTIALLY_COMPLETED ("some actions succeeded; more remain").
-          This is deliberately not RETRYING: hitting the budget is not a failure, so it must not
-          consume the retry budget or schedule automatic re-runs. An operator resumes it
-          (PARTIALLY_COMPLETED -> READY/RETRYING). Completed steps, checkpoints, executions and
-          evidence are left untouched; the plan's persisted step statuses drive the resume.
+          so it yields COMPLETED or FAILED by the agent's own judgment.
+        * Otherwise the objective was not finished in this run: FAILED. A task is either done
+          or failed; there is no in-between status. Completed steps, checkpoints, executions
+          and the task's memory are left untouched, so an operator can retry it (FAILED ->
+          RETRYING) and the agent carries on from the persisted plan.
         """
         # Read the persisted plan: the in-memory spec can be stale after a replan.
         plan = await self.planner.load_plan_spec(task)
@@ -438,11 +437,12 @@ class AgentController:
         remaining = plan.ready_steps() if plan is not None else []
         await self.tasks.transition(
             task,
-            TaskStatus.PARTIALLY_COMPLETED,
+            TaskStatus.FAILED,
             reason=(
-                f"Iteration budget of {budget} exhausted with work remaining; "
-                "progress is checkpointed and the task can be resumed."
+                f"Iteration budget of {budget} exhausted before the objective was done; "
+                "progress and memory are checkpointed, so the task can be retried."
             ),
+            error_details={"budget_exhausted": budget},
             progress=self._plan_progress(plan) if plan is not None else task.progress,
             next_planned_action=(
                 remaining[0].description if remaining else task.next_planned_action
@@ -1463,13 +1463,14 @@ class AgentController:
             )
             report.blockers.append(msg)
             await self.tasks.transition(
-                task, TaskStatus.PARTIALLY_COMPLETED, reason=msg,
+                task, TaskStatus.FAILED, reason=msg,
+                error_details={"replan_limit": MAX_REPLANS_PER_TASK, "last_problem": reason[:300]},
                 next_planned_action="Operator review needed",
             )
             return (
                 StepResult(iteration, "replan limit reached", None, None, False, msg, 0),
                 True,
-                LoopOutcome.PARTIALLY_COMPLETED,
+                LoopOutcome.FAILED,
             )
 
         await self._release_write_lock()  # the replan below is a slow LLM call
@@ -1500,7 +1501,7 @@ class AgentController:
             report.failures.append(f"Replanning failed: {exc}")
             await self.tasks.transition(
                 task,
-                TaskStatus.PARTIALLY_COMPLETED,
+                TaskStatus.FAILED,
                 reason=f"Replanning failed: {exc}",
                 error_details={"replan_error": str(exc)},
             )
@@ -1544,7 +1545,12 @@ class AgentController:
         verdict = await self._agent_completion_verdict(task, plan)
         if verdict is not None:
             complete, why, missing = verdict
-            done_steps = sum(1 for s in plan.steps if s.status == "completed" and s.tool)
+            # Steps whose tool really ran count, whether or not the old evidence matcher
+            # accepted them: the agent's judgment is the proof now. At least 1, because
+            # COMPLETED refuses a zero evidence count.
+            done_steps = max(
+                1, sum(1 for s in plan.steps if s.tool and s.status in ("completed", "unverified"))
+            )
             if complete:
                 await self.tasks.transition(
                     task,
@@ -1563,20 +1569,20 @@ class AgentController:
                     LoopOutcome.COMPLETED,
                 )
             report.unverified_claims.extend(missing)
+            report.failures.append(f"Agent judged the objective not complete: {why}"[:500])
             await self.tasks.transition(
                 task,
-                TaskStatus.PARTIALLY_COMPLETED,
+                TaskStatus.FAILED,
                 reason=f"Agent judged the objective NOT complete: {why}"[:1000],
-                verified=False,
-                evidence_count=done_steps,
+                error_details={"agent_verdict": "incomplete", "reason": why[:500], "missing": missing},
                 progress=self._plan_progress(plan),
-                next_planned_action="; ".join(missing)[:500] or "Operator review needed",
+                next_planned_action="; ".join(missing)[:500] or "Retry the task",
             )
             return (
-                StepResult(iteration, "plan finished incomplete", None,
+                StepResult(iteration, "plan failed", None,
                            {"agent_verdict": "incomplete"}, False, why[:300], 0),
                 True,
-                LoopOutcome.PARTIALLY_COMPLETED,
+                LoopOutcome.FAILED,
             )
         # The LLM was unavailable or answered unusably: fall back to the step-status check below.
         # `unverified` is a distinct outcome: the action ran but its evidence did not
@@ -1644,12 +1650,12 @@ class AgentController:
 
         await self.tasks.transition(
             task,
-            TaskStatus.PARTIALLY_COMPLETED,
+            TaskStatus.FAILED,
             reason=reason,
-            verified=False,
-            evidence_count=verified_count,
+            error_details={"unverified": len(unverified), "skipped": len(skipped),
+                           "blocked": len(blocked)},
             progress=self._plan_progress(plan),
-            next_planned_action="Review skipped, blocked, and unverified steps; enable required permissions to proceed.",
+            next_planned_action="Review skipped, blocked, and unverified steps; enable required permissions, then retry.",
         )
         return (
             StepResult(
@@ -1658,7 +1664,7 @@ class AgentController:
                 False, "Plan processed but the objective could not be fully verified.", 0,
             ),
             True,
-            LoopOutcome.PARTIALLY_COMPLETED,
+            LoopOutcome.FAILED,
         )
 
     # ------------------------------------------------------------------
