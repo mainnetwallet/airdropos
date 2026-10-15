@@ -271,6 +271,7 @@ class ReplyRouter:
         # fail in ways that raise. The operator's message must survive either.
         await self.db.commit()
 
+        self._turn_body = body  # kept so a resolved blocker records what the operator said
         outcome = await self._route(
             conversation=conversation,
             task=task,
@@ -955,6 +956,8 @@ class ReplyRouter:
             outcome=result.outcome,
             verification_method=result.method,
             reply_message_id=base.get("message_id"),
+            operator_reply=getattr(self, "_turn_body", None),
+            interpretation=interpretation if isinstance(interpretation, dict) else None,
         )
 
         await events.publish(

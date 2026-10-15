@@ -534,6 +534,8 @@ class InterventionService:
         outcome: str,
         verification_method: Optional[str] = None,
         reply_message_id: Optional[Any] = None,
+        operator_reply: Optional[str] = None,
+        interpretation: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Close a request. Persisted in the same transaction as the state change it authorises."""
         request.status = "RESOLVED"
@@ -565,6 +567,14 @@ class InterventionService:
                         required=False,
                         reason=f"Resolved by {resolved_by}: {outcome}"[:500],
                         resolved=True,
+                        resolution={
+                            "by": resolved_by,
+                            "method": verification_method,
+                            "outcome": outcome,
+                            "operator_reply": operator_reply,
+                            "interpretation": (interpretation or {}).get("explanation"),
+                            "decision": (interpretation or {}).get("decision"),
+                        },
                     )
             except Exception as exc:  # never let bookkeeping block the resume
                 logger.debug("Could not clear the task context blocker: %s", exc)

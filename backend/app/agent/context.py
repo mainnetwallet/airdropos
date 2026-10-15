@@ -622,6 +622,16 @@ class ResolvedContext:
             if ctx.next_step_rationale:
                 parts.append(f"WHY THE NEXT ACTION: {ctx.next_step_rationale}")
 
+        hi = dict(self.task_context.human_intervention or {}) if self.task_context else {}
+        if hi.get("pending"):
+            parts.append(f"WAITING ON THE OPERATOR: {hi.get('reason') or 'an operator action'}")
+        elif hi.get("summary"):
+            parts.append(f"OPERATOR ALREADY RESPONDED: {hi['summary']}")
+        if hi.get("standing_rules"):
+            parts.append(
+                "RULES THE OPERATOR GAVE FOR THIS TASK: " + "; ".join(hi["standing_rules"])
+            )
+
         confirmed = [o for o in self.observations if o.proved_completion]
         if confirmed:
             parts.append(
@@ -1105,23 +1115,61 @@ class TaskContextService:
         step_index: Optional[int] = None,
         instruction: Optional[str] = None,
         resolved: bool = False,
+        resolution: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Record what the task is waiting on a person for.
 
         Cleared when the operator clears it, so "waiting for a human" is a fact about
-        now, not a permanent label.
+        now, not a permanent label. But the STORY is kept: once resolved, the context still
+        says why the task needed the operator, what the operator answered and how that was
+        accepted, so every later LLM call (replans, the completion judgment) understands why
+        the task stopped and that the manual step was done, instead of seeing only a bare
+        "pending: false".
         """
         context = await self.load_or_create(task)
         state = dict(context.human_intervention or {})
         if resolved:
+            now = datetime.now(timezone.utc).isoformat()
+            res = {k: v for k, v in dict(resolution or {}).items() if v not in (None, "")}
+            for key in ("operator_reply", "outcome", "interpretation"):
+                if key in res:
+                    res[key] = self._screened_text(str(res[key]), limit=600)
+            blocker = state.get("reason") or "an operator action"
+            parts = [f"The task was parked because: {blocker}."]
+            if res.get("operator_reply"):
+                parts.append(f'The operator replied: "{res["operator_reply"]}".')
+            if res.get("interpretation"):
+                parts.append(f"Reading of the reply: {res['interpretation']}.")
+            if res.get("outcome"):
+                parts.append(f"Accepted as: {res['outcome']}")
+            parts.append(
+                "This blocker is RESOLVED. Treat the manual step as done or the information as "
+                "supplied; do not ask the operator for it again unless a new problem appears."
+            )
+            summary = self._screened_text(" ".join(parts), limit=1500)
+            entry = {
+                "reason": state.get("reason"),
+                "step_index": state.get("step_index"),
+                "raised_at": state.get("raised_at"),
+                "resolved_at": now,
+                "resolution": res,
+                "summary": summary,
+            }
+            history = (list(state.get("history") or []) + [entry])[-5:]
             state = {
                 **state,
                 "pending": False,
-                "resolved_at": datetime.now(timezone.utc).isoformat(),
+                "resolved_at": now,
+                "resolution": res,
+                "summary": summary,
+                "history": history,
             }
         else:
             state = {
                 **state,
+                # A new blocker: the previous resolution is history, not the current state.
+                "resolution": None,
+                "summary": None,
                 "pending": bool(required),
                 # The reason quotes whatever the page or bot actually said, so it is
                 # screened for the same reason requirement text is.
@@ -1130,6 +1178,24 @@ class TaskContextService:
                 "step_index": step_index,
                 "raised_at": datetime.now(timezone.utc).isoformat(),
             }
+        context.human_intervention = state
+        flag_modified(context, "human_intervention")
+        self._touch(context)
+        await self.db.flush()
+
+    async def add_standing_rules(self, task: Task, rules: Sequence[str]) -> None:
+        """Keep rules the operator gave for the rest of this task (e.g. "ordinary math
+        questions from the bot may be answered by the agent"), so later LLM calls see them."""
+        cleaned = [self._screened_text(str(r), limit=200) for r in rules if str(r).strip()]
+        if not cleaned:
+            return
+        context = await self.load_or_create(task)
+        state = dict(context.human_intervention or {})
+        existing = list(state.get("standing_rules") or [])
+        for rule in cleaned:
+            if rule and rule not in existing:
+                existing.append(rule)
+        state["standing_rules"] = existing[-8:]
         context.human_intervention = state
         flag_modified(context, "human_intervention")
         self._touch(context)
