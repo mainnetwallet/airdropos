@@ -269,6 +269,67 @@ class ExecutionPlanSpec:
         }
 
 
+_STEP_LIST_KEYS = ("steps", "plan", "tasks", "actions", "execution_plan", "workflow")
+_DESCRIPTION_KEYS = ("description", "action", "title", "name", "step", "task", "summary")
+
+
+def extract_raw_steps(result: Any) -> List[Dict[str, Any]]:
+    """Find the step list in a planner reply, tolerating the shapes models actually produce.
+
+    Accepts the contract (``{"steps": [...]}``) and common drifts: another key for the list
+    (``plan``, ``tasks``, ``actions``), the list nested one level down (``{"plan": {"steps": [...]}}``),
+    a bare list, or steps keyed by number. Items are normalised so a step that names its text
+    ``action`` or ``title`` is not discarded for having no ``description``.
+    """
+
+    def as_list(value: Any) -> Optional[List[Any]]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict) and value and all(str(k).isdigit() for k in value):
+            return [value[k] for k in sorted(value, key=lambda k: int(k))]
+        return None
+
+    found: Optional[List[Any]] = as_list(result)
+    if found is None and isinstance(result, dict):
+        for key in _STEP_LIST_KEYS:
+            found = as_list(result.get(key))
+            if found:
+                break
+            nested = result.get(key)
+            if isinstance(nested, dict):
+                found = extract_raw_steps(nested) or None
+                if found:
+                    break
+    out: List[Dict[str, Any]] = []
+    for item in found or []:
+        if isinstance(item, str) and item.strip():
+            item = {"description": item}
+        if not isinstance(item, dict):
+            continue
+        item = dict(item)
+        if not str(item.get("description") or "").strip():
+            for key in _DESCRIPTION_KEYS:
+                if str(item.get(key) or "").strip():
+                    item["description"] = str(item[key])
+                    break
+        out.append(item)
+    return out
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 class PlanningError(Exception):
     """Raised when a plan cannot be produced or violates a hard constraint."""
 
@@ -602,7 +663,35 @@ Produce EXACTLY this JSON shape:
         logger.warning(
             "PLANNER RAW RESULT keys=%s body=%s", list(result.keys()), _json(result)[:3000]
         )
-        steps = self._parse_steps(result.get("steps") or [])
+        steps = self._parse_steps(extract_raw_steps(result))
+        if not steps:
+            # One corrective retry that tells the model exactly what was wrong with its reply,
+            # instead of failing the whole run (and waiting out a retry backoff) on a format slip.
+            logger.warning(
+                "Planner reply had no usable steps (keys=%s); retrying once with feedback",
+                list(result.keys()) if isinstance(result, dict) else type(result).__name__,
+            )
+            try:
+                retry = await llm.complete_json(
+                    [
+                        Message("system", PLANNER_SYSTEM_PROMPT),
+                        Message("user", user),
+                        Message("assistant", _json(result)[:4000]),
+                        Message(
+                            "user",
+                            "That reply contained no usable steps. Reply again with ONLY a JSON "
+                            'object of the exact shape given, with a non-empty "steps" array. '
+                            'Every step needs a one-line "description". Keep it to the few steps '
+                            "that are actually required.",
+                        ),
+                    ]
+                )
+            except LLMError as exc:
+                raise PlanningError(
+                    f"Decomposition failed: the fixed LLM is unavailable ({exc.category})."
+                ) from exc
+            result = retry
+            steps = self._parse_steps(extract_raw_steps(result))
         if not steps:
             raise PlanningError("Decomposition produced no executable steps.")
 
@@ -611,7 +700,7 @@ Produce EXACTLY this JSON shape:
             steps=steps,
             constraints=constraints.to_dict(),
             rationale=str(result.get("rationale", ""))[:2000],
-            llm_reasoning=_json(result.get("steps"))[:4000],
+            llm_reasoning=_json(extract_raw_steps(result))[:4000],
         )
 
         self.enforce_constraints(spec, constraints)
@@ -662,10 +751,10 @@ Produce EXACTLY this JSON shape:
                     ),
                     verification_tool=str(verification_tool) if verification_tool else None,
                     expected_evidence=str(raw.get("expected_evidence") or ""),
-                    estimated_cost_usd=float(raw.get("estimated_cost_usd") or 0.0),
-                    estimated_duration_minutes=int(raw.get("estimated_duration_minutes") or 5),
+                    estimated_cost_usd=_as_float(raw.get("estimated_cost_usd")),
+                    estimated_duration_minutes=_as_int(raw.get("estimated_duration_minutes"), 5),
                     retryable=bool(raw.get("retryable", True)),
-                    retry_limit=int(raw.get("retry_limit") or 2),
+                    retry_limit=_as_int(raw.get("retry_limit"), 2),
                 )
             )
         return steps
