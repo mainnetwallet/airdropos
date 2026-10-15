@@ -577,5 +577,6 @@ export interface TelegramAccount {
   user_id: number | null
   is_default: boolean
   logged_in: boolean
+  legacy: boolean
   added_at: string | null
 }

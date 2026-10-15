@@ -224,6 +224,35 @@ export const api = {
   diagnostics: () => request<DiagnosticsResponse>('/diagnostics'),
   workerStatus: () => request<WorkerStatus>('/worker/status'),
   telegramAccounts: () => request<{ accounts: TelegramAccount[] }>('/telegram/accounts'),
+  telegramLoginStart: (body: { label: string; phone: string; make_default: boolean }) =>
+    request<{ login_id: string; stage: 'code'; expires_in: number }>('/telegram/accounts/login/start', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  telegramLoginCode: (login_id: string, code: string) =>
+    request<{ stage: 'password' | 'done'; label?: string }>('/telegram/accounts/login/code', {
+      method: 'POST',
+      body: JSON.stringify({ login_id, code }),
+    }),
+  telegramLoginPassword: (login_id: string, password: string) =>
+    request<{ stage: 'done'; label: string }>('/telegram/accounts/login/password', {
+      method: 'POST',
+      body: JSON.stringify({ login_id, password }),
+    }),
+  telegramLoginCancel: (login_id: string) =>
+    request<{ cancelled: boolean }>('/telegram/accounts/login/cancel', {
+      method: 'POST',
+      body: JSON.stringify({ login_id }),
+    }),
+  telegramSetDefault: (label: string) =>
+    request<{ label: string; is_default: boolean }>(`/telegram/accounts/${encodeURIComponent(label)}/default`, {
+      method: 'POST',
+    }),
+  telegramRemoveAccount: (label: string, revoke: boolean) =>
+    request<{ removed: string; revoked_on_telegram: boolean }>(
+      `/telegram/accounts/${encodeURIComponent(label)}?revoke=${revoke}`,
+      { method: 'DELETE' },
+    ),
   clearWorkerLogs: () =>
     request<{ cleared: number; cleared_at: string | null }>('/worker/logs/clear', { method: 'POST' }),
 

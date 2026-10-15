@@ -1,9 +1,13 @@
 /** Telegram Integration: readiness of the Telegram user client, from the worker's real status. */
 
-import { useQuery } from '@tanstack/react-query'
+import { useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { CheckCircle2, ChevronRight, Info, Send, UserRound, XCircle } from 'lucide-react'
+import { CheckCircle2, ChevronRight, Info, Plus, Send, Star, Trash2, UserRound, XCircle } from 'lucide-react'
 import { api } from '@/services/api'
+import AddAccountModal from '@/components/telegram/AddAccountModal'
+import RemoveAccountModal from '@/components/telegram/RemoveAccountModal'
+import type { TelegramAccount } from '@/types'
 import { Card, ErrorState, IconTile, Loading, PageHeader, Pill } from '@/components/ui'
 
 export default function Telegram() {
@@ -19,6 +23,13 @@ export default function Telegram() {
     refetchInterval: 15000,
   })
   const accounts = accountsQuery.data?.accounts ?? []
+  const qc = useQueryClient()
+  const [adding, setAdding] = useState(false)
+  const [removing, setRemoving] = useState<TelegramAccount | null>(null)
+  const makeDefault = useMutation({
+    mutationFn: (label: string) => api.telegramSetDefault(label),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['telegram-accounts'] }),
+  })
 
   if (isLoading) return <Loading label="Checking Telegram" />
   if (error || !data) return <ErrorState error={error} onRetry={() => refetch()} />
@@ -80,15 +91,20 @@ export default function Telegram() {
       </Card>
 
       {/* Accounts */}
-      <Card title={`Telegram accounts (${accounts.length})`}>
+      <Card
+        title={`Telegram accounts (${accounts.length})`}
+        action={
+          <button type="button" onClick={() => setAdding(true)} className="btn btn-primary !px-3 !py-1.5 text-xs">
+            <Plus className="h-4 w-4" /> Add account
+          </button>
+        }
+      >
         {accountsQuery.isLoading ? (
           <p className="py-4 text-center text-sm text-slate-500">Loading accounts…</p>
         ) : accountsQuery.error ? (
           <p className="py-4 text-center text-sm text-status-warning">Could not load Telegram accounts.</p>
         ) : accounts.length === 0 ? (
-          <p className="py-4 text-center text-sm text-slate-500">
-            No account is logged in yet. Run <span className="font-mono">python scripts/telegram_login.py</span> in a terminal.
-          </p>
+          <p className="py-4 text-center text-sm text-slate-500">No account is logged in yet. Tap “Add account”.</p>
         ) : (
           <ul className="divide-y divide-surface-300/70">
             {accounts.map((a) => (
@@ -112,14 +128,40 @@ export default function Telegram() {
                     {!a.logged_in && <Pill tone="red">Logged out</Pill>}
                   </div>
                 </div>
+                <div className="flex shrink-0 gap-1">
+                  {!a.is_default && !a.legacy && (
+                    <button
+                      type="button"
+                      title="Make default"
+                      aria-label={`Make ${a.label} the default account`}
+                      disabled={makeDefault.isPending}
+                      onClick={() => makeDefault.mutate(a.label)}
+                      className="rounded-lg p-2 text-slate-400 hover:bg-surface-200 hover:text-slate-100"
+                    >
+                      <Star className="h-4 w-4" />
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    title="Remove"
+                    aria-label={`Remove ${a.label}`}
+                    onClick={() => setRemoving(a)}
+                    className="rounded-lg p-2 text-slate-400 hover:bg-surface-200 hover:text-status-error"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
         )}
+        {makeDefault.error && <p className="mt-3 text-xs text-status-error">{(makeDefault.error as Error).message}</p>}
         <p className="mt-3 text-xs text-slate-500">
-          Add another account: <span className="font-mono">python scripts/telegram_login.py --label NAME</span>
+          The agent uses the default account unless a task names a label.
         </p>
       </Card>
+      {adding && <AddAccountModal hasAccounts={accounts.length > 0} onClose={() => setAdding(false)} />}
+      {removing && <RemoveAccountModal account={removing} onClose={() => setRemoving(null)} />}
 
       {/* Setup checks */}
       <Card title="Setup">
