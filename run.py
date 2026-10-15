@@ -767,6 +767,7 @@ def main() -> None:
         action="store_true",
         help="print one line per HTTP request (off by default; also settable with ACCESS_LOG=true in .env)",
     )
+    ap.add_argument("--hmr", action="store_true", help="dashboard dev server with live HMR (default: HMR off, so a phone browser does not reload the page when it returns from the background)")
     ap.add_argument("--keep-existing", action="store_true", help="do not stop old AirdropOS processes that still hold the ports")
     ap.add_argument(
         "--no-dashboard",
@@ -882,7 +883,7 @@ def main() -> None:
             )
         )
     if npm:
-        procs.append(Proc("web", [npm, "run", "dev"], FRONTEND, dict(child_env, AIRDROPOS_PROC="web")))
+        procs.append(Proc("web", [npm, "run", "dev" if args.hmr else "dev:mobile"], FRONTEND, dict(child_env, AIRDROPOS_PROC="web")))
 
     log(f"Backend API : http://localhost:{port}   (docs: /docs)")
     if npm:
