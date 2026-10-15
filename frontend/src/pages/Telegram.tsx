@@ -6,7 +6,6 @@ import { Link } from 'react-router-dom'
 import { CheckCircle2, ChevronRight, Info, Plus, Send, Star, Trash2, UserRound, XCircle } from 'lucide-react'
 import { api } from '@/services/api'
 import AddAccountModal from '@/components/telegram/AddAccountModal'
-import { loadPendingLogin, type PendingLogin } from '@/components/telegram/pendingLogin'
 import RemoveAccountModal from '@/components/telegram/RemoveAccountModal'
 import type { TelegramAccount } from '@/types'
 import { Card, ErrorState, IconTile, Loading, PageHeader, Pill } from '@/components/ui'
@@ -25,28 +24,15 @@ export default function Telegram() {
   })
   const accounts = accountsQuery.data?.accounts ?? []
   const qc = useQueryClient()
-  // A login that was waiting for its code (the page may have reloaded while the user was in Telegram).
-  const [pending, setPending] = useState<PendingLogin | null>(() => loadPendingLogin())
-  const [adding, setAdding] = useState(() => loadPendingLogin() !== null)
-  const closeAdd = () => {
-    setAdding(false)
-    setPending(loadPendingLogin())
-  }
+  const [adding, setAdding] = useState(false)
   const [removing, setRemoving] = useState<TelegramAccount | null>(null)
   const makeDefault = useMutation({
     mutationFn: (label: string) => api.telegramSetDefault(label),
     onSuccess: () => void qc.invalidateQueries({ queryKey: ['telegram-accounts'] }),
   })
 
-  // Only replace the page while there is nothing to show. A background refetch that fails (typical
-  // when the phone comes back from another app) keeps the last data, so an open dialog survives.
-  if (!data) {
-    return isLoading ? (
-      <Loading label="Checking Telegram" />
-    ) : (
-      <ErrorState error={error} onRetry={() => refetch()} />
-    )
-  }
+  if (isLoading) return <Loading label="Checking Telegram" />
+  if (error || !data) return <ErrorState error={error} onRetry={() => refetch()} />
 
   const { telegram, worker } = data
   const tools = worker.telegram_tools ?? []
@@ -109,7 +95,7 @@ export default function Telegram() {
         title={`Telegram accounts (${accounts.length})`}
         action={
           <button type="button" onClick={() => setAdding(true)} className="btn btn-primary !px-3 !py-1.5 text-xs">
-            <Plus className="h-4 w-4" /> {pending ? 'Continue login' : 'Add account'}
+            <Plus className="h-4 w-4" /> Add account
           </button>
         }
       >
@@ -174,7 +160,7 @@ export default function Telegram() {
           The agent uses the default account unless a task names a label.
         </p>
       </Card>
-      {adding && <AddAccountModal hasAccounts={accounts.length > 0} resume={pending} onClose={closeAdd} />}
+      {adding && <AddAccountModal hasAccounts={accounts.length > 0} onClose={() => setAdding(false)} />}
       {removing && <RemoveAccountModal account={removing} onClose={() => setRemoving(null)} />}
 
       {/* Setup checks */}
