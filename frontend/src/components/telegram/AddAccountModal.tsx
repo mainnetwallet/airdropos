@@ -3,33 +3,56 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Loader2 } from 'lucide-react'
 import Modal from '@/components/live/Modal'
 import { api } from '@/services/api'
+import { savePendingLogin, type PendingLogin, type LoginStep } from './pendingLogin'
 
-type Step = 'details' | 'code' | 'password'
+type Step = 'details' | LoginStep
 
 /**
  * Add a Telegram account: label + phone -> login code -> (2FA password).
  * The phone, code and password live only in this component's state and are cleared as soon as
  * they are sent. They are never stored in the browser (no localStorage, no query cache).
  */
-export default function AddAccountModal({ hasAccounts, onClose }: { hasAccounts: boolean; onClose: () => void }) {
+export default function AddAccountModal({
+  hasAccounts,
+  resume,
+  onClose,
+}: {
+  hasAccounts: boolean
+  resume: PendingLogin | null
+  onClose: () => void
+}) {
   const qc = useQueryClient()
-  const [step, setStep] = useState<Step>('details')
-  const [label, setLabel] = useState('')
+  const [step, setStep] = useState<Step>(resume?.step ?? 'details')
+  const [label, setLabel] = useState(resume?.label ?? '')
   const [phone, setPhone] = useState('')
   const [makeDefault, setMakeDefault] = useState(false)
   const [code, setCode] = useState('')
   const [password, setPassword] = useState('')
-  const loginId = useRef<string | null>(null)
+  const loginId = useRef<string | null>(resume?.loginId ?? null)
+  const expiresAt = useRef<number>(resume?.expiresAt ?? 0)
 
-  // Closing mid-login tells the server to forget the pending login and its half-made session.
-  const close = () => {
+  const remember = (next: Step) => {
+    if (loginId.current && next !== 'details') {
+      savePendingLogin({ loginId: loginId.current, label: label.trim(), step: next, expiresAt: expiresAt.current })
+    }
+  }
+  const forget = () => {
+    loginId.current = null
+    savePendingLogin(null)
+  }
+
+  // Closing (backdrop tap, Escape, X) only hides the dialog: a stray tap when coming back from the
+  // Telegram app must not throw the pending login away. "Cancel login" below does that on purpose.
+  const close = () => onClose()
+  const cancelLogin = () => {
     if (loginId.current) void api.telegramLoginCancel(loginId.current).catch(() => undefined)
+    forget()
     onClose()
   }
   useEffect(() => () => setPassword(''), [])
 
   const finish = () => {
-    loginId.current = null
+    forget()
     void qc.invalidateQueries({ queryKey: ['telegram-accounts'] })
     void qc.invalidateQueries({ queryKey: ['worker-status-mini'] })
     onClose()
@@ -39,21 +62,25 @@ export default function AddAccountModal({ hasAccounts, onClose }: { hasAccounts:
     mutationFn: () => api.telegramLoginStart({ label: label.trim(), phone: phone.trim(), make_default: makeDefault }),
     onSuccess: (r) => {
       loginId.current = r.login_id
+      expiresAt.current = Date.now() + Math.max(30, r.expires_in - 5) * 1000
       setPhone('')
       setStep('code')
+      remember('code')
     },
   })
   const sendCode = useMutation({
     mutationFn: () => api.telegramLoginCode(loginId.current ?? '', code.trim()),
     onSuccess: (r) => {
       setCode('')
-      if (r.stage === 'password') setStep('password')
-      else finish()
+      if (r.stage === 'password') {
+        setStep('password')
+        remember('password')
+      } else finish()
     },
     onError: (e: Error & { status?: number }) => {
       // A wrong code can be retried; anything else ends this login on the server.
       if (e.status === 410 || e.status === 429 || e.status === 409) {
-        loginId.current = null
+        forget()
         setCode('')
         setStep('details')
       }
@@ -67,7 +94,7 @@ export default function AddAccountModal({ hasAccounts, onClose }: { hasAccounts:
     },
     onError: (e: Error & { status?: number }) => {
       if (e.status === 410 || e.status === 429 || e.status === 409) {
-        loginId.current = null
+        forget()
         setPassword('')
         setStep('details')
       }
@@ -139,7 +166,7 @@ export default function AddAccountModal({ hasAccounts, onClose }: { hasAccounts:
           >
             <p className="text-sm text-slate-300">
               Enter the code Telegram sent to <span className="font-semibold">{label.trim()}</span> (check the Telegram app
-              on that account).
+              on that account). You can switch to Telegram and come back; this login waits for you.
             </p>
             <input
               className="input w-full text-center text-lg tracking-widest"
@@ -153,6 +180,9 @@ export default function AddAccountModal({ hasAccounts, onClose }: { hasAccounts:
             {error && <p className="text-sm text-status-error">{error.message}</p>}
             <button type="submit" className="btn btn-primary w-full" disabled={busy || !code.trim()}>
               {sendCode.isPending && <Loader2 className="h-4 w-4 animate-spin" />} Log in
+            </button>
+            <button type="button" className="w-full text-center text-xs text-slate-500 underline" onClick={cancelLogin}>
+              Cancel this login
             </button>
           </form>
         )}
@@ -178,6 +208,9 @@ export default function AddAccountModal({ hasAccounts, onClose }: { hasAccounts:
             {error && <p className="text-sm text-status-error">{error.message}</p>}
             <button type="submit" className="btn btn-primary w-full" disabled={busy || !password}>
               {sendPassword.isPending && <Loader2 className="h-4 w-4 animate-spin" />} Log in
+            </button>
+            <button type="button" className="w-full text-center text-xs text-slate-500 underline" onClick={cancelLogin}>
+              Cancel this login
             </button>
           </form>
         )}
