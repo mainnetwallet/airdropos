@@ -1223,6 +1223,54 @@ class TelegramClickButtonTool(BaseTool):
         return await _session.run(action, interactive=True, label=f"Pressed a button in @{target['value']}")
 
 
+class TelegramGetMyAccountTool(BaseTool):
+    """Report which Telegram account the agent is working as."""
+
+    name = "telegram_get_my_account"
+    version = "1.0.0"
+    description = (
+        "Return the @username (and display name and numeric id) of the Telegram account this "
+        "agent is logged in as. When a task or a bot asks for 'your Telegram username' and "
+        "none is given, call this and use exactly the username it returns. Never returns the "
+        "phone number."
+    )
+    required_permissions = ["telegram.read"]
+    side_effect = SideEffect.EXTERNAL_READ
+    timeout_seconds = 30
+    is_idempotent = True
+    input_schema = {"type": "object", "properties": {}}
+
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        async def action(client: Any) -> ToolResult:
+            me = await client.get_me()
+            if me is None:
+                return ToolResult.failure(
+                    "Telegram did not return the logged-in account.",
+                    category="TELEGRAM_ACCOUNT_UNAVAILABLE",
+                    retryable=True,
+                )
+            username = getattr(me, "username", None)
+            first = getattr(me, "first_name", None) or ""
+            last = getattr(me, "last_name", None) or ""
+            data = {
+                "username": username,
+                "handle": f"@{username}" if username else None,
+                "display_name": f"{first} {last}".strip() or None,
+                "user_id": getattr(me, "id", None),
+            }
+            if not username:
+                return ToolResult.needs_user(
+                    "The Telegram account the agent uses has no @username. Set one in "
+                    "Telegram (Settings > Username) or tell me which username to give.",
+                    data=data,
+                )
+            return ToolResult.success(
+                data=data, evidence=_evidence("account_read", username=username)
+            )
+
+        return await _session.run(action, interactive=False, label="Read Telegram account")
+
+
 class TelegramListDialogsTool(BaseTool):
     """List the chats this account can actually see.
 
@@ -1410,6 +1458,7 @@ def register_telegram_user_tools(registry) -> bool:
             TelegramSendMessageTool(),
             TelegramClickButtonTool(),
             TelegramListDialogsTool(),
+            TelegramGetMyAccountTool(),
             TelegramCheckMembershipTool(),
             *[tool() for tool in CONTINUATION_TOOLS],
         ]
@@ -1452,6 +1501,7 @@ def telegram_capability_report() -> Dict[str, Any]:
             TelegramSendMessageTool,
             TelegramClickButtonTool,
             TelegramListDialogsTool,
+            TelegramGetMyAccountTool,
             TelegramCheckMembershipTool,
         )
     )

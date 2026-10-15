@@ -285,6 +285,7 @@ class WalletService:
             "supported_networks": row.supported_networks or [],
             "is_active": row.is_active,
             "is_locked": row.is_locked,
+            "is_default": bool(row.is_default),
             "has_key_material": bool(row.encrypted_secret),
             "can_sign": self.can_sign(row),
             "total_spent_usd": row.total_spent_usd,
@@ -322,6 +323,21 @@ class WalletService:
 
     async def set_active(self, row: Wallet, active: bool) -> None:
         row.is_active = bool(active)
+        if not row.is_active:
+            row.is_default = False  # an inactive wallet cannot be the default
+        await self.db.flush()
+
+    async def set_default(self, row: Wallet, default: bool = True) -> None:
+        """Make `row` the one default wallet (or clear it). Only an active wallet qualifies."""
+        from sqlalchemy import update
+
+        if default:
+            if not row.is_active:
+                raise WalletError("An inactive wallet cannot be the default. Activate it first.")
+            await self.db.execute(
+                update(Wallet).where(Wallet.id != row.id).values(is_default=False)
+            )
+        row.is_default = bool(default)
         await self.db.flush()
 
     async def delete(self, row: Wallet) -> None:

@@ -421,6 +421,10 @@ Hard rules:
     continue from the latest messages and buttons it returned and do NOT plan another /start.
     Never write a separate "send /start" step. Bots differ, so read what the bot actually shows
     and choose the next step from that.
+13b. When a campaign or bot asks for the operator's wallet address and none is named, plan
+    one get_wallet_address step with no wallet argument (the operator's default wallet is
+    used). When it asks for the operator's Telegram username, plan one telegram_get_my_account
+    step and use the username it returns. Never invent either value.
 13. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
 """

@@ -90,6 +90,13 @@ async def resolve_wallet(
             "create_wallet to make one."
         )
     if len(rows) > 1:
+        # The operator chose a default wallet on the Wallets page: it settles "which one"
+        # when the task did not name a wallet. Only among wallets that already passed the
+        # label/network filters above, so a default that does not fit is never forced on a
+        # task that needs another network.
+        defaults = [r for r in rows if getattr(r, "is_default", False)]
+        if len(defaults) == 1:
+            return defaults[0], None
         names = ", ".join(f"'{r.label}' ({r.address})" for r in rows[:5])
         return None, (
             f"{len(rows)} wallets match. Say which one, by label, id or address. Candidates: {names}"
@@ -166,8 +173,10 @@ class GetWalletAddressTool(BaseTool):
     version = "1.0.0"
     description = (
         "Return the PUBLIC address of one of the operator's wallets. Identify it by "
-        "wallet id, label, address, or simply 'the only one'. When more than one "
-        "wallet matches, the tool says so instead of guessing."
+        "wallet id, label, address, or simply 'the only one'. When a task asks for a wallet "
+        "address and names none, call this with no arguments (add `network` for the chain the "
+        "task needs): it returns the operator's DEFAULT wallet from the Wallets page. When "
+        "several wallets match and none is the default, the tool says so instead of guessing."
     )
     required_permissions = ["wallet.read"]
     side_effect = SideEffect.NONE
@@ -224,6 +233,7 @@ class GetWalletAddressTool(BaseTool):
                     "has_key_material": data["has_key_material"],
                     # The frontend's Copy Address button copies exactly this value.
                     "copyable_address": data["address"],
+                    "is_default": data.get("is_default", False),
                 },
                 evidence={
                     "authoritative": True,

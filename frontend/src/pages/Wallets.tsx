@@ -23,6 +23,7 @@ import {
   Upload,
   Wallet as WalletIcon,
   X,
+  Star,
 } from 'lucide-react'
 import { api } from '@/services/api'
 import clsx from 'clsx'
@@ -350,6 +351,9 @@ export default function Wallets() {
                     {!wallet.has_key_material && (
                       <span className="badge bg-surface-300 capitalize text-slate-300">watch-only</span>
                     )}
+                    {wallet.is_default && (
+                      <span className="badge bg-blue-900 text-blue-300">default</span>
+                    )}
                     {wallet.is_locked && (
                       <span className="badge bg-yellow-900 text-yellow-300">locked</span>
                     )}
@@ -437,6 +441,21 @@ export default function Wallets() {
                     >
                       {wallet.is_locked ? <Unlock className="h-4 w-4" /> : <Lock className="h-4 w-4" />}
                       {wallet.is_locked ? 'Unlock' : 'Lock'}
+                    </button>
+                  )}
+                  {wallet.is_active && (
+                    <button
+                      className="btn-ghost"
+                      disabled={busy}
+                      title="The agent uses this wallet when a task asks for an address and names none"
+                      onClick={() =>
+                        void runAction(wallet.id, () =>
+                          api.setWalletDefault(wallet.id, !wallet.is_default),
+                        )
+                      }
+                    >
+                      <Star className="h-4 w-4" />
+                      {wallet.is_default ? 'Remove default' : 'Set as default'}
                     </button>
                   )}
                   <button

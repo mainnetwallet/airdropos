@@ -365,6 +365,10 @@ export const api = {
     request<WalletView>(`/wallets/${encodeURIComponent(id)}/deactivate?active=${active}`, {
       method: 'POST',
     }),
+  setWalletDefault: (id: string, makeDefault: boolean) =>
+    request<WalletView>(`/wallets/${encodeURIComponent(id)}/default?default=${makeDefault}`, {
+      method: 'POST',
+    }),
   deleteWallet: (id: string) =>
     request<void>(`/wallets/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 

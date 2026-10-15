@@ -298,6 +298,8 @@ export interface WalletView {
   supported_networks: string[]
   is_active: boolean
   is_locked: boolean
+  /** The wallet the agent uses when a task asks for an address and names none. */
+  is_default?: boolean
   /** True when an encrypted key is stored. The key itself is never sent. */
   has_key_material: boolean
   /** Capability flag: key present, wallet active and unlocked. Watch-only is always false. */

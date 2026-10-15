@@ -331,6 +331,40 @@ async def lock_wallet(
     return service.to_dict(row)
 
 
+@router.post("/wallets/{wallet_id}/default", tags=["wallets"])
+async def set_default_wallet(
+    wallet_id: str,
+    request: Request,
+    default: bool = Query(default=True, description="true to make default, false to clear"),
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_wallet_write),
+) -> Dict[str, Any]:
+    """Choose the wallet the agent uses when a task asks for a wallet address.
+
+    Exactly one wallet can be the default. It changes which public address the agent
+    hands out; it grants no signing or spending permission.
+    """
+    enforce_rate_limit(request, "write")
+    row = await _load(db, wallet_id)
+    service = _service(db)
+    try:
+        await service.set_default(row, default)
+    except WalletError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    await write_audit(
+        db,
+        principal,
+        "WALLET_DEFAULT_SET" if default else "WALLET_DEFAULT_CLEARED",
+        "wallet",
+        wallet_id,
+        after_state={"is_default": row.is_default},
+        ip_address=request.client.host if request.client else None,
+    )
+    await db.commit()
+    return service.to_dict(row)
+
+
 @router.post("/wallets/{wallet_id}/deactivate", tags=["wallets"])
 async def deactivate_wallet(
     wallet_id: str,

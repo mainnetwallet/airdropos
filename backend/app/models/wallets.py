@@ -29,6 +29,9 @@ class Wallet(Base):
     supported_networks: Mapped[Optional[List[str]]] = mapped_column(JSONB, default=list)
     is_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # The wallet the agent uses when a task asks for "a wallet address" and names none.
+    # At most one wallet is the default; WalletService.set_default keeps it that way.
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     total_spent_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
