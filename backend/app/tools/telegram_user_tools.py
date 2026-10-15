@@ -32,11 +32,12 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs
 
 from backend.app.core.config import settings
-from backend.app.integrations import telegram_accounts
+from backend.app.integrations import telegram_accounts, telegram_leases
 from backend.app.integrations.telegram_accounts import resolve_path
 from backend.app.live import hub
 from backend.app.live.events import redact_text
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
+from backend.app.tools.context import get_current_task_id
 from backend.app.tools.web_tools import sanitize_external_text
 
 logger = logging.getLogger(__name__)
@@ -155,6 +156,9 @@ class _TelegramUserSession:
         # The bot the workflow is currently anchored to, so "return to the bot" is a
         # real addressable target rather than something the LLM must remember.
         self.current_bot: Optional[str] = None
+        # True once a task has used this session, so the idle sweeper (see
+        # scheduler/worker.py) only ever closes connections a task opened.
+        self.bound_by_task = False
 
     # -- Live Broadcast helpers ------------------------------------------------
     SESSION_ID = "telegram:agent"
@@ -212,14 +216,42 @@ class _TelegramUserSession:
         )
 
     def _note_task(self) -> None:
+        """Remember which task is using this session (several tasks may run at once)."""
+        tid = get_current_task_id()
         try:
             from backend.app.scheduler.worker_status import state as worker_state
 
-            cur = worker_state.current_task
+            running = getattr(worker_state, "running", {}) or {}
+            cur = running.get(tid) if tid else worker_state.current_task
         except Exception:
             cur = None
         if cur:
             self.task_id, self.task_title = cur.get("task_id"), cur.get("title")
+        elif tid:
+            self.task_id = tid
+
+    async def _bind_current_task(self) -> None:
+        """Tie the running task to this account the first time it uses one.
+
+        A task created with an explicit account is already bound. One created without is
+        bound to whichever account it actually uses first, so the account is locked and
+        later closed for it like any other. Best effort: it must never fail a tool call.
+        """
+        tid = get_current_task_id()
+        if not tid or not telegram_leases.is_running_here(tid):
+            return
+        self.bound_by_task = True
+        if telegram_leases.bound_label(tid):
+            return
+        telegram_leases.remember_binding(tid, self.label)
+        try:
+            from backend.app.database.session import AsyncSessionLocal
+
+            async with AsyncSessionLocal() as db:
+                await telegram_leases.bind_if_unbound(db, tid, self.label)
+                await db.commit()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not record Telegram account for task %s (%s)", tid, type(exc).__name__)
 
     def _after(self, label: str, result: ToolResult) -> None:
         self.last_action_at = time.time()
@@ -294,6 +326,7 @@ class _TelegramUserSession:
             self.started_at = time.time()
             self._emit("session.started", "The agent began using the Telegram account", "ok")
         self._note_task()
+        await self._bind_current_task()
         blocked = self.gate_reason()
         if blocked:
             self._emit("telegram.blocked", f"{label} not run: {blocked}", "paused")
@@ -406,6 +439,16 @@ def session_for(label: Optional[str] = None) -> _TelegramUserSession:
     exactly as before. Raises UnknownAccount for a label that is not registered.
     """
     label = (label or "").strip() or None
+    # A task is bound to one account for its whole life: whatever account the model names,
+    # the task keeps using its own, so tasks on different accounts never cross over.
+    bound = telegram_leases.bound_label(get_current_task_id())
+    if bound:
+        if label and label.lower() != bound.lower():
+            logger.warning(
+                "Task is bound to Telegram account '%s'; ignoring requested account '%s'",
+                bound, label[:40],
+            )
+        label = bound
     account = telegram_accounts.get_account(label)
     if account is None:
         if label is None:

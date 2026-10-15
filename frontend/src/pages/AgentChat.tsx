@@ -403,6 +403,10 @@ export default function AgentChat() {
   // Other screens can hand over a draft (e.g. "define a goal"); it is never auto-sent.
   const [input, setInput] = useState(() => (location.state as { prompt?: string } | null)?.prompt ?? '')
   const [showInfo, setShowInfo] = useState(false)
+  // Telegram account the task created by the next message must use ('' = the default account).
+  const [telegramAccount, setTelegramAccount] = useState('')
+  const telegramAccounts = useQuery({ queryKey: ['telegram-accounts'], queryFn: api.telegramAccounts })
+  const loggedInAccounts = (telegramAccounts.data?.accounts ?? []).filter((a) => a.logged_in)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -433,9 +437,11 @@ export default function AgentChat() {
     mutationFn: ({
       message,
       history,
+      account,
     }: {
       message: string
       history: Array<{ role: 'user' | 'assistant'; content: string }>
+      account?: string
     }) => {
       // The turn streams: reply text and tool progress arrive live and are shown as a
       // preview. What is kept is the final result this resolves with, i.e. exactly what the
@@ -449,6 +455,7 @@ export default function AgentChat() {
           history,
           (event) => agentChatStore.applyStreamEvent(event, epoch),
           controller.signal,
+          account,
         )
         .finally(() => agentChatStore.setAbort(null))
     },
@@ -502,7 +509,7 @@ export default function AgentChat() {
 
     agentChatStore.add({ role: 'user', content: text })
     setInput('')
-    send.mutate({ message: text, history })
+    send.mutate({ message: text, history, account: telegramAccount || undefined })
   }
 
   const clearChat = () => {
@@ -663,6 +670,27 @@ export default function AgentChat() {
             </button>
           ))}
         </div>
+
+        {loggedInAccounts.length > 0 && (
+          <label className="mb-2 flex items-center gap-2 text-xs text-slate-400">
+            <span className="shrink-0">Telegram for new tasks</span>
+            <select
+              value={telegramAccount}
+              onChange={(e) => setTelegramAccount(e.target.value)}
+              disabled={pending}
+              aria-label="Telegram account for tasks created from this chat"
+              className="min-w-0 flex-1 rounded-lg border border-surface-300 bg-surface-200 px-2 py-1.5 text-xs text-slate-100 focus:border-accent focus:outline-none"
+            >
+              <option value="">Default account</option>
+              {loggedInAccounts.map((a) => (
+                <option key={a.label} value={a.label}>
+                  {a.label}
+                  {a.username ? ` (@${a.username})` : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
 
         <form
           onSubmit={handleSubmit}

@@ -38,6 +38,7 @@ export interface TaskSummary {
   priority: number
   progress: number
   network: string | null
+  telegram_account?: string | null
   retry_count: number
   created_at: string
   updated_at: string
@@ -52,6 +53,7 @@ export interface TaskReport {
   priority: number
   progress: number
   network: string | null
+  telegram_account?: string | null
   retry_count: number
   max_retries: number
   dependencies: string[]
@@ -602,4 +604,8 @@ export interface TelegramAccount {
   logged_in: boolean
   legacy: boolean
   added_at: string | null
+  /** True while unfinished tasks are bound to this account; it cannot be stopped or removed. */
+  in_use?: boolean
+  /** Public ids of those tasks. */
+  active_tasks?: string[]
 }

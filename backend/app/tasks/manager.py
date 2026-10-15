@@ -75,6 +75,7 @@ class TaskManager:
         deadline_at: Optional[datetime] = None,
         max_retries: int = 3,
         owner_email: Optional[str] = None,
+        telegram_account: Optional[str] = None,
     ) -> Task:
         """Allocate a unique AIR-YYYY-MM-DD-NNNNNN ID and persist a new task."""
         if priority < 1 or priority > 10:
@@ -105,6 +106,7 @@ class TaskManager:
             deadline_at=deadline_at,
             max_retries=max_retries,
             owner_email=owner_email,
+            telegram_account=telegram_account,
             next_planned_action=planned_actions[0].get("description") if planned_actions else None,
         )
         self.db.add(task)
@@ -530,6 +532,7 @@ class TaskManager:
             "priority": task.priority,
             "progress": task.progress,
             "network": task.network,
+            "telegram_account": task.telegram_account,
             "retry_count": task.retry_count,
             "max_retries": task.max_retries,
             "dependencies": task.dependencies or [],

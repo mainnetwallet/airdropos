@@ -305,7 +305,9 @@ Every message must produce ONE strict JSON object with these keys:
     "category": string,       // e.g. "waitlist", "airdrop", "points", "research",
                               //      "monitoring", "social", "wallet"
     "network": string|null,   // e.g. "ethereum", "base", or null
-    "priority": integer       // 1 (highest) .. 10 (lowest); default 5
+    "priority": integer,      // 1 (highest) .. 10 (lowest); default 5
+    "telegram_account": string|null  // label from LOGGED-IN TELEGRAM ACCOUNTS below when the
+                              // operator names one ("use telegram X for this task"); else null
   }
 }
 
@@ -455,6 +457,30 @@ def _format_catalog(catalog: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _format_telegram_accounts() -> str:
+    """The labels of the logged-in Telegram accounts, so a task can be bound to one by name."""
+    try:
+        from backend.app.integrations import telegram_accounts
+
+        accounts = [a for a in telegram_accounts.list_accounts() if a.get("session_ready")]
+    except Exception:
+        accounts = []
+    if not accounts:
+        return "LOGGED-IN TELEGRAM ACCOUNTS: none."
+    rows = []
+    for a in accounts:
+        who = a.get("profile_name") or ""
+        rows.append(f"  - {a['label']}" + (f" ({who})" if who else "") + (" [default]" if a.get("is_default") else ""))
+    return (
+        "LOGGED-IN TELEGRAM ACCOUNTS (labels only):\n"
+        + "\n".join(rows)
+        + "\n  A task is bound to ONE of these for its whole life, and several tasks can run at the\n"
+        "  same time on the same or on different accounts. When the operator says which Telegram\n"
+        "  account a task should use, put that exact label in create_task.telegram_account. If they\n"
+        "  name none, leave it null (the default account is used). Never invent a label."
+    )
+
+
 def build_chat_system_prompt(catalog: List[Dict[str, Any]]) -> str:
     """Full manual + live tool catalog + chat routing contract."""
     return (
@@ -463,6 +489,8 @@ def build_chat_system_prompt(catalog: List[Dict[str, Any]]) -> str:
         + "LIVE TOOL CATALOG (authoritative)\n"
         + "==================================================================\n"
         + _format_catalog(catalog)
+        + "\n\n"
+        + _format_telegram_accounts()
         + "\n\n"
         + CHAT_ROUTING_CONTRACT
     )

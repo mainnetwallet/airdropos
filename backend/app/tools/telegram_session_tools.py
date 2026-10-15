@@ -433,6 +433,23 @@ class TelegramDisconnectTool(BaseTool):
         if failure is not None:
             return failure
         was_connected = session.is_connected()
+        # Other unfinished tasks may be using this account right now; closing it under them
+        # would break their work. Only the running task's own use does not block it.
+        from backend.app.database.session import AsyncSessionLocal
+        from backend.app.integrations import telegram_leases
+
+        try:
+            async with AsyncSessionLocal() as db:
+                await telegram_leases.assert_free(db, session.label, ignore_task=get_current_task_id())
+        except telegram_leases.AccountInUse as busy:
+            return ToolResult.failure(
+                str(busy),
+                category="ACCOUNT_IN_USE",
+                retryable=False,
+                data={"account": session.label, "disconnected": False, "busy_tasks": busy.task_ids},
+            )
+        except Exception:  # pragma: no cover - a lock lookup failure must not change behaviour
+            logger.warning("Could not check Telegram account usage before disconnect", exc_info=True)
         gate = session.gate_reason()
         if gate:
             # The gate is the operator's, and dropping the connection of a session

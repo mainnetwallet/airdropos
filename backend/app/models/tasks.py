@@ -40,6 +40,11 @@ class Task(Base):
     max_retries: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
 
     next_planned_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Label of the Telegram account (see integrations/telegram_accounts.py) this task acts
+    # through. Chosen when the task is created, or recorded the first time the task uses a
+    # Telegram account. While the task is not finished the account is locked: it cannot be
+    # stopped, disconnected or removed. When the last task bound to it ends it is closed.
+    telegram_account: Mapped[Optional[str]] = mapped_column(String(40), index=True, nullable=True)
     error_details: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONB, default=dict)
     # The authenticated operator who created this task. It scopes the task's Agent Inbox
     # conversation: a reply is authorised against this, never against a client-supplied id.

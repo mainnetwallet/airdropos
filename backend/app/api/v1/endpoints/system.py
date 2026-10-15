@@ -19,7 +19,7 @@ from backend.app.core.config import settings
 from backend.app.database.session import get_db, session_scope
 from backend.app.airdrops.verifier import ChangeDetector
 from backend.app.inbox.service import ConversationService
-from backend.app.integrations import telegram_accounts
+from backend.app.integrations import telegram_accounts, telegram_leases
 from backend.app.integrations import telegram_login
 from backend.app.integrations.telegram import telegram_bot
 from backend.app.learning.engine import LearningEngine
@@ -182,6 +182,9 @@ class ChatRequest(BaseModel):
     # re-estimates and asks the fixed model for a bounded, labelled summary)
     # rather than by dropping messages on length.
     history: List[ChatTurn] = Field(default_factory=list)
+    # Telegram account a task created by this message must use (a label from
+    # /telegram/accounts). Empty: whatever the message says, else the default account.
+    telegram_account: Optional[str] = Field(default=None, max_length=40)
 
 
 def _trim_history(history: List["ChatTurn"]) -> List["ChatTurn"]:
@@ -291,7 +294,9 @@ async def agent_chat(
     loop = ChatToolLoop(registry=registry, policy=registry.policy)
 
     async def create_task(spec: Dict[str, Any]):
-        return await _persist_chat_task(db, principal, spec, history, message)
+        return await _persist_chat_task(
+            db, principal, spec, history, message, payload.telegram_account
+        )
 
     try:
         turn = await loop.run(db=db, message=message, history=history, create_task=create_task)
@@ -367,7 +372,9 @@ async def agent_chat_stream(
             async with session_scope() as db:
 
                 async def create_task(spec: Dict[str, Any]):
-                    return await _persist_chat_task(db, principal, spec, history, message)
+                    return await _persist_chat_task(
+                        db, principal, spec, history, message, payload.telegram_account
+                    )
 
                 turn = await loop.run(
                     db=db,
@@ -432,6 +439,7 @@ async def _persist_chat_task(
     spec: Dict[str, Any],
     history: List["ChatTurn"],
     message: str,
+    telegram_account: Optional[str] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Save the task the model asked for and return its real id, or an error string.
 
@@ -456,8 +464,19 @@ async def _persist_chat_task(
         f"{operator_text}"
     ).strip()
 
+    # The account the operator picked wins over one the model inferred from the message.
+    # An unknown account is an error, not a silent fallback to the default: the task would
+    # otherwise run as a different Telegram identity than the one that was asked for.
+    try:
+        account_label = telegram_leases.normalize_label(
+            telegram_account or spec.get("telegram_account")
+        )
+    except ValueError as exc:
+        return None, str(exc)
+
     manager = TaskManager(db)
     task = await manager.create_task(
+        telegram_account=account_label,
         title=str(spec["title"]).strip()[:500],
         description=description,
         category=(str(spec["category"])[:100] if spec.get("category") else None),
@@ -479,6 +498,7 @@ async def _persist_chat_task(
             "status": task.status,
             "title": task.title,
             "priority": task.priority,
+            "telegram_account": task.telegram_account,
             "worker_will_execute": True,
         },
         None,
@@ -496,6 +516,7 @@ class CreateTaskRequest(BaseModel):
     priority: int = Field(default=5, ge=1, le=10)
     goal_id: Optional[str] = None
     project_id: Optional[str] = None
+    telegram_account: Optional[str] = Field(default=None, max_length=40)
 
 
 @router.post("/tasks", status_code=201, tags=["tasks"])
@@ -506,8 +527,13 @@ async def create_task(
     principal: Principal = Depends(require_task_write),
 ) -> Dict[str, Any]:
     enforce_rate_limit(request, "write")
+    try:
+        account_label = telegram_leases.normalize_label(payload.telegram_account)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": str(exc)})
     manager = TaskManager(db)
     task = await manager.create_task(
+        telegram_account=account_label,
         title=payload.title,
         description=payload.description,
         category=payload.category,
@@ -528,7 +554,12 @@ async def create_task(
     await write_audit(db, principal, "TASK_CREATE", "task", task.task_id,
                       after_state={"title": task.title, "priority": task.priority})
     await db.commit()
-    return {"task_id": task.task_id, "status": task.status, "created_at": task.created_at.isoformat()}
+    return {
+        "task_id": task.task_id,
+        "status": task.status,
+        "telegram_account": task.telegram_account,
+        "created_at": task.created_at.isoformat(),
+    }
 
 
 @router.get("/tasks", tags=["tasks"])
@@ -557,6 +588,7 @@ async def list_tasks(
                 "priority": t.priority,
                 "progress": t.progress,
                 "network": t.network,
+                "telegram_account": t.telegram_account,
                 "retry_count": t.retry_count,
                 "created_at": t.created_at.isoformat(),
                 "updated_at": t.updated_at.isoformat(),
@@ -1232,13 +1264,17 @@ def _telegram_readiness() -> Dict[str, Any]:
 @router.get("/telegram/accounts", tags=["system"])
 async def telegram_accounts_list(
     request: Request,
+    db: AsyncSession = Depends(get_db),
     principal: Principal = Depends(require_read),
 ) -> Dict[str, Any]:
     """Logged-in Telegram accounts: label and profile name only, never phone or session data."""
     enforce_rate_limit(request, "read")
+    in_use = await telegram_leases.labels_in_use(db)
     return {
         "accounts": [
             {
+                "in_use": a["label"].lower() in in_use,
+                "active_tasks": in_use.get(a["label"].lower(), []),
                 "label": a["label"],
                 "profile_name": a.get("profile_name"),
                 "first_name": a.get("first_name"),
@@ -1382,6 +1418,14 @@ async def telegram_account_remove(
     account = telegram_accounts.get_account(label)
     if account is None:
         raise HTTPException(status_code=404, detail={"error": "No such Telegram account."})
+    # An account that unfinished tasks are bound to cannot be removed under them.
+    try:
+        await telegram_leases.assert_free(db, account["label"])
+    except telegram_leases.AccountInUse as busy:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": str(busy), "category": "ACCOUNT_IN_USE", "tasks": busy.task_ids},
+        )
     # Disconnect any client this process holds before the file goes away.
     from backend.app.tools import telegram_user_tools as tools
 

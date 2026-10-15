@@ -556,8 +556,13 @@ export default function TaskManagerPage() {
                   <div>
                     <p className="font-mono text-xs text-slate-500">{detailQuery.data.task_id}</p>
                     <h3 className="mt-0.5 font-medium text-slate-100">{detailQuery.data.title}</h3>
-                    <div className="mt-2">
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
                       <StatusBadge status={detailQuery.data.status} />
+                      {detailQuery.data.telegram_account && (
+                        <span className="rounded-full bg-blue-500/15 px-2 py-0.5 text-xs text-blue-600">
+                          Telegram: {detailQuery.data.telegram_account}
+                        </span>
+                      )}
                     </div>
                   </div>
 

@@ -76,6 +76,9 @@ class WorkerState:
         self.started_at: Optional[datetime] = None
         self.tools: List[str] = []
         self.current_task: Optional[Dict[str, Any]] = None
+        # Every task running right now, keyed by public id. The worker runs several at once;
+        # ``current_task`` stays as the most recently started one for older dashboard code.
+        self.running: Dict[str, Dict[str, Any]] = {}
         self.last_task: Optional[Dict[str, Any]] = None
         self.last_error: Optional[Dict[str, Any]] = None
         self.last_poll_at: Optional[datetime] = None
@@ -119,20 +122,24 @@ class WorkerState:
             "title": title,
             "since": datetime.now(timezone.utc).isoformat(),
         }
+        self.running[task_id] = self.current_task
         self.note = f"running {task_id}"
 
     def task_finished(self, task_id: str, outcome: str) -> None:
         self.finished += 1
-        self.current_task = None
+        self.running.pop(task_id, None)
+        self.current_task = next(reversed(self.running.values()), None) if self.running else None
         self.last_task = {
             "task_id": task_id,
             "outcome": outcome,
             "at": datetime.now(timezone.utc).isoformat(),
         }
-        self.note = "idle"
+        self.note = f"running {len(self.running)} task(s)" if self.running else "idle"
 
     def failed(self, exc: BaseException, task_id: Optional[str] = None) -> None:
-        self.current_task = None
+        if task_id:
+            self.running.pop(task_id, None)
+        self.current_task = next(reversed(self.running.values()), None) if self.running else None
         self.last_error = {
             "at": datetime.now(timezone.utc).isoformat(),
             "task_id": task_id,
@@ -154,6 +161,7 @@ class WorkerState:
             "telegram_tools": [t for t in self.tools if t.startswith("telegram")],
             "note": self.note,
             "current_task": self.current_task,
+            "running_tasks": list(self.running.values()),
             "last_task": self.last_task,
             "last_error": self.last_error,
             "last_poll_at": iso(self.last_poll_at),

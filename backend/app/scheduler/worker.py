@@ -354,9 +354,53 @@ async def _settle_failed_execution(task_pk: Any, reason: str, detail: Dict[str, 
         logger.warning("Task %s -> %s after failed execution: %s", task.task_id, task.status, reason)
 
 
-async def task_execution_loop() -> None:
-    """Continuously claim and execute tasks."""
-    logger.info("Task execution loop started for %s", WORKER_ID)
+_TELEGRAM_SWEEP_INTERVAL_SECONDS = 10.0
+_last_telegram_sweep = 0.0
+
+
+async def release_idle_telegram_sessions(*, force: bool = False) -> int:
+    """Close the Telegram connections that no unfinished task needs any more.
+
+    A task keeps its Telegram account open and locked until it is finished; when the last
+    task bound to an account ends, this closes that account. The next task that names it
+    reconnects automatically. Only connections a task opened are touched, and never one that
+    is in the middle of an action. Returns how many connections were closed.
+    """
+    global _last_telegram_sweep
+    now = time.monotonic()
+    if not force and now - _last_telegram_sweep < _TELEGRAM_SWEEP_INTERVAL_SECONDS:
+        return 0
+    _last_telegram_sweep = now
+    try:
+        from backend.app.integrations import telegram_leases
+        from backend.app.tools.telegram_user_tools import all_sessions
+
+        candidates = [
+            s for s in all_sessions()
+            if s.bound_by_task and s.is_connected() and not s._lock.locked()
+        ]
+        if not candidates:
+            return 0
+        async with AsyncSessionLocal() as db:
+            in_use = await telegram_leases.labels_in_use(db)
+        closed = 0
+        for sess in candidates:
+            if sess.label.lower() in in_use:
+                continue
+            if await sess.disconnect_quietly():
+                closed += 1
+                sess.bound_by_task = False
+                sess._emit("session.released", "No task needs this Telegram account any more; closed", "ok")
+                logger.info("Telegram account '%s' closed: its tasks have finished", sess.label)
+        return closed
+    except Exception:
+        logger.warning("Telegram idle-session sweep failed", exc_info=True)
+        return 0
+
+
+async def task_execution_loop(slot: int = 0) -> None:
+    """Continuously claim and execute tasks. Several of these run side by side."""
+    logger.info("Task execution loop %s started for %s", slot, WORKER_ID)
     while not _shutdown_event.is_set():
         current_task_id = None
         current_task_pk = None
@@ -371,7 +415,8 @@ async def task_execution_loop() -> None:
                 task = await manager.claim_next_task(WORKER_ID)
 
                 if task is None:
-                    worker_state.polled("idle: no runnable task")
+                    if not worker_state.running:
+                        worker_state.polled("idle: no runnable task")
                     await asyncio.sleep(3)
                     continue
 
@@ -391,6 +436,10 @@ async def task_execution_loop() -> None:
                 )
                 worker_state.polled(f"running {task.task_id}")
                 worker_state.task_claimed(task.task_id, task.title)
+                # Tell this process's Telegram tools which account the task is bound to.
+                from backend.app.integrations import telegram_leases
+
+                telegram_leases.begin_run(task.task_id, task.telegram_account)
 
                 # Bind the operator's authorization policy explicitly. The registry's
                 # own policy is used as a fallback inside `invoke`, but passing it here
@@ -465,6 +514,17 @@ async def task_execution_loop() -> None:
                 except Exception:
                     logger.exception("Could not record failure for task %s", current_task_id)
             await asyncio.sleep(5)
+        finally:
+            # The run is over (finished, failed, or discarded) and its status is settled:
+            # stop routing Telegram calls for it, then close any account nobody needs now.
+            if current_task_id:
+                try:
+                    from backend.app.integrations import telegram_leases
+
+                    telegram_leases.end_run(current_task_id)
+                except Exception:
+                    pass
+            await release_idle_telegram_sessions(force=bool(current_task_id))
 
 
 # ----------------------------------------------------------------------
@@ -631,7 +691,11 @@ async def main() -> None:
     # and Telegram session that live in THIS process.
     gateway_task = asyncio.create_task(live_gateway.serve(_shutdown_event))
 
-    await asyncio.create_task(task_execution_loop())
+    # One loop per execution slot, so tasks run at the same time (each on its own Telegram
+    # account, or sharing one). claim_next_task enforces MAX_CONCURRENT_TASKS across them.
+    slots = max(1, int(settings.MAX_CONCURRENT_TASKS))
+    logger.info("Running up to %s tasks at the same time", slots)
+    await asyncio.gather(*(task_execution_loop(i) for i in range(slots)))
 
     await _shutdown_event.wait()
     logger.info("Shutdown signal received. Preserving state.")

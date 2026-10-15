@@ -132,6 +132,15 @@ class TelegramProvider(SessionProvider):
                 tg._emit("session.resumed", f"Resumed by {who}", "ok")
             return {"status": (await self.get_session(key))["status"], "task_id": tg.task_id, "resumed_from": resumed_from}
         elif action == "stop":
+            # An account that unfinished tasks are bound to cannot be stopped under them.
+            from backend.app.database.session import AsyncSessionLocal
+            from backend.app.integrations import telegram_leases
+
+            try:
+                async with AsyncSessionLocal() as db:
+                    await telegram_leases.assert_free(db, tg.label)
+            except telegram_leases.AccountInUse as busy:
+                raise Conflict(str(busy), "account_in_use")
             if not tg.stopped:
                 self._stopped_seen[key] = time.time()
                 tg.stopped = True  # set first: queued agent calls re-check this before they touch the client
