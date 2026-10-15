@@ -6,6 +6,7 @@
   "description": "AirdropOS Web Dashboard - React + TypeScript control surface",
   "scripts": {
     "dev": "vite",
+    "dev:mobile": "vite --mode mobile",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "lint": "eslint src --ext .ts,.tsx",

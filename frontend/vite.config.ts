@@ -13,7 +13,9 @@ logger.error = (msg, options) => {
   baseError(msg, options)
 }
 
-export default defineConfig({
+// `npm run dev:mobile` (vite --mode mobile) turns the HMR WebSocket off. On a phone, Chrome drops that
+// socket when the tab is backgrounded and Vite then full-reloads the page on return.
+export default defineConfig(({ mode }) => ({
   customLogger: logger,
   plugins: [react()],
   resolve: {
@@ -28,6 +30,7 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    hmr: mode === 'mobile' ? false : undefined,
     proxy: {
       '/api': {
         target: 'http://localhost:8000',
@@ -36,4 +39,4 @@ export default defineConfig({
       },
     },
   },
-})
+}))
