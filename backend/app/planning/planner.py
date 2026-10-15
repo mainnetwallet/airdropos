@@ -315,6 +315,14 @@ class PlanConstraints:
 # method the controller recognises (controller.EVIDENCE_KINDS). Matching is conservative: only
 # an unambiguous phrase is mapped, anything else stays as written and is treated as UNVERIFIED
 # by the controller, never silently upgraded.
+_TOOL_NAME_AS_METHOD = {
+    "telegram_send_message": "message_sent",
+    "telegram_click_button": "button_clicked",
+    "telegram_open_bot": "bot_started",
+    "telegram_read_messages": "message_observed",
+    "telegram_return_to_bot": "message_observed",
+}
+
 _VERIFICATION_HINTS = (
     (("wallet address", "get_wallet_address", "evm address", "0x address"), "wallet_record"),
     (("chain receipt", "transaction receipt", "tx receipt"), "chain_receipt"),
@@ -341,6 +349,10 @@ def normalize_verification_method(raw: Any, description: str = "") -> str:
     if not text:
         return "unspecified"
     lowered = text.lower()
+    # The model sometimes writes the TOOL's name where a method belongs. The method that tool's
+    # evidence actually satisfies is unambiguous, so it is used instead of leaving the step
+    # UNVERIFIED over a naming slip.
+    lowered = _TOOL_NAME_AS_METHOD.get(lowered, lowered)
     if lowered in EVIDENCE_KINDS or lowered in GENERIC_EVIDENCE_METHODS or lowered == "unspecified":
         return lowered
     matches = {
@@ -396,8 +408,9 @@ Hard rules:
     visible_text, http_status, source_scan, notification_delivered, prepared_transfer,
     contract_read, wallet_record, record_read, message_observed, button_clicked, or
     tool_evidence. Put the detail of what must be true in "expected_evidence", never in "verification_method".
-    For Telegram work match the method to what the tool really proves: telegram_send_message ->
-    message_sent, telegram_click_button -> button_clicked, starting a bot -> bot_started. Those only
+    For Telegram work match the method to what the tool really proves: sending a message ->
+    message_sent, clicking a button -> button_clicked, starting a bot -> bot_started (these are
+    method names, never write a tool name such as telegram_send_message there). Those only
     prove the action happened, NOT that the bot accepted it. To prove acceptance add a separate
     read step (verification_method message_observed) that reads the bot's reply. Never declare
     page_observation or post_action_observation for a Telegram send or click.

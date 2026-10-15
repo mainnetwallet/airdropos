@@ -126,6 +126,9 @@ class ExtractedState:
     reference_values: Dict[str, Any] = field(default_factory=dict)
     suspicious_content: Optional[str] = None
     used_model: bool = False
+    # Set when prose extraction was deferred (allow_model=False): the caller may run
+    # extract_requirements_from_prose on it later, off the critical path.
+    pending_prose: Optional[str] = None
 
     def __bool__(self) -> bool:
         return bool(self.observed_state or self.requirements)
@@ -349,8 +352,13 @@ async def extract_from_result(
     *,
     budget: DiscoveryBudget,
     context_hint: str = "",
+    allow_model: bool = True,
 ) -> ExtractedState:
     """Everything a tool result contributes to the task's execution context.
+
+    With ``allow_model=False`` no LLM call is made here. When prose would have been sent to
+    the model it is returned in ``pending_prose`` so the caller can extract it in the
+    background and the run never waits on an optional model call.
 
     Structured requirements are always read. Prose is only consulted when structured
     extraction found nothing and the budget allows it, so a tool that reports its own
@@ -372,6 +380,10 @@ async def extract_from_result(
             "It was not acted on."
         )
         combined.observed_state.setdefault("untrusted_content_flagged", True)
+        return combined
+
+    if not allow_model:
+        combined.pending_prose = prose
         return combined
 
     prose_state = await extract_requirements_from_prose(

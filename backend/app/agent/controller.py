@@ -25,7 +25,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.context import TaskContextService, action_fingerprint
-from backend.app.agent.discovery import DiscoveryBudget, extract_from_result
+from backend.app.agent.discovery import (
+    DiscoveryBudget,
+    extract_from_result,
+    extract_requirements_from_prose,
+)
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
 from backend.app.models import AirdropCampaign, Task
@@ -245,6 +249,9 @@ class AgentController:
         # executing it revealed something new.
         self.discovery_budget = DiscoveryBudget()
         self.discovery_replans = 0
+        # Optional LLM reads of a bot's reply run here, off the critical path (see
+        # _absorb_result). Kept referenced so the event loop cannot garbage-collect them.
+        self._background_tasks: set = set()
         # A planning cycle resolves the task's context once. The cache is cleared at each
         # cycle boundary (`begin_planning_cycle`), which is exactly where a context write
         # may have happened, so a second planner call in the same cycle does not re-read
@@ -1100,10 +1107,16 @@ class AgentController:
         is_idempotent = bool(getattr(tool_def, "is_idempotent", True))
 
         outcome = OUTCOME_CONFIRMED if verified else OUTCOME_UNVERIFIED
+        context_hint = f"{task.title or ''} {step.description}"
+        # allow_model=False: reading a bot's prose for requirements is an optional LLM call. It
+        # used to block here, so one stalled provider request froze the whole task right after
+        # a step. It now runs in the background and any requirement it finds is picked up by a
+        # later iteration; the loop keeps moving meanwhile.
         extracted = await extract_from_result(
             tool_result.data or {},
             budget=self.discovery_budget,
-            context_hint=f"{task.title or ''} {step.description}",
+            context_hint=context_hint,
+            allow_model=False,
         )
 
         observation = await self.context.record_observation(
@@ -1136,6 +1149,11 @@ class AgentController:
             logger.warning(
                 "Task %s: external content attempted to instruct the agent: %s",
                 task.task_id, extracted.suspicious_content[:200],
+            )
+
+        if extracted.pending_prose:
+            self._spawn_prose_extraction(
+                task, extracted.pending_prose, context_hint, f"{step.tool or 'step'}#{step.index}"
             )
 
         discovered: List[str] = []
@@ -1813,6 +1831,56 @@ class AgentController:
         why = str(result.get("reason") or "").strip()
         missing = [str(m)[:200] for m in (result.get("missing") or []) if str(m).strip()]
         return result["complete"], why, missing
+
+    def _spawn_prose_extraction(
+        self, task: Task, prose: str, context_hint: str, source_ref: str
+    ) -> None:
+        """Run the optional prose-to-requirements LLM read without blocking the task."""
+        job = asyncio.create_task(
+            self._extract_prose_in_background(task.id, task.task_id, prose, context_hint, source_ref)
+        )
+        self._background_tasks.add(job)
+        job.add_done_callback(self._background_tasks.discard)
+
+    async def _extract_prose_in_background(
+        self, task_pk: Any, task_label: str, prose: str, context_hint: str, source_ref: str
+    ) -> None:
+        """Extract requirements from a bot's reply and store them through its own session.
+
+        Never raises: extraction only enriches the task context. It writes through a separate
+        short-lived session because the controller's session belongs to the running loop.
+        """
+        from backend.app.database.session import session_scope
+
+        try:
+            state = await extract_requirements_from_prose(
+                prose, budget=self.discovery_budget, context_hint=context_hint
+            )
+            if not (state.requirements or state.suspicious_content):
+                return
+            async with session_scope() as session:
+                live = await session.get(Task, task_pk)
+                if live is None:
+                    return
+                ctx = TaskContextService(session)
+                if state.suspicious_content:
+                    await ctx.add_question(
+                        live,
+                        "External content contained an instruction aimed at the agent; "
+                        "it was not acted on. Review before continuing.",
+                    )
+                    logger.warning(
+                        "Task %s: external content attempted to instruct the agent: %s",
+                        task_label, state.suspicious_content[:200],
+                    )
+                for text in state.requirements:
+                    await ctx.record_requirement(
+                        live, text, origin="tool_result", source_ref=source_ref
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Background requirement extraction for %s failed: %s", task_label, exc)
 
     async def _release_write_lock(self) -> None:
         """Commit pending work so SQLite's write lock is not held across a slow call.
