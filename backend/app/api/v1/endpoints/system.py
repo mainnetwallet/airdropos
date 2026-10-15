@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.browser.controller import controller as browser_controller
 from backend.app.core.config import settings
-from backend.app.database.session import get_db
+from backend.app.database.session import get_db, session_scope
 from backend.app.airdrops.verifier import ChangeDetector
 from backend.app.inbox.service import ConversationService
 from backend.app.integrations import telegram_accounts
@@ -308,6 +311,119 @@ async def agent_chat(
         "model_policy": "single_fixed_model",
         "note": "The configured fixed model is used for every AI operation. No fallback exists.",
     }
+
+
+# Strong references to in-flight streamed turns. A turn keeps running to its next safe
+# boundary after the browser leaves, and an unreferenced task can be garbage collected.
+_STREAMED_TURNS: "set[asyncio.Task[None]]" = set()
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Connection": "keep-alive",
+    # Tell nginx-style proxies not to hold the response back to batch it.
+    "X-Accel-Buffering": "no",
+}
+_SSE_KEEPALIVE_SECONDS = 15.0
+
+
+def _sse(event: Dict[str, Any]) -> str:
+    """One Server-Sent Event frame. The type is both the event name and in the data."""
+    return f"event: {event['type']}\ndata: {json.dumps(event, default=str)}\n\n"
+
+
+@router.post("/agent/chat/stream", tags=["agent"])
+async def agent_chat_stream(
+    request: Request,
+    payload: ChatRequest,
+    principal: Principal = Depends(require_agent_chat),
+) -> StreamingResponse:
+    """The same turn as `/agent/chat`, delivered live as Server-Sent Events.
+
+    Events: `round_start`, `reply_delta` (the operator-facing text, as it is written),
+    `tool_start`, `tool_result`, then exactly one `done` (the full result, identical to
+    what `/agent/chat` returns) or `error`. The authoritative answer is always the
+    `done` payload; deltas are a preview and the client replaces them with it.
+
+    Authorization, rate limiting, tool policy, approvals and every safety bound are the
+    ones the blocking endpoint uses, because it is the same `ChatToolLoop`. If the
+    browser disconnects, the turn stops at its next safe boundary (never inside a tool
+    call) and creates no task.
+    """
+    from backend.app.agent.chat_loop import ChatToolLoop
+
+    message = payload.message
+    enforce_rate_limit(request, "chat")
+
+    history = _trim_history(payload.history)
+    loop = ChatToolLoop(registry=registry, policy=registry.policy)
+
+    queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
+    client_gone = False
+
+    async def run_turn() -> None:
+        try:
+            # The request-scoped session would be closed before a streamed body ends,
+            # so the turn owns a session of its own, like tools do.
+            async with session_scope() as db:
+
+                async def create_task(spec: Dict[str, Any]):
+                    return await _persist_chat_task(db, principal, spec, history, message)
+
+                turn = await loop.run(
+                    db=db,
+                    message=message,
+                    history=history,
+                    create_task=create_task,
+                    on_event=queue.put_nowait,
+                    should_stop=lambda: client_gone,
+                )
+            queue.put_nowait(
+                {
+                    "type": "done",
+                    **turn.to_dict(),
+                    "model_policy": "single_fixed_model",
+                    "note": "The configured fixed model is used for every AI operation. No fallback exists.",
+                }
+            )
+        except Exception as exc:  # never lose a turn silently
+            logger.exception("Streamed agent chat turn failed")
+            queue.put_nowait(
+                {
+                    "type": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "category": "AGENT_LOOP_FAILED",
+                    "retryable": True,
+                }
+            )
+        finally:
+            queue.put_nowait(None)
+
+    turn_task = asyncio.create_task(run_turn())
+    _STREAMED_TURNS.add(turn_task)
+    turn_task.add_done_callback(_STREAMED_TURNS.discard)
+
+    async def event_source():
+        nonlocal client_gone
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=_SSE_KEEPALIVE_SECONDS)
+                except asyncio.TimeoutError:
+                    # A comment frame keeps idle proxies from closing a long tool run.
+                    yield ": keep-alive\n\n"
+                    continue
+                if event is None:
+                    break
+                yield _sse(event)
+        finally:
+            # Reached on normal completion and when Starlette cancels the body because
+            # the browser went away. The turn is NOT cancelled: it is asked to stop at
+            # its next safe boundary so a tool is never abandoned half-run.
+            client_gone = True
+
+    return StreamingResponse(
+        event_source(), media_type="text/event-stream", headers=_SSE_HEADERS
+    )
 
 
 async def _persist_chat_task(

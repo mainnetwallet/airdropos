@@ -30,12 +30,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.prompts import build_chat_system_prompt
-from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.client import LLMError, LLMResponse, Message, llm
+from backend.app.llm.json_stream import JsonStringFieldStreamer
 from backend.app.tools.base import ToolResultStatus
 from backend.app.tools.registry import AuthorizationPolicy, ToolRegistry
 
@@ -49,6 +50,15 @@ TURN_TIME_BUDGET_SECONDS = 150.0
 # Side effects that may never be taken on a single ambiguous sentence. The model is
 # asked for an approval request instead; the deterministic policy is what enforces it.
 IRREVERSIBLE_SIDE_EFFECTS = {"wallet_signing", "transaction_submission"}
+
+# A streamed call that fails before the operator has seen anything is retried once as a
+# normal call, because some providers or gateways do not support `stream: true`. These
+# failures would repeat identically, so they are raised instead.
+_NO_STREAM_FALLBACK = {"CONTEXT_OVERFLOW", "BILLING_REFUSAL", "COMPACTION_RECURSION"}
+
+# Receives one progress event: {"type": "round_start" | "reply_delta" | "tool_start" |
+# "tool_result", ...}. Must be cheap and synchronous (the endpoint just queues it).
+EventCallback = Callable[[Dict[str, Any]], None]
 
 
 @dataclass
@@ -185,9 +195,22 @@ class ChatToolLoop:
         message: str,
         history: List[Any],
         create_task: Optional[Any] = None,
+        on_event: Optional[EventCallback] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
     ) -> ChatTurnResult:
-        """Execute one turn. `create_task` persists a task the model asked for."""
+        """Execute one turn. `create_task` persists a task the model asked for.
+
+        `on_event` turns on live progress: the model is called with streaming, the
+        operator's `reply` text is forwarded token by token, and each tool call is
+        announced when it starts and when it ends. Without it the behaviour is exactly
+        the original single blocking call per round.
+
+        `should_stop` is polled only at safe boundaries (before a model call and before
+        a tool call, never in the middle of one), so a client that went away stops the
+        turn without abandoning a half-run tool. A stopped turn creates no task.
+        """
         started = time.perf_counter()
+        stopped = False
         result = ChatTurnResult(reply="")
 
         catalog = self.registry.catalog_for_llm(self.policy)
@@ -205,6 +228,13 @@ class ChatToolLoop:
 
         repaired = False  # one re-ask is allowed when the model breaks the JSON contract
         for round_index in range(self.max_rounds):
+            if should_stop is not None and should_stop():
+                stopped = True
+                result.truncated = True
+                result.blockers.append(
+                    "The client disconnected, so the remaining steps were not run."
+                )
+                break
             if time.perf_counter() - started > TURN_TIME_BUDGET_SECONDS:
                 result.truncated = True
                 result.blockers.append(
@@ -212,8 +242,9 @@ class ChatToolLoop:
                 )
                 break
 
+            self._emit(on_event, "round_start", round=round_index + 1)
             try:
-                response = await llm.complete(messages, json_mode=True)
+                response = await self._ask_model(messages, on_event, round_index + 1)
             except LLMError as exc:
                 result.blockers.append(
                     f"The configured model is unavailable ({exc.category}): {exc}"
@@ -265,6 +296,14 @@ class ChatToolLoop:
             transcript.append(f"ROUND {round_index + 1} - the agent decided to run tools.")
             exhausted = False
             for call in requested:
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    result.truncated = True
+                    result.blockers.append(
+                        "The client disconnected; remaining tool calls were skipped."
+                    )
+                    exhausted = True
+                    break
                 if len(result.tool_calls) >= MAX_TOOL_CALLS_PER_TURN:
                     result.truncated = True
                     result.blockers.append(
@@ -280,9 +319,25 @@ class ChatToolLoop:
                     exhausted = True
                     break
 
+                self._emit(
+                    on_event,
+                    "tool_start",
+                    round=round_index + 1,
+                    tool=str(call.get("tool") or ""),
+                    arguments=_redact_arguments(call.get("arguments") or {}),
+                )
                 record = await self._invoke(call)
                 result.tool_calls.append(record)
                 transcript.append(_render_tool_result(record))
+                self._emit(
+                    on_event,
+                    "tool_result",
+                    round=round_index + 1,
+                    tool=record.tool,
+                    status=record.status,
+                    duration_ms=record.duration_ms,
+                    error=record.error,
+                )
 
             if exhausted:
                 result.reply = reply or self._fallback_reply(result)
@@ -301,7 +356,7 @@ class ChatToolLoop:
         if not result.reply:
             result.reply = self._fallback_reply(result)
 
-        if spec and create_task is not None:
+        if spec and create_task is not None and not stopped:
             task_info, task_error = await create_task(spec)
             if task_error:
                 result.blockers.append(task_error)
@@ -343,6 +398,58 @@ class ChatToolLoop:
         if not result.reply:
             result.reply = self._fallback_reply(result)
         return result
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _emit(on_event: Optional[EventCallback], event_type: str, **data: Any) -> None:
+        """Report progress. A broken listener must never break the turn."""
+        if on_event is None:
+            return
+        try:
+            on_event({"type": event_type, **data})
+        except Exception:
+            logger.exception("Chat progress listener failed for %s", event_type)
+
+    async def _ask_model(
+        self,
+        messages: List[Message],
+        on_event: Optional[EventCallback],
+        round_number: int,
+    ) -> LLMResponse:
+        """One model call: blocking by default, streamed when someone is listening.
+
+        The model still has to answer with the JSON contract, and the finished body is
+        parsed exactly as before. Streaming only adds a live view of the `reply` field,
+        extracted from the partial JSON, so the operator reads the answer as it is
+        written instead of waiting for the whole object.
+        """
+        if on_event is None:
+            return await llm.complete(messages, json_mode=True)
+
+        streamer = JsonStringFieldStreamer("reply")
+        shown = False
+
+        def on_token(token: str) -> None:
+            nonlocal shown
+            piece = streamer.feed(token)
+            if piece:
+                shown = True
+                self._emit(on_event, "reply_delta", round=round_number, text=piece)
+
+        try:
+            return await llm.stream_complete(messages, json_mode=True, on_token=on_token)
+        except LLMError as exc:
+            # Nothing has run and nothing has been shown, so asking again without
+            # streaming cannot duplicate anything. After text was shown it could, so
+            # the failure is reported instead.
+            if shown or exc.category in _NO_STREAM_FALLBACK:
+                raise
+            logger.warning(
+                "Streamed chat call failed (%s); retrying once without streaming: %s",
+                exc.category,
+                exc,
+            )
+            return await llm.complete(messages, json_mode=True)
 
     # ------------------------------------------------------------------
     async def _invoke(self, call: Dict[str, Any]) -> ToolCallRecord:

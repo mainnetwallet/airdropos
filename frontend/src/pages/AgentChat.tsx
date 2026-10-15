@@ -22,7 +22,7 @@ import {
 } from 'lucide-react'
 import clsx from 'clsx'
 import { api } from '@/services/api'
-import { agentChatStore, type ChatMessage } from '@/services/agentChatStore'
+import { agentChatStore, type ChatMessage, type LiveTool, type LiveTurn } from '@/services/agentChatStore'
 import { Alert, Card } from '@/components/ui'
 import type { AgentToolCall, AutonomousRule, AutonomyPolicy } from '@/types'
 
@@ -334,10 +334,67 @@ function MessageDetail({ message }: { message: ChatMessage }) {
   )
 }
 
+function toolLabel(tool: LiveTool): string {
+  if (tool.status === 'running') return 'running…'
+  const took = tool.durationMs !== undefined ? ` · ${(tool.durationMs / 1000).toFixed(1)}s` : ''
+  return `${tool.status === 'success' ? 'done' : tool.status.replace(/_/g, ' ')}${took}`
+}
+
+/**
+ * The agent's turn while it is still being produced: the answer so far and which tools
+ * are running. Display only. It is a preview of the stream; the message that replaces it
+ * is built from the backend's final result, and a tool is shown as finished only because
+ * the backend said so.
+ */
+function LiveReply({ live }: { live: LiveTurn | null }) {
+  const hasText = !!live && live.text.length > 0
+  const hasTools = !!live && live.tools.length > 0
+
+  return (
+    <div className="flex items-start gap-2">
+      <AgentAvatar />
+      <div className="flex max-w-[82%] flex-col gap-2 lg:max-w-[80%]">
+        {hasTools && (
+          <ul className="space-y-1 rounded-2xl border border-surface-300 bg-surface-200/60 px-3 py-2 text-xs lg:border-0">
+            {live!.tools.map((t) => (
+              <li key={t.id} className="flex items-center gap-2 text-slate-300">
+                <span
+                  className={clsx(
+                    'h-1.5 w-1.5 shrink-0 rounded-full',
+                    t.status === 'running'
+                      ? 'animate-pulse bg-sky-400'
+                      : t.status === 'success'
+                        ? 'bg-emerald-400'
+                        : 'bg-amber-400',
+                  )}
+                />
+                <span className="font-mono">{t.tool}</span>
+                <span className="text-slate-500">{toolLabel(t)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tl-md border border-surface-300 bg-surface-200 px-4 py-2.5 text-[15px] leading-relaxed text-slate-100 lg:border-0 lg:text-sm lg:text-slate-200">
+          {hasText ? (
+            <>
+              {live!.text}
+              <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-sky-400/80" aria-hidden />
+            </>
+          ) : (
+            <span className="animate-pulse text-sm text-slate-400">
+              {hasTools ? 'Working…' : 'Thinking…'}
+            </span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export default function AgentChat() {
   // Conversation lives in a persistent external store, not component state, so
   // it survives navigating to another page and back.
-  const { messages, pending } = useSyncExternalStore(
+  const { messages, pending, live } = useSyncExternalStore(
     agentChatStore.subscribe,
     agentChatStore.getSnapshot,
   )
@@ -356,9 +413,11 @@ export default function AgentChat() {
     queryFn: api.autonomy,
   })
 
+  // While text is streaming in, a smooth scroll restarts on every token and lags behind it.
+  const liveSize = live ? live.text.length + live.tools.length : 0
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages.length, pending])
+    bottomRef.current?.scrollIntoView({ behavior: liveSize > 0 ? 'auto' : 'smooth' })
+  }, [messages.length, pending, liveSize])
 
   // ChatGPT-style composer: the box grows with the text up to a cap, then scrolls.
   useLayoutEffect(() => {
@@ -377,7 +436,22 @@ export default function AgentChat() {
     }: {
       message: string
       history: Array<{ role: 'user' | 'assistant'; content: string }>
-    }) => api.agentChat(message, history),
+    }) => {
+      // The turn streams: reply text and tool progress arrive live and are shown as a
+      // preview. What is kept is the final result this resolves with, i.e. exactly what the
+      // blocking endpoint would have returned.
+      const epoch = agentChatStore.getEpoch()
+      const controller = new AbortController()
+      agentChatStore.setAbort(() => controller.abort())
+      return api
+        .agentChatStream(
+          message,
+          history,
+          (event) => agentChatStore.applyStreamEvent(event, epoch),
+          controller.signal,
+        )
+        .finally(() => agentChatStore.setAbort(null))
+    },
     onMutate: () => {
       agentChatStore.setPending(true)
       // Remember which conversation this request belongs to.
@@ -571,14 +645,7 @@ export default function AgentChat() {
             )
           })}
 
-          {pending && (
-            <div className="flex items-start gap-2">
-              <AgentAvatar />
-              <div className="rounded-2xl rounded-tl-md border border-surface-300 bg-surface-200 px-4 py-2.5 lg:border-0">
-                <span className="animate-pulse text-sm text-slate-400">Thinking…</span>
-              </div>
-            </div>
-          )}
+          {pending && <LiveReply live={live} />}
           <div ref={bottomRef} />
         </div>
 

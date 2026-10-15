@@ -32,7 +32,7 @@ import contextvars
 import json
 import logging
 import re
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 import httpx
 
@@ -639,13 +639,21 @@ class FixedLLMClient:
             retryable=False,
         )
 
-    async def stream(
+    async def _iter_stream(
         self,
         messages: List[Message],
+        *,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> AsyncIterator[str]:
-        """Stream tokens from the single fixed model for chat UIs."""
+        json_mode: bool = False,
+        stop: Optional[List[str]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Open one streamed completion and yield each decoded provider chunk.
+
+        Shared by `stream` (tokens only) and `stream_complete` (tokens plus the model
+        name, usage and finish reason), so the request is built, preflighted and
+        error-classified in exactly one place.
+        """
         if self.in_compaction or _in_compaction_call.get():
             raise LLMError(
                 "A nested LLM request was made while compaction was running.",
@@ -657,7 +665,12 @@ class FixedLLMClient:
         # has been handed to the caller a retry is no longer transparent.
         prepared = await self._try_preflight(messages)
         payload = self._build_payload(
-            prepared, temperature=temperature, max_tokens=max_tokens, stream=True
+            prepared,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            stop=stop,
+            stream=True,
         )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -665,43 +678,140 @@ class FixedLLMClient:
         }
         url = f"{self.base_url}/chat/completions"
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    text = body.decode("utf-8", "replace")
-                    # The stream never yields partial output before this point,
-                    # so a context overflow here is still safely retryable. Once
-                    # the first token has been yielded below, no retry is ever
-                    # attempted: replaying would duplicate output the caller has
-                    # already seen.
-                    if classify_provider_error(response.status_code, text) == "CONTEXT_OVERFLOW":
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with client.stream("POST", url, json=payload, headers=headers) as response:
+                    if response.status_code != 200:
+                        body = await response.aread()
+                        text = body.decode("utf-8", "replace")
+                        # The stream never yields partial output before this point,
+                        # so a context overflow here is still safely retryable. Once
+                        # the first token has been yielded below, no retry is ever
+                        # attempted: replaying would duplicate output the caller has
+                        # already seen.
+                        if classify_provider_error(response.status_code, text) == "CONTEXT_OVERFLOW":
+                            raise LLMError(
+                                "The model refused the streamed request because it exceeded "
+                                "the context window.",
+                                category="CONTEXT_OVERFLOW",
+                                retryable=False,
+                            )
                         raise LLMError(
-                            "The model refused the streamed request because it exceeded "
-                            "the context window.",
-                            category="CONTEXT_OVERFLOW",
-                            retryable=False,
+                            f"LLM stream failed with HTTP {response.status_code}: {text[:300]!r}",
+                            category="HTTP_ERROR",
+                            retryable=response.status_code >= 500,
                         )
-                    raise LLMError(
-                        f"LLM stream failed with HTTP {response.status_code}: {text[:300]!r}",
-                        category="HTTP_ERROR",
-                        retryable=response.status_code >= 500,
-                    )
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    for choice in chunk.get("choices", []):
-                        delta = choice.get("delta") or {}
-                        token = delta.get("content")
-                        if token:
-                            yield token
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(chunk, dict):
+                            yield chunk
+        except httpx.HTTPError as exc:
+            # A transport failure is an LLM failure the caller can classify, not a
+            # raw httpx exception that would surface as an unexplained 500.
+            raise LLMError(
+                f"LLM stream connection failed: {type(exc).__name__}: {exc}",
+                category="CONNECTION_ERROR",
+                retryable=True,
+            ) from exc
+
+    async def stream(
+        self,
+        messages: List[Message],
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        json_mode: bool = False,
+        stop: Optional[List[str]] = None,
+    ) -> AsyncIterator[str]:
+        """Stream tokens from the single fixed model for chat UIs."""
+        async for chunk in self._iter_stream(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            stop=stop,
+        ):
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                token = delta.get("content")
+                if token:
+                    yield token
+
+    async def stream_complete(
+        self,
+        messages: List[Message],
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        json_mode: bool = False,
+        stop: Optional[List[str]] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> LLMResponse:
+        """Stream a completion, report each token to `on_token`, and return the whole.
+
+        The return value is the same `LLMResponse` `complete` produces, so a caller can
+        show text as it arrives and still parse the finished body (for example the JSON
+        contract the chat loop depends on) exactly as before. `on_token` must be cheap and
+        synchronous; an exception it raises is logged and never breaks the request.
+        """
+        parts: List[str] = []
+        model: Optional[str] = None
+        usage: Dict[str, Any] = {}
+        finish_reason: Optional[str] = None
+
+        async for chunk in self._iter_stream(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            stop=stop,
+        ):
+            model = chunk.get("model") or model
+            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                usage = chunk["usage"]
+            for choice in chunk.get("choices") or []:
+                delta = choice.get("delta") or {}
+                token = delta.get("content")
+                if token:
+                    parts.append(token)
+                    if on_token is not None:
+                        try:
+                            on_token(token)
+                        except Exception:  # a display hook must never fail the call
+                            logger.exception("llm.stream on_token callback failed")
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+
+        content = "".join(parts)
+        if not content:
+            raise LLMError(
+                "The streamed response contained no content.",
+                category="EMPTY_CONTENT",
+                retryable=False,
+            )
+        if detect_billing_refusal_in_content(content):
+            raise LLMError(
+                "The LLM endpoint refused the request for lack of credit; it is not a "
+                "model answer and not a context problem.",
+                category="BILLING_REFUSAL",
+                retryable=False,
+            )
+        self._record_served_model(model)
+        return LLMResponse(
+            content=content,
+            model=model or None,
+            requested_model=self._model_id,
+            usage=usage,
+            finish_reason=finish_reason,
+            raw={"streamed": True, "model": model, "usage": usage},
+        )
 
     # ------------------------------------------------------------------
     # Connectivity

@@ -265,6 +265,29 @@ export interface AgentChatResponse {
   note?: string
 }
 
+/**
+ * One event of a streamed agent turn (`POST /agent/chat/stream`).
+ *
+ * `reply_delta` text is a live preview of the answer as it is written; the `done` event
+ * carries the authoritative result, identical to the blocking `/agent/chat` response, and
+ * is what the UI keeps. A tool is only ever reported as done by a `tool_result` (or the
+ * final `done`), never inferred from the preview text.
+ */
+export type AgentStreamEvent =
+  | { type: 'round_start'; round: number }
+  | { type: 'reply_delta'; round: number; text: string }
+  | { type: 'tool_start'; round: number; tool: string; arguments?: Record<string, unknown> }
+  | {
+      type: 'tool_result'
+      round: number
+      tool: string
+      status: string
+      duration_ms?: number
+      error?: string | null
+    }
+  | ({ type: 'done' } & AgentChatResponse)
+  | { type: 'error'; error: string; category?: string; retryable?: boolean }
+
 export interface ToolDescriptor {
   name: string
   version: string

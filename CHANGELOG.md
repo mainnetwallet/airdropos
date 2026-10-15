@@ -5,6 +5,27 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added (live streaming for the Agent Chat turn)
+- **`POST /agent/chat/stream`** runs the same `ChatToolLoop` turn as `/agent/chat` and delivers it
+  as Server-Sent Events: `round_start`, `reply_delta` (the answer as it is written),
+  `tool_start`, `tool_result`, then one `done` (identical to the blocking response) or `error`.
+  Authentication, the `agent_chat` scope, rate limiting, tool authorization, approvals and every
+  bound are unchanged. `/agent/chat` stays as the fallback and the frontend uses it automatically
+  against a backend that has no streaming endpoint.
+- **`FixedLLMClient.stream_complete()`** streams a completion and still returns a normal
+  `LLMResponse` (model, usage, finish reason). `stream()` now accepts `json_mode`/`stop`, shares
+  its request and error handling with it (`_iter_stream`), and reports transport failures as
+  `LLMError` instead of a raw `httpx` exception.
+- **`llm/json_stream.JsonStringFieldStreamer`** extracts the `reply` field from the JSON body while
+  it is still arriving, so the JSON contract the loop depends on is kept and the operator still
+  reads the answer token by token with no extra model call.
+- **Safe stop on disconnect.** A turn whose browser went away stops before the next model or tool
+  call (never inside a tool) and creates no task. A stream that fails before anything was shown is
+  retried once as a normal call.
+- The Agent Chat page shows the answer as it is written and each tool as it runs. Clearing the
+  chat or logging out aborts the stream in flight.
+- Reverse proxies must not buffer the stream; the endpoint sends `X-Accel-Buffering: no`.
+
 ### Changed (LLM-driven compaction, planned-from context, no chat history character cap)
 - **Context compaction is now LLM-driven.** `app/llm/compaction.py` asks the configured
   fixed `LLM_MODEL_ID` for a strict-JSON, section-labelled summary of the reduceable

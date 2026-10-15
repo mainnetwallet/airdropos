@@ -8,6 +8,7 @@
 import type {
   AgentChatResponse,
   AgentInfo,
+  AgentStreamEvent,
   AutonomyPolicy,
   DiagnosticsResponse,
   EmergencyStopStatus,
@@ -37,6 +38,7 @@ import type {
   LiveOverview,
   LiveSession,
 } from '@/types/live'
+import { takeSseFrames } from '@/services/sse'
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api/v1'
 
@@ -150,6 +152,25 @@ function errorMessage(body: unknown, status: number): string {
   return `Request failed with ${status}`
 }
 
+/** Turn a failed response into an `ApiError`, ending the session on a 401. */
+async function throwApiError(path: string, response: Response): Promise<never> {
+  // Read the body exactly once; json() followed by text() throws
+  // "body stream already read" and hides the real server error.
+  const raw = await response.text()
+  let detail: unknown
+  try {
+    detail = raw ? JSON.parse(raw) : raw
+  } catch {
+    detail = raw
+  }
+  // A 401 on any call except the login form itself means the session is gone.
+  if (response.status === 401 && path !== '/auth/login') {
+    clearSession()
+    window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+  }
+  throw new ApiError(errorMessage(detail, response.status), response.status, detail)
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken()
   const response = await fetch(`${API_BASE}${path}`, {
@@ -161,26 +182,91 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   })
 
-  if (!response.ok) {
-    // Read the body exactly once; json() followed by text() throws
-    // "body stream already read" and hides the real server error.
-    const raw = await response.text()
-    let detail: unknown
-    try {
-      detail = raw ? JSON.parse(raw) : raw
-    } catch {
-      detail = raw
-    }
-    // A 401 on any call except the login form itself means the session is gone.
-    if (response.status === 401 && path !== '/auth/login') {
-      clearSession()
-      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
-    }
-    throw new ApiError(errorMessage(detail, response.status), response.status, detail)
-  }
+  if (!response.ok) await throwApiError(path, response)
 
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
+}
+
+/**
+ * Run one agent turn over Server-Sent Events.
+ *
+ * `onEvent` receives the live progress (reply text as it is written, each tool as it
+ * starts and ends). The returned promise resolves with the final result, which is the
+ * same object `/agent/chat` returns, so callers keep treating that as the answer and the
+ * live text as a preview. An older backend without the streaming endpoint (404/405) is
+ * served by the blocking call, so the console still works during a staggered upgrade.
+ */
+async function agentChatStream(
+  message: string,
+  history: Array<{ role: 'user' | 'assistant'; content: string }>,
+  onEvent: (event: AgentStreamEvent) => void,
+  signal?: AbortSignal,
+): Promise<AgentChatResponse> {
+  const path = '/agent/chat/stream'
+  const token = getToken()
+  const response = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    signal,
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'text/event-stream',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ message, history }),
+  })
+
+  if (response.status === 404 || response.status === 405) {
+    return request<AgentChatResponse>('/agent/chat', {
+      method: 'POST',
+      body: JSON.stringify({ message, history }),
+      signal,
+    })
+  }
+  if (!response.ok) await throwApiError(path, response)
+  if (!response.body) throw new Error('The browser did not expose a readable response stream.')
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let final: AgentChatResponse | null = null
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const { frames, rest } = takeSseFrames(buffer)
+      buffer = rest
+
+      for (const frame of frames) {
+        let event: AgentStreamEvent
+        try {
+          event = JSON.parse(frame.data) as AgentStreamEvent
+        } catch {
+          continue // a corrupt frame is skipped; the final `done` is what matters
+        }
+        if (event.type === 'error') {
+          throw new ApiError(event.error, 503, event)
+        }
+        if (event.type === 'done') {
+          const { type: _type, ...result } = event
+          final = result as AgentChatResponse
+        }
+        onEvent(event)
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
+
+  if (!final) {
+    throw new Error(
+      'The connection closed before the agent finished. If it had already started work, ' +
+        'check Task Manager before sending the request again.',
+    )
+  }
+  return final
 }
 
 export const api = {
@@ -275,6 +361,8 @@ export const api = {
       '/agent/chat',
       { method: 'POST', body: JSON.stringify({ message, history }) },
     ),
+  /** Same turn as `agentChat`, with live progress. See `agentChatStream`. */
+  agentChatStream,
 
   // --- Tasks ------------------------------------------------------------
   listTasks: (params?: { status?: string; limit?: number; offset?: number }) => {
