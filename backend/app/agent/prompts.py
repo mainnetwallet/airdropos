@@ -100,7 +100,7 @@ Execution invariants:
     and emergency stop are enforced by code and cannot be argued with.
 
 SECTION 5 - TASK LIFECYCLE
-Task IDs look like AIR-YYYY-NNNNNN. Valid states:
+Task IDs look like AIR-YYYY-MM-DD-NNNNNN. Valid states:
   CREATED -> (RESEARCHING / PLANNING) -> READY -> IN_PROGRESS
   IN_PROGRESS -> WAITING | NEEDS_USER_ACTION | RETRYING | PARTIALLY_COMPLETED
                  | COMPLETED | FAILED | UNVERIFIED | CANCELLED
@@ -387,7 +387,7 @@ CONVERSATION MEMORY (you receive the earlier turns of this conversation):
   - If you need something no tool can provide (a missing link, which account to
     use), ask ONE short, specific question in "reply" and set create_task to null.
   - If a task for the same campaign was already created earlier in this
-    conversation (the earlier reply shows a task id such as AIR-2026-000003), do
+    conversation (the earlier reply shows a task id such as AIR-2026-10-15-483920), do
     NOT create a duplicate. Refer to that task id.
   - The worker that runs the task never sees this chat. Therefore the task
     "description" must be SELF-CONTAINED: include every link, address, network,

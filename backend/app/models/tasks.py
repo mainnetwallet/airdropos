@@ -16,7 +16,7 @@ from backend.app.database.session import Base
 class Task(Base):
     __tablename__ = "tasks"
 
-    task_id: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)  # AIR-2026-000001
+    task_id: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)  # AIR-2026-10-15-483920
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(100), index=True, nullable=True)
@@ -136,14 +136,13 @@ class TaskEvidence(Base):
     )
 
 
-class TaskIdCounter(Base):
-    """High-water mark of the AIR-YYYY-NNNNNN sequence, one row per year.
+class IssuedTaskId(Base):
+    """Permanent ledger of every task ID ever handed out.
 
-    Task IDs are minted from this counter, never from ``max(existing task_id)``. The counter
-    only ever goes up, so deleting a task can never cause its ID to be handed out again.
+    Rows are never deleted, not even when the task is. A new ID is checked against this table
+    (and its unique constraint), so an ID that belonged to a deleted task can never be issued again.
     """
 
-    __tablename__ = "task_id_counters"
+    __tablename__ = "issued_task_ids"
 
-    year: Mapped[int] = mapped_column(Integer, unique=True, index=True, nullable=False)
-    last_value: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    task_id: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)

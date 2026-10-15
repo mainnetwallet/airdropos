@@ -1,13 +1,17 @@
-"""A deleted task's AIR-YYYY-NNNNNN ID must never be issued again."""
+"""Task IDs are AIR-YYYY-MM-DD-NNNNNN (today + 6 random digits) and are never reused."""
 
-import pytest
+import re
+from datetime import date
+
 import pytest_asyncio
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from backend.app.database.session import Base
-from backend.app.models import Task
+from backend.app.models import IssuedTaskId, Task
+from backend.app.tasks import id_generator
+from backend.app.tasks.id_generator import format_task_id, validate_task_id
 from backend.app.tasks.manager import TaskManager
 
 
@@ -31,39 +35,54 @@ async def _new(factory) -> str:
         return task.task_id
 
 
-async def _delete_all(factory) -> None:
+async def _delete_all_tasks(factory) -> None:
     async with factory() as db:
         await db.execute(delete(Task))
         await db.commit()
 
 
-async def test_ids_increase_without_deletes(factory):
-    ids = [await _new(factory) for _ in range(3)]
-    assert [i.rsplit("-", 1)[1] for i in ids] == ["000001", "000002", "000003"]
+async def test_format_is_today_plus_six_random_digits(factory):
+    task_id = await _new(factory)
+    assert re.fullmatch(r"AIR-\d{4}-\d{2}-\d{2}-\d{6}", task_id)
+    assert task_id.startswith(f"AIR-{id_generator.today().isoformat()}-")
+    assert validate_task_id(task_id)
 
 
-async def test_deleted_id_is_not_reused(factory):
+async def test_ids_are_random_not_sequential(factory):
+    ids = [await _new(factory) for _ in range(5)]
+    assert len(set(ids)) == 5
+    suffixes = [int(i[-6:]) for i in ids]
+    assert suffixes != sorted(suffixes) or suffixes != list(range(suffixes[0], suffixes[0] + 5))
+
+
+async def test_deleted_id_is_never_issued_again(factory, monkeypatch):
     first = await _new(factory)
-    await _delete_all(factory)
+    await _delete_all_tasks(factory)
+
+    # Force the random source to offer the deleted ID first, then a different one.
+    offers = iter([first[-6:], "123456"])
+    monkeypatch.setattr(id_generator, "random_suffix", lambda: next(offers))
+
     second = await _new(factory)
     assert second != first
-    assert second.endswith("000002")
+    assert second.endswith("123456")
 
 
-async def test_deleting_the_newest_does_not_roll_the_counter_back(factory):
-    await _new(factory)
-    await _new(factory)
-    await _delete_all(factory)
-    assert (await _new(factory)).endswith("000003")
-
-
-async def test_existing_database_without_a_counter_continues_after_highest(factory):
-    # A database from before the counter: tasks exist, the counter row does not.
-    await _new(factory)
-    await _new(factory)
-    from sqlalchemy import text
-
+async def test_every_issued_id_stays_in_the_ledger_after_delete(factory):
+    first = await _new(factory)
+    await _delete_all_tasks(factory)
     async with factory() as db:
-        await db.execute(text("DELETE FROM task_id_counters"))
-        await db.commit()
-    assert (await _new(factory)).endswith("000003")
+        ledger = (await db.scalars(select(IssuedTaskId.task_id))).all()
+    assert first in ledger
+
+
+def test_validate_accepts_dated_and_legacy_ids_only():
+    assert validate_task_id("AIR-2026-10-15-483920")
+    assert validate_task_id("AIR-2026-000001")  # legacy, still readable
+    assert not validate_task_id("AIR-2026-13-40-483920")  # not a real date
+    assert not validate_task_id("AIR-2026-10-15-48392")  # 5 digits
+    assert not validate_task_id("")
+
+
+def test_format_uses_the_given_day():
+    assert format_task_id(date(2026, 8, 15), "000042") == "AIR-2026-08-15-000042"

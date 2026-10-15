@@ -41,7 +41,7 @@ Look for `Telegram bot polling started`. With no token or no authorized IDs, the
 | `/help` | Command list |
 | `/status` | Platform and agent status |
 | `/tasks` | List active tasks |
-| `/task AIR-2026-000001` | Full authoritative task report |
+| `/task AIR-2026-10-15-483920` | Full authoritative task report |
 | `/create <title>` | Create a task |
 | `/goals` | List long-term goals |
 | `/wallet` | Wallet summary |

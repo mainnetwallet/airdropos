@@ -355,7 +355,7 @@ export default function TaskManagerPage() {
         subtitle={
           <>
             <span className="lg:hidden">Manage and monitor all tasks</span>
-            <span className="hidden lg:inline">Persistent tasks with AIR-YYYY-NNNNNN identifiers</span>
+            <span className="hidden lg:inline">Persistent tasks with AIR-YYYY-MM-DD-NNNNNN identifiers</span>
           </>
         }
         action={

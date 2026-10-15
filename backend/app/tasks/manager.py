@@ -22,7 +22,7 @@ from backend.app.models import (
     TaskEvidence,
     TaskExecution,
 )
-from backend.app.tasks.id_generator import format_task_id, parse_task_id, reserve_sequence
+from backend.app.tasks.id_generator import reserve_task_id
 from backend.app.tasks.state_machine import (
     VALID_TRANSITIONS,
     TaskStatus,
@@ -76,30 +76,16 @@ class TaskManager:
         max_retries: int = 3,
         owner_email: Optional[str] = None,
     ) -> Task:
-        """Allocate a collision-free AIR-YYYY-NNNNNN ID and persist a new task."""
+        """Allocate a unique AIR-YYYY-MM-DD-NNNNNN ID and persist a new task."""
         if priority < 1 or priority > 10:
             raise ValueError("priority must be between 1 (highest) and 10 (lowest)")
-
-        year = datetime.now(timezone.utc).year
-        # Highest sequence among tasks that still exist; only used to seed the persistent counter
-        # for databases that predate it. The counter, not this value, decides the next ID.
-        existing = await self.db.execute(
-            select(Task.task_id).where(Task.task_id.like(f"AIR-{year}-%"))
-        )
-        highest = 0
-        for (tid,) in existing.all():
-            try:
-                _, seq = parse_task_id(tid)
-                highest = max(highest, seq)
-            except ValueError:
-                continue
 
         async def is_taken(candidate: str) -> bool:
             found = await self.db.scalar(select(Task.id).where(Task.task_id == candidate))
             return found is not None
 
-        sequence = await reserve_sequence(self.db, year, floor=highest, is_taken=is_taken)
-        task_id = format_task_id(sequence, year)
+        # Random AIR-YYYY-MM-DD-NNNNNN, recorded permanently so a deleted task's ID is never reused.
+        task_id = await reserve_task_id(self.db, is_taken=is_taken)
 
         task = Task(
             task_id=task_id,

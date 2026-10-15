@@ -101,7 +101,7 @@ class DiscordBot:
             "help": "Available commands:\n"
                     "/status - platform and agent status\n"
                     "/tasks - list active tasks\n"
-                    "/task <AIR-YYYY-NNNNNN> - full task status report\n"
+                    "/task <AIR-YYYY-MM-DD-NNNNNN> - full task status report\n"
                     "/create <title> - create a task\n"
                     "/goals - list long-term goals\n"
                     "/wallet - wallet summary\n"

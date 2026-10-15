@@ -16,7 +16,7 @@ not spawn redundant tasks for the same objective.
 
 ## Tasks
 
-Tasks are the executable unit. Every task gets a persistent `AIR-YYYY-NNNNNN` ID and stores:
+Tasks are the executable unit. Every task gets a persistent `AIR-YYYY-MM-DD-NNNNNN` ID and stores:
 
 - Goal, project, and parent task references
 - Category, network, priority, status

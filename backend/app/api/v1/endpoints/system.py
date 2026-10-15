@@ -276,7 +276,7 @@ async def agent_chat(
     produced, and any approvals that are still outstanding.
 
     A `create_task` in the model's reply still produces a real, persisted task for the
-    background worker, and the real AIR-YYYY-NNNNNN id is returned.
+    background worker, and the real AIR-YYYY-MM-DD-NNNNNN id is returned.
     """
     from backend.app.agent.chat_loop import ChatToolLoop
 

@@ -138,7 +138,7 @@ class CreateTaskTool(BaseTool):
     version = "1.0.0"
     description = (
         "Create a persistent task the background worker will execute, and return its "
-        "real AIR-YYYY-NNNNNN id. Use this for any request that takes more than one reply."
+        "real AIR-YYYY-MM-DD-NNNNNN id. Use this for any request that takes more than one reply."
     )
     required_permissions = ["task.write"]
     side_effect = SideEffect.STATE_MUTATION

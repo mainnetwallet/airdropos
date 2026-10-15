@@ -25,7 +25,7 @@ Type any of these into the Agent Console:
 | `Why did this fail?` | Runs the real diagnostics sweep and reports measured status for the database, model, browser, Telegram, tools, emergency stop and every RPC endpoint. |
 | `Check all configured RPC networks.` | Probes each chain and reports `HEALTHY`, `NOT_CONFIGURED`, or the exact failure category. Endpoint URLs are never printed (they carry your provider key). |
 | `Find good airdrops.` | Runs the discovery cycle and reports what it found **and which sources it could not read**. |
-| `Start this airdrop.` | Creates a real task (`AIR-YYYY-NNNNNN`) and queues it for the worker. |
+| `Start this airdrop.` | Creates a real task (`AIR-YYYY-MM-DD-NNNNNN`) and queues it for the worker. |
 | `Show my recent transactions.` | Reads the transaction records. |
 | `Transfer 0.01 ETH to 0x…` | **Prepares** a transfer and shows you the exact terms. Signs nothing. See below. |
 

@@ -521,7 +521,7 @@ export default function AgentChat() {
                 <p className="font-medium text-slate-300">Ask the agent to do something</p>
                 <p className="max-w-md text-sm text-slate-500">
                   e.g. “Discover legitimate airdrops and research eligibility for my configured
-                  wallets”, “Show me the status of AIR-2026-000001”, or “Report today's activity”.
+                  wallets”, “Show me the status of AIR-2026-10-15-483920”, or “Report today's activity”.
                 </p>
               </div>
             </>

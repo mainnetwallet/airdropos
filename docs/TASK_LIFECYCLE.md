@@ -2,7 +2,7 @@
 
 ## Task IDs
 
-Format: `AIR-YYYY-NNNNNN` (e.g. `AIR-2026-000001`).
+Format: `AIR-YYYY-MM-DD-NNNNNN` (e.g. `AIR-2026-10-15-483920`).
 
 `id_generator.next_sequence()` allocates IDs under an asyncio lock and accepts an `is_taken`
 callback so it skips collisions. A unique index on `tasks.task_id` is the final backstop.

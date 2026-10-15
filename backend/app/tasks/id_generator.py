@@ -1,154 +1,93 @@
 """Persistent Task ID Generator.
 
-Format: AIR-YYYY-NNNNNN  e.g. AIR-2026-000001
+Format: AIR-YYYY-MM-DD-NNNNNN  e.g. AIR-2026-10-15-483920
+(today's date, then 6 random digits).
 
-IDs come from a persistent, ever-increasing counter (task_id_counters), so a deleted
-task's ID is never issued again. Collision safety is additionally enforced by the unique
-index on tasks.task_id plus a retry loop.
+Every ID that is issued is recorded in ``issued_task_ids`` and that record is never removed, so
+an ID that belonged to a deleted task is never handed out again. The unique constraint on that
+table is what makes this safe when several workers create tasks at the same time.
+
+Older IDs of the form AIR-YYYY-NNNNNN stay valid; they are only read, never generated.
 """
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
-from datetime import datetime, timezone
+import re
+import secrets
+from datetime import date, datetime
 from typing import Any, Callable, Optional
 
-from sqlalchemy import case, insert, select, update
+from sqlalchemy import insert
 from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
 ID_PREFIX = "AIR"
-_id_lock = asyncio.Lock()
+_DATED_ID = re.compile(r"^AIR-(\d{4})-(\d{2})-(\d{2})-(\d{6})$")
+_LEGACY_ID = re.compile(r"^AIR-(\d{4})-(\d{6})$")
 
 
-def current_year() -> int:
-    return datetime.now(timezone.utc).year
+def today() -> date:
+    """The operator's local calendar date (the machine's timezone)."""
+    return datetime.now().astimezone().date()
 
 
-def format_task_id(sequence: int, year: Optional[int] = None) -> str:
-    """Render a sequence number as a persistent task ID."""
-    year = year or current_year()
-    if sequence < 1:
-        raise ValueError("Task sequence numbers start at 1")
-    return f"{ID_PREFIX}-{year}-{sequence:06d}"
+def random_suffix() -> str:
+    """Six random digits from the OS CSPRNG (100000-999999, so always six digits)."""
+    return f"{secrets.randbelow(900_000) + 100_000:06d}"
 
 
-def parse_task_id(task_id: str) -> tuple[int, int]:
-    """Parse AIR-YYYY-NNNNNN into (year, sequence). Raises on malformed input."""
-    if not task_id:
-        raise ValueError("Task ID cannot be empty")
-    parts = task_id.split("-")
-    if len(parts) != 3 or parts[0] != ID_PREFIX:
-        raise ValueError(f"Malformed task ID '{task_id}': expected format AIR-YYYY-NNNNNN")
-    try:
-        year = int(parts[1])
-        sequence = int(parts[2])
-    except ValueError as exc:
-        raise ValueError(f"Malformed task ID '{task_id}': non-numeric year or sequence") from exc
-    if not 2000 <= year <= 2999:
-        raise ValueError(f"Malformed task ID '{task_id}': implausible year {year}")
-    if not 1 <= sequence <= 999_999:
-        raise ValueError(f"Malformed task ID '{task_id}': sequence out of range")
-    return year, sequence
+def format_task_id(day: Optional[date] = None, suffix: Optional[str] = None) -> str:
+    """Render AIR-YYYY-MM-DD-NNNNNN for ``day`` (default: today)."""
+    day = day or today()
+    return f"{ID_PREFIX}-{day.year:04d}-{day.month:02d}-{day.day:02d}-{suffix or random_suffix()}"
 
 
 def validate_task_id(task_id: str) -> bool:
-    try:
-        parse_task_id(task_id)
-        return True
-    except ValueError:
+    """True for a current (dated) or legacy (AIR-YYYY-NNNNNN) task ID."""
+    if not task_id:
         return False
-
-
-async def next_sequence(
-    max_sequence: int = 0,
-    year: Optional[int] = None,
-    is_taken: Optional[Callable[[str], Any]] = None,
-    max_attempts: int = 25,
-) -> int:
-    """Atomically advance the sequence, skipping any IDs already in use.
-
-    `is_taken` is a callable returning True when a candidate ID already exists in
-    the database. It may be sync or async; async is preferred because it closes
-    the race where two processes compute the same next ID before either commits.
-    """
-    year = year or current_year()
-    async with _id_lock:
-        candidate = max_sequence + 1
-        attempts = 0
-        while attempts < max_attempts:
-            attempts += 1
-            if candidate > 999_999:
-                raise RuntimeError(
-                    f"Task ID space for {year} is exhausted; archive old records or roll to a new year."
-                )
-            if is_taken is None or not await _maybe_await(is_taken(format_task_id(candidate, year))):
-                return candidate
-            logger.warning("Task ID %s already exists; advancing sequence", format_task_id(candidate, year))
-            candidate += 1
-        raise RuntimeError("Could not allocate a collision-free task ID after repeated attempts.")
+    dated = _DATED_ID.match(task_id)
+    if dated:
+        try:
+            date(int(dated.group(1)), int(dated.group(2)), int(dated.group(3)))
+        except ValueError:
+            return False
+        return True
+    return _LEGACY_ID.match(task_id) is not None
 
 
 async def _maybe_await(value: Any) -> Any:
-    """Await `value` when it is awaitable, otherwise return it unchanged.
-
-    Lets `next_sequence` accept both sync predicates (tests, in-memory state) and
-    async ones (real database lookups) without forcing callers to wrap sync code.
-    """
     if inspect.isawaitable(value):
         return await value
     return value
 
 
-
-async def reserve_sequence(
+async def reserve_task_id(
     db: Any,
-    year: int,
-    floor: int = 0,
+    day: Optional[date] = None,
     is_taken: Optional[Callable[[str], Any]] = None,
-    max_attempts: int = 25,
-) -> int:
-    """Reserve the next sequence number for ``year`` from the persistent counter.
+    max_attempts: int = 50,
+) -> str:
+    """Mint a fresh random ID and record it in the permanent ledger.
 
-    The counter is advanced inside the caller's transaction with a single atomic UPDATE, which
-    row-locks it, so concurrent creators are serialised and each gets a distinct number. It
-    never moves backwards: deleting tasks does not free their numbers. ``floor`` seeds/raises
-    the counter to the highest ID already in the tasks table (for databases that predate it).
+    The ledger row is written with the caller's session. Depending on the database, an ID drawn for a task
+    that is never saved may stay burned, which is harmless (it is skipped, never reused). A collision (with a live task or any ID issued before) just draws a
+    new random number.
     """
-    from backend.app.models.tasks import TaskIdCounter
-
-    exists = await db.scalar(select(TaskIdCounter.id).where(TaskIdCounter.year == year))
-    if exists is None:
-        try:
-            async with db.begin_nested():
-                await db.execute(insert(TaskIdCounter).values(year=year, last_value=0))
-        except IntegrityError:
-            pass  # another creator seeded it first
+    from backend.app.models.tasks import IssuedTaskId
 
     for _ in range(max_attempts):
-        stmt = (
-            update(TaskIdCounter)
-            .where(TaskIdCounter.year == year)
-            .values(
-                last_value=case(
-                    (TaskIdCounter.last_value < floor, floor),
-                    else_=TaskIdCounter.last_value,
-                )
-                + 1
-            )
-            .returning(TaskIdCounter.last_value)
-            .execution_options(synchronize_session=False)
-        )
-        candidate = (await db.execute(stmt)).scalar_one()
-        if candidate > 999_999:
-            raise RuntimeError(
-                f"Task ID space for {year} is exhausted; archive old records or roll to a new year."
-            )
-        if is_taken is None or not await _maybe_await(is_taken(format_task_id(candidate, year))):
-            return candidate
-        logger.warning("Task ID %s already exists; advancing counter", format_task_id(candidate, year))
-        floor = candidate
+        candidate = format_task_id(day)
+        if is_taken is not None and await _maybe_await(is_taken(candidate)):
+            continue
+        try:
+            async with db.begin_nested():
+                await db.execute(insert(IssuedTaskId).values(task_id=candidate))
+        except IntegrityError:
+            logger.warning("Task ID %s was issued before; drawing another", candidate)
+            continue
+        return candidate
     raise RuntimeError("Could not allocate a collision-free task ID after repeated attempts.")

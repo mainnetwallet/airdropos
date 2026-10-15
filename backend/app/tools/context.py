@@ -1,7 +1,7 @@
 """Ambient execution context for tools.
 
 ``ToolRegistry.invoke`` is told which task a call belongs to (the public
-``AIR-YYYY-NNNNNN`` id), but a tool's ``execute`` only receives its validated
+``AIR-YYYY-MM-DD-NNNNNN`` id), but a tool's ``execute`` only receives its validated
 parameters. Rather than widen every tool schema (which the model could then forge),
 the registry publishes the task id here for the duration of the call and tools read it.
 
