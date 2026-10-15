@@ -164,7 +164,9 @@ class FixedLLMClient:
         # None means "no application-imposed output limit": the parameter is then omitted
         # from every request and the provider's own limit applies.
         self._max_tokens: Optional[int] = settings.LLM_MAX_TOKENS
-        self._timeout = settings.LLM_TIMEOUT_SECONDS
+        # No application-imposed request timeout: a slow model is waited for, never cut off.
+        # httpx treats None as "no timeout" for connect, read, write and pool alike.
+        self._timeout: Optional[float] = None
         # Retries AFTER the first attempt, hard-capped at one: a failed call (timeout, connection,
         # 429, 5xx) is tried once more, and if that also fails the error is raised at once. An
         # older .env with LLM_MAX_RETRIES=3 therefore cannot bring back long retry chains.

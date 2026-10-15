@@ -134,7 +134,6 @@ class Settings(BaseSettings):
             "gone on the next call. 0 disables the retry."
         ),
     )
-    LLM_TIMEOUT_SECONDS: int = Field(default=60)
     # Retries after the first attempt. Capped at 1 by the client: one retry on error, then fail.
     LLM_MAX_RETRIES: int = Field(default=1)
 

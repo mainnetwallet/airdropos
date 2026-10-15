@@ -31,3 +31,7 @@ async def test_timeout_is_tried_exactly_twice(monkeypatch):
         await llm.complete([client_mod.Message("user", "hi")])
     assert err.value.category == "TIMEOUT"
     assert calls["n"] == 2
+
+
+def test_no_request_timeout_is_applied():
+    assert FixedLLMClient()._timeout is None
