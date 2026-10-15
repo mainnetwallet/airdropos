@@ -14,6 +14,7 @@ Non-negotiable invariants enforced here:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ from backend.app.agent.discovery import (
     extract_requirements_from_prose,
 )
 from backend.app.core.config import settings
+from backend.app.core.runlog import clip, param_keys
 from backend.app.llm.client import LLMError, Message, llm
 from backend.app.models import AirdropCampaign, Task
 from backend.app.models.context import (
@@ -272,8 +274,13 @@ class AgentController:
         started = time.perf_counter()
         budget = max_iterations or settings.MAX_EXECUTION_LOOP_ITERATIONS
         report = LoopReport(task_id=task.task_id, outcome=LoopOutcome.FAILED)
+        logger.info(
+            "RUN start task=%s status=%s retry=%s/%s iteration_budget=%s",
+            task.task_id, task.status, task.retry_count, task.max_retries, budget,
+        )
 
         if emergency_stop.is_stopped and not emergency_stop.can_execute_tasks():
+            logger.warning("RUN refused task=%s reason=emergency_stop_active", task.task_id)
             report.outcome = LoopOutcome.STOPPED
             report.blockers.append("Emergency stop is active; execution not started.")
             await self._park_for_emergency_stop(task)
@@ -297,6 +304,10 @@ class AgentController:
             await self.db.commit()
             known_revision = await self._plan_revision(task)
             iteration = await self._resume_iteration(task)
+            logger.info(
+                "RUN plan task=%s revision=%s steps=%s resume_from_iteration=%s",
+                task.task_id, known_revision, len(plan_spec.steps), iteration,
+            )
             if iteration:
                 report.steps.append(
                     StepResult(iteration, "resumed from checkpoint", None, None, True,
@@ -332,17 +343,32 @@ class AgentController:
                     report.blockers.append("Execution cancelled.")
                     raise
                 except LLMError as exc:
-                    logger.error("Fixed LLM failed during task %s: %s", task.task_id, exc)
+                    logger.error(
+                        "RUN llm_error task=%s iteration=%s category=%s error=%s",
+                        task.task_id, iteration, getattr(exc, "category", "?"), clip(exc),
+                        exc_info=True,
+                    )
                     report.failures.append(f"LLM error ({exc.category}): {exc}")
                     report.outcome = LoopOutcome.FAILED
                     await self._checkpoint(task, iteration, "llm_error")
                     break
                 except PlanningError as exc:
-                    logger.error("Planning failed for task %s: %s", task.task_id, exc)
+                    logger.error(
+                        "RUN planning_error task=%s iteration=%s error=%s",
+                        task.task_id, iteration, clip(exc), exc_info=True,
+                    )
                     report.failures.append(f"Planning error: {exc}")
                     report.outcome = LoopOutcome.FAILED
                     await self._checkpoint(task, iteration, "planning_error")
                     break
+                except Exception as exc:
+                    # Not an LLM or planning error: a bug or an infrastructure fault. Say
+                    # exactly where it happened, then let the worker settle the task.
+                    logger.exception(
+                        "RUN crashed task=%s iteration=%s type=%s error=%s",
+                        task.task_id, iteration, type(exc).__name__, clip(exc),
+                    )
+                    raise
 
                 # A replan persists a NEW revision. Keep iterating over the persisted truth, not
                 # the superseded in-memory plan, or removed/changed steps would still be executed.
@@ -354,6 +380,11 @@ class AgentController:
                     known_revision = revision
 
                 step.duration_ms = int((time.perf_counter() - iteration_started) * 1000)
+                logger.info(
+                    "RUN iteration task=%s iter=%s tool=%s verified=%s terminal=%s ms=%s note=%s",
+                    task.task_id, iteration, step.tool_name, step.verified, is_terminal,
+                    step.duration_ms, clip(step.notes, 200),
+                )
                 report.steps.append(step)
                 await self.tasks.save_execution(
                     task,
@@ -382,6 +413,15 @@ class AgentController:
 
             report.duration_ms = int((time.perf_counter() - started) * 1000)
             await self._apply_final_status(task, report)
+            log_end = logger.info if report.outcome in (
+                LoopOutcome.COMPLETED, LoopOutcome.PARTIALLY_COMPLETED
+            ) else logger.warning
+            log_end(
+                "RUN end task=%s outcome=%s status=%s ms=%s failures=%s blockers=%s first_failure=%s",
+                task.task_id, report.outcome.value, task.status, report.duration_ms,
+                len(report.failures), len(report.blockers),
+                clip(report.failures[0] if report.failures else (report.blockers[0] if report.blockers else ""), 300),
+            )
             return report
         finally:
             await self.leases.release(task, lease.lease_token)
@@ -504,6 +544,11 @@ class AgentController:
         blocker. If any of that fails the task is deliberately left running-failed rather than
         parked with nobody able to unblock it.
         """
+        logger.warning(
+            "PARK task=%s iter=%s category=%s step=%s reason=%s",
+            task.task_id, iteration, error_category or force_reason_code,
+            clip(blocking_step, 160), clip(error_text, 400),
+        )
         try:
             result = await park_for_intervention(
                 self.db,
@@ -526,13 +571,17 @@ class AgentController:
             )
             if result is None:
                 logger.error(
-                    "Could not raise an intervention for %s; leaving it in %s",
+                    "PARK failed task=%s: no intervention raised; task left in %s",
                     task.task_id, task.status,
                 )
+            else:
+                logger.info("PARK raised task=%s status=%s", task.task_id, task.status)
             return result
         except Exception as exc:
             # A failure to notify must never be worse than the failure being reported.
-            logger.error("Intervention request failed for %s: %s", task.task_id, exc)
+            logger.error(
+                "PARK failed task=%s error=%s", task.task_id, clip(exc), exc_info=True
+            )
             return None
 
     @staticmethod
@@ -862,6 +911,10 @@ class AgentController:
         # --- OBSERVE: are this step's prerequisites actually met? --------
         satisfied, unmet = await self.planner.evaluate_prerequisites(task, step)
         if not satisfied:
+            logger.warning(
+                "STEP blocked task=%s iter=%s step=%s reason=prerequisite_unmet detail=%s",
+                task.task_id, iteration, step.index, clip(unmet),
+            )
             step.status = "blocked"
             step.failure_reason = f"Prerequisite not met: {unmet}"
             await self.planner.update_step_status(
@@ -882,6 +935,11 @@ class AgentController:
 
         step.status = "running"
         await self.planner.update_step_status(task, step.index, "running")
+        logger.info(
+            "STEP start task=%s iter=%s step=%s kind=%s tool=%s params=%s desc=%s",
+            task.task_id, iteration, step.index, step.kind.value, step.tool,
+            param_keys(step.parameters), clip(action, 160),
+        )
 
         # --- ACT ---------------------------------------------------------
         if not step.tool:
@@ -889,6 +947,10 @@ class AgentController:
                 # No catalog tool can perform this step. It must NOT be reported as
                 # done: hand it to the operator and PAUSE, so one unsupported action
                 # cannot be mistaken for a completed one.
+                logger.warning(
+                    "STEP no_tool task=%s iter=%s step=%s kind=%s -> asking operator (desc=%s)",
+                    task.task_id, iteration, step.index, step.kind.value, clip(action, 160),
+                )
                 human_gated = step.kind.requires_human
                 reason = (
                     f"No catalog tool can perform this {step.kind.value} step"
@@ -933,6 +995,7 @@ class AgentController:
             )
 
         if self.registry is None:
+            logger.error("STEP fatal task=%s iter=%s reason=no_tool_registry", task.task_id, iteration)
             report.failures.append("No tool registry bound to this controller.")
             return (
                 StepResult(iteration, action, step.tool, None, False, "Tool registry unavailable", 0),
@@ -942,6 +1005,10 @@ class AgentController:
 
         if step.kind is StepKind.TRANSACT and not self._transactions_allowed():
             reason = "Transaction submission is not authorized by the current policy."
+            logger.warning(
+                "STEP skipped task=%s iter=%s step=%s reason=transactions_not_authorized tool=%s",
+                task.task_id, iteration, step.index, step.tool,
+            )
             step.status = "skipped"
             step.failure_reason = reason
             await self.planner.update_step_status(task, step.index, "skipped", failure_reason=reason)
@@ -1023,6 +1090,19 @@ class AgentController:
         tool_result = await self.registry.invoke(
             step.tool, step.parameters, policy=self.policy, task_id=task.task_id
         )
+        if tool_result.status is ToolResultStatus.SUCCESS:
+            logger.info(
+                "STEP tool_ok task=%s iter=%s step=%s tool=%s ms=%s",
+                task.task_id, iteration, step.index, step.tool, tool_result.duration_ms,
+            )
+        else:
+            logger.warning(
+                "STEP tool_failed task=%s iter=%s step=%s tool=%s status=%s category=%s "
+                "retryable=%s ms=%s error=%s",
+                task.task_id, iteration, step.index, step.tool, tool_result.status.value,
+                tool_result.error_category, getattr(tool_result, "retryable", None),
+                tool_result.duration_ms, clip(tool_result.error, 400),
+            )
 
         if tool_result.status is not ToolResultStatus.SUCCESS:
             await self.context.record_observation(
@@ -1061,6 +1141,10 @@ class AgentController:
 
         # --- VERIFY: an intent to verify is not verification --------------
         verified, evidence = await self._verify_step(task, step, tool_result)
+        logger.info(
+            "STEP verified task=%s iter=%s step=%s tool=%s verified=%s evidence=%s",
+            task.task_id, iteration, step.index, step.tool, verified, evidence,
+        )
 
         # --- RECORD: what did this action actually teach us? ---------------
         # Before choosing the next action, the result is written into the task's context:
@@ -1392,6 +1476,12 @@ class AgentController:
         """Apply the deterministic recovery decision for a failed step."""
         action = step.description
         report.failures.append(f"{step.tool}: {tool_result.error}")
+        logger.warning(
+            "RECOVER task=%s iter=%s step=%s tool=%s diagnosis=%s requires_human=%s strategy=%s",
+            task.task_id, iteration, step.index, step.tool,
+            getattr(diagnosis.category, "value", diagnosis.category), diagnosis.requires_human,
+            clip(diagnosis.recovery_strategy, 200),
+        )
 
         await self.tasks.record_action(
             task,
@@ -1460,6 +1550,11 @@ class AgentController:
         )
         within_budget = task.retry_count < min(task.max_retries, settings.MAX_TASK_RETRIES)
 
+        logger.warning(
+            "RECOVER decision task=%s step=%s retry=%s within_budget=%s attempt=%s/%s reason=%s",
+            task.task_id, step.index, should_retry, within_budget, task.retry_count,
+            min(task.max_retries, settings.MAX_TASK_RETRIES), clip(retry_reason, 200),
+        )
         if should_retry and within_budget:
             task.next_execution_at = next_retry_at(diagnosis.backoff_seconds or 5)
             await self.tasks.transition(
@@ -1608,8 +1703,17 @@ class AgentController:
     ) -> tuple[StepResult, bool, LoopOutcome]:
         """All plan steps are processed. The agent (LLM) decides whether the objective is done."""
         verdict = await self._agent_completion_verdict(task, plan)
+        if verdict is None:
+            logger.warning(
+                "FINALIZE task=%s completion judgment unavailable; falling back to step statuses",
+                task.task_id,
+            )
         if verdict is not None:
             complete, why, missing = verdict
+            logger.info(
+                "FINALIZE task=%s complete=%s missing=%s why=%s",
+                task.task_id, complete, len(missing), clip(why, 300),
+            )
             # Steps whose tool really ran count, whether or not the old evidence matcher
             # accepted them: the agent's judgment is the proof now. At least 1, because
             # COMPLETED refuses a zero evidence count.
@@ -2046,7 +2150,7 @@ class AgentController:
                 status=task.status,
             )
         except Exception as exc:  # never let reporting mask the run's own result
-            logger.debug("Could not report run outcome to the inbox for %s: %s", task.task_id, exc)
+            logger.warning("Could not report run outcome to the inbox for %s: %s", task.task_id, clip(exc))
 
 
 def json_dumps(obj: Any) -> str:

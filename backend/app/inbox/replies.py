@@ -233,6 +233,10 @@ class ReplyRouter:
         client_token: Optional[str] = None,
     ) -> ReplyOutcome:
         body = (text or "").strip()
+        # Length only, never the text: an operator reply can contain a secret.
+        logger.info(
+            "REPLY received task=%s status=%s chars=%s", task.task_id, task.status, len(body)
+        )
 
         # --- 4. Idempotency: a duplicate submit returns the original result. -----
         # Checked before anything expensive: a repeated token never reaches the LLM.
@@ -459,13 +463,17 @@ class ReplyRouter:
             )
             interpretation = await ReplyInterpreter().interpret(context, body)
         except InterpretationError as exc:
-            logger.warning("Reply on %s was not interpreted: %s", task.task_id, exc.category)
+            logger.warning(
+                "REPLY not_interpreted task=%s category=%s", task.task_id, exc.category
+            )
             return None, exc.category
         except Exception as exc:  # defensive: interpretation must never take the reply down
-            logger.exception("Unexpected failure interpreting a reply on %s", task.task_id)
+            logger.exception(
+                "REPLY interpret_crashed task=%s type=%s", task.task_id, type(exc).__name__
+            )
             return None, type(exc).__name__
         logger.info(
-            "Reply on %s interpreted as %s", task.task_id, interpretation.decision
+            "REPLY interpreted task=%s decision=%s", task.task_id, interpretation.decision
         )
         return interpretation, None
 
@@ -904,6 +912,7 @@ class ReplyRouter:
         """Requeue the SAME task from its last safe state. Never from scratch."""
         eligible, why = await self._resumable(task)
         if not eligible:
+            logger.warning("REPLY resume_refused task=%s reason=%s", task.task_id, why)
             # The request stays OPEN. Closing it here (as this branch used to) left the task
             # parked with nothing to reply to, so once the cause was cleared -- an engaged
             # Emergency Stop being lifted, say -- the operator had no way to resume it.
@@ -938,6 +947,9 @@ class ReplyRouter:
                 interpretation=interpretation,
             )
 
+        logger.info(
+            "REPLY resume task=%s queued=%s status_now=%s", task.task_id, bool(moved), task.status
+        )
         if not moved:
             return await self._reply_agent(
                 conversation, task, base,

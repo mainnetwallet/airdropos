@@ -309,6 +309,7 @@ class ToolRegistry:
 
         tool = self._tools.get(name)
         if tool is None:
+            logger.warning("TOOL unknown name=%s task=%s", name, task_id)
             return ToolResult.failure(
                 f"No tool named '{name}' is registered.",
                 category="UNSUPPORTED_OPERATION",
@@ -316,6 +317,9 @@ class ToolRegistry:
             )
 
         if name in self._disabled:
+            logger.warning(
+                "TOOL disabled name=%s task=%s reason=%s", name, task_id, self._disabled[name]
+            )
             return ToolResult(
                 status=ToolResultStatus.UNAVAILABLE,
                 error=f"Tool '{name}' is unavailable: {self._disabled[name]}",
@@ -340,6 +344,10 @@ class ToolRegistry:
         try:
             validated = tool.validate_params(params or {})
         except ToolValidationError as exc:
+            logger.warning(
+                "TOOL invalid_input name=%s task=%s params=%s error=%s",
+                name, task_id, sorted((params or {}).keys()), str(exc)[:300],
+            )
             return ToolResult.failure(str(exc), category="INVALID_INPUT", retryable=False)
 
         # Network / wallet allowlists apply to the arguments, not just the tool.
@@ -381,6 +389,7 @@ class ToolRegistry:
                         "Emergency stop is active; web interaction and state changes are blocked.",
                     )
         except Exception as exc:  # EmergencyStopError and any guard failure
+            logger.warning("TOOL blocked name=%s task=%s reason=%s", name, task_id, str(exc)[:300])
             return ToolResult(
                 status=ToolResultStatus.NOT_AUTHORIZED,
                 error=str(exc),
@@ -396,13 +405,18 @@ class ToolRegistry:
             with task_context(task_id):
                 result = await asyncio.wait_for(tool.execute(validated), timeout=tool.timeout_seconds)
         except asyncio.TimeoutError:
+            logger.warning(
+                "TOOL timeout name=%s task=%s limit_s=%s", name, task_id, tool.timeout_seconds
+            )
             result = ToolResult.failure(
                 f"Tool '{name}' exceeded its {tool.timeout_seconds}s timeout.",
                 category="TIMEOUT",
                 retryable=True,
             )
         except Exception as exc:  # Tools should not raise; if they do, contain it.
-            logger.exception("Unhandled exception in tool '%s'", name)
+            logger.exception(
+                "TOOL crashed name=%s task=%s type=%s", name, task_id, type(exc).__name__
+            )
             result = ToolResult.failure(
                 f"{type(exc).__name__}: {exc}",
                 category="TOOL_FAILURE",
@@ -424,8 +438,11 @@ class ToolRegistry:
         else:
             metrics["failure"] += 1
 
-        logger.debug(
-            "Tool '%s' -> %s in %sms (task=%s)", name, result.status.value, duration_ms, task_id
+        # INFO on success, WARNING otherwise, so a failing tool is visible in the live log
+        # without raising the log level. Only the outcome is logged, never parameters.
+        (logger.info if result.status is ToolResultStatus.SUCCESS else logger.warning)(
+            "TOOL done name=%s task=%s status=%s category=%s ms=%s",
+            name, task_id, result.status.value, result.error_category, duration_ms,
         )
         return result
 

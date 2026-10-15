@@ -13,6 +13,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
@@ -382,6 +383,12 @@ async def task_execution_loop() -> None:
 
                 current_task_id = task.task_id
                 current_task_pk = task.id
+                run_started = time.perf_counter()
+                logger.info(
+                    "WORKER claimed task=%s worker=%s status=%s retry=%s/%s title=%s",
+                    task.task_id, WORKER_ID, task.status, task.retry_count, task.max_retries,
+                    (task.title or "")[:80],
+                )
                 worker_state.polled(f"running {task.task_id}")
                 worker_state.task_claimed(task.task_id, task.title)
 
@@ -395,7 +402,16 @@ async def task_execution_loop() -> None:
                 report = await controller.execute_task(task)
                 await db.commit()
 
-                logger.info("Task %s finished: %s", task.task_id, report.outcome.value)
+                logger.info(
+                    "WORKER finished task=%s outcome=%s status=%s ms=%s steps=%s failures=%s blockers=%s",
+                    task.task_id, report.outcome.value, task.status,
+                    int((time.perf_counter() - run_started) * 1000), len(report.steps),
+                    len(report.failures), len(report.blockers),
+                )
+                for failure in report.failures[:3]:
+                    logger.warning("WORKER failure task=%s detail=%s", task.task_id, redact(str(failure))[:300])
+                for blocker in report.blockers[:3]:
+                    logger.warning("WORKER blocker task=%s detail=%s", task.task_id, redact(str(blocker))[:300])
                 worker_state.task_finished(task.task_id, report.outcome.value)
 
                 if report.outcome.value == "failed" and task.status == TaskStatus.IN_PROGRESS.value:
@@ -432,7 +448,10 @@ async def task_execution_loop() -> None:
                     )
                     worker_state.polled(f"discarded {current_task_id} (deleted while running)")
                     continue
-            logger.exception("Task execution error: %s", exc)
+            logger.exception(
+                "WORKER crashed task=%s type=%s error=%s",
+                current_task_id, type(exc).__name__, redact(str(exc))[:300],
+            )
             worker_state.failed(exc, current_task_id)
             if current_task_pk is not None:
                 # The session above was rolled back; record the failure in a new one so the
