@@ -409,6 +409,7 @@ class Settings(BaseSettings):
     RPC_OPTIMISM: Optional[str] = "https://mainnet.optimism.io"
     RPC_BASE: Optional[str] = "https://mainnet.base.org"
     RPC_POLYGON: Optional[str] = "https://polygon-rpc.com"
+    RPC_BSC: Optional[str] = "https://bsc-dataseed.binance.org"
     RPC_SEPOLIA: Optional[str] = "https://rpc.sepolia.org"
 
     # Operator-supplied ERC-20 contracts, keyed by network then symbol:

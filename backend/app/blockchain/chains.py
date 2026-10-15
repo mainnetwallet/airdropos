@@ -164,6 +164,13 @@ CHAIN_CATALOG: Tuple[EvmChain, ...] = (
         explorer_url="https://polygonscan.com",
     ),
     EvmChain(
+        name="bsc",
+        chain_id=56,
+        rpc_setting="RPC_BSC",
+        native_symbol="BNB",
+        explorer_url="https://bscscan.com",
+    ),
+    EvmChain(
         name="sepolia",
         chain_id=11155111,
         rpc_setting="RPC_SEPOLIA",

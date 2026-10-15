@@ -28,6 +28,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
 from backend.app.models import ExecutionPlan, PlanRevision, Task
@@ -266,7 +267,7 @@ class PlanConstraints:
     # legitimate plan ("Plan has 26 steps, exceeding the maximum of 24"). None = unlimited.
     max_steps: Optional[int] = None
     allow_transactions: bool = False
-    allowed_networks: Set[str] = field(default_factory=lambda: {"ethereum", "arbitrum", "optimism", "base", "polygon", "sepolia"})
+    allowed_networks: Set[str] = field(default_factory=lambda: set(known_networks()))
 
     def remaining_budget_usd(self) -> float:
         """The budget left for a plan, or ``inf`` when no ceiling is configured.
