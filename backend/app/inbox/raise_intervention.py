@@ -27,6 +27,7 @@ from backend.app.inbox import events
 from backend.app.inbox.service import (
     AMBIGUOUS_INSTRUCTION,
     BROWSER_SESSION_UNAVAILABLE,
+    EXTENSION_INSTALL_REQUIRED,
     HUMAN_APPROVAL,
     HUMAN_VERIFICATION,
     MISSING_AUTHENTICATION,
@@ -83,6 +84,24 @@ def guidance_for(reason_code: str, error_text: str, integration_ref: Optional[st
             "how_verified": (
                 "I will inspect the live session and confirm it is no longer waiting for "
                 "verification, then resume only if it is."
+            ),
+        }
+
+    if reason_code == EXTENSION_INSTALL_REQUIRED:
+        return {
+            "required_action": (
+                "Click 'Add to Chrome' on the Web Store listing and accept the permissions "
+                "prompt, in the browser profile AirdropOS opened."
+            ),
+            "where_to_act": common_where,
+            "instructions": [
+                "Switch to the AirdropOS browser window that has the Chrome Web Store listing open.",
+                "Click 'Add to Chrome', then 'Add extension' in Chrome's prompt.",
+                "Reply here when it is added and I will check the profile for it.",
+            ],
+            "how_verified": (
+                "I will read the profile's installed extensions and resume only if the "
+                "extension is really listed there. Chrome's confirmation is never clicked for you."
             ),
         }
 

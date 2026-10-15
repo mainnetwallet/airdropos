@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -20,11 +21,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox.service import (
     BROWSER_SESSION_UNAVAILABLE,
+    EXTENSION_INSTALL_REQUIRED,
     HUMAN_VERIFICATION,
     MISSING_AUTHENTICATION,
     MISSING_CONFIGURATION,
     TELEGRAM_SESSION_UNAVAILABLE,
+    UNKNOWN_REASON,
     InterventionRequest,
+    classify_reason,
 )
 from backend.app.models import Task
 
@@ -83,7 +87,15 @@ async def verify(
     db: AsyncSession, task: Task, request: InterventionRequest
 ) -> VerificationResult:
     """Run the verifier registered for this request's reason code."""
-    verifier = verifier_for(request.reason_code)
+    reason_code = request.reason_code
+    if reason_code == UNKNOWN_REASON and verifier_for(reason_code) is None:
+        # A request raised before extension installs had their own reason was stored as
+        # UNKNOWN even though its text names the blocker precisely. Re-derive that one case
+        # from the recorded text so the real check runs; nothing else is re-classified.
+        text = f"{request.problem_summary or ''} {request.blocking_step or ''}"
+        if classify_reason(text) == EXTENSION_INSTALL_REQUIRED:
+            reason_code = EXTENSION_INSTALL_REQUIRED
+    verifier = verifier_for(reason_code)
     if verifier is None:
         return VerificationResult.unchecked(
             method=NOT_CHECKED,
@@ -97,14 +109,14 @@ async def verify(
         result = await asyncio.wait_for(verifier(db, task, request), timeout=VERIFY_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         return VerificationResult.unchecked(
-            method=request.reason_code,
+            method=reason_code,
             outcome=f"The check did not finish within {VERIFY_TIMEOUT_SECONDS:.0f}s.",
             question="The check timed out. Please confirm the condition is resolved, or tell me what is still failing.",
         )
     except Exception as exc:
         logger.warning("Verification for %s failed: %s", request.request_id, exc)
         return VerificationResult.unchecked(
-            method=request.reason_code,
+            method=reason_code,
             outcome=f"The check could not run: {type(exc).__name__}.",
             question="I could not run the check. Please tell me the current state of the thing that is blocking this task.",
         )
@@ -409,6 +421,109 @@ async def _verify_live_session(
 
 
 # ----------------------------------------------------------------------
+# Browser extension install
+# ----------------------------------------------------------------------
+_STORE_EXTENSION_ID = re.compile(r"/([a-p]{32})(?:[/?#]|$)")
+
+
+def _extension_targets(plan: Any, request: InterventionRequest) -> List[Dict[str, Optional[str]]]:
+    """The extensions this task asked the operator to install, read from its own plan.
+
+    Taken from the plan's Web Store steps, never from the operator's chat message, so a reply
+    cannot name a different extension and have it accepted.
+    """
+    targets: List[Dict[str, Optional[str]]] = []
+    for step in getattr(plan, "steps", None) or []:
+        if getattr(step, "tool", None) != "browser_extensions":
+            continue
+        params = getattr(step, "parameters", None) or {}
+        if params.get("action") != "web_store":
+            continue
+        match = _STORE_EXTENSION_ID.search(str(params.get("store_url") or ""))
+        ext_id = (match.group(1) if match else str(params.get("extension_id") or "")).strip().lower()
+        query = str(params.get("query") or "").strip()
+        if not ext_id and not query:
+            continue
+        targets.append(
+            {
+                "extension_id": ext_id or None,
+                "query": query or None,
+                "profile": str(
+                    params.get("session_key") or params.get("profile_id")
+                    or request.integration_ref or ""
+                ).strip() or None,
+            }
+        )
+    return targets
+
+
+async def _verify_extension_installed(
+    db: AsyncSession, task: Task, request: InterventionRequest
+) -> VerificationResult:
+    """Check that the extension is really installed in the browser profile.
+
+    Reads the profile's own installed-extension state (the same read `browser_extensions
+    action=check` does). A reply of "installed" is a claim; this is the proof. Chrome's
+    'Add to Chrome' confirmation is never clicked by AirdropOS, so the operator's click is the
+    only thing that can make this pass.
+    """
+    from backend.app.browser.profiles import resolve_session_key
+    from backend.app.planning.planner import Planner
+    from backend.app.tools import browser_tools
+
+    plan = await Planner(db).load_plan_spec(task)
+    targets = _extension_targets(plan, request)
+    if not targets:
+        return VerificationResult.unchecked(
+            method=NOT_CHECKED,
+            outcome="This task's plan names no Chrome Web Store extension to look for.",
+            question="Which extension should I look for? Tell me its name and I will check the profile.",
+        )
+
+    missing: List[str] = []
+    found: List[str] = []
+    where = ""
+    for target in targets:
+        key = resolve_session_key(target["profile"])
+        status = await browser_tools.controller.extension_status(key)
+        if not status.get("ok"):
+            return VerificationResult.unchecked(
+                method="extension_installed",
+                outcome=f"'{key}' is not a saved browser profile, so its extensions cannot be read.",
+                question="Which browser profile did you install it in? Create or select it on the Browser Profiles page.",
+            )
+        where = str(status.get("profile_dir") or key)
+        label = target["query"] or target["extension_id"] or "the extension"
+        if target["extension_id"]:
+            hit = [e for e in status.get("installed", []) if str(e.get("id", "")).lower() == target["extension_id"]]
+        else:
+            hit = await browser_tools._find_extension(status, target["query"] or "")
+        if hit:
+            found.append(str(hit[0].get("name") or label))
+        else:
+            missing.append(label)
+
+    if missing:
+        return VerificationResult.failed(
+            method="extension_installed",
+            outcome=(
+                f"Chrome does not list {', '.join(missing)} as installed in the AirdropOS "
+                f"browser profile ({where})."
+            ),
+            question=(
+                "It is not installed in the profile AirdropOS opened. Make sure you clicked 'Add "
+                "to Chrome' in that AirdropOS browser window (not your everyday Chrome), accept "
+                "the prompt, then reply and I will check again."
+            ),
+        )
+    return VerificationResult.satisfied(
+        method="extension_installed",
+        outcome=f"Installed in the browser profile: {', '.join(found)}.",
+        extensions=found,
+    )
+
+
+# ----------------------------------------------------------------------
 # Authentication / configuration
 # ----------------------------------------------------------------------
 async def _verify_authentication(
@@ -470,6 +585,7 @@ def register_default_verifiers() -> None:
     """Install the built-in verifiers. Safe to call more than once."""
     register(TELEGRAM_SESSION_UNAVAILABLE, _verify_telegram_session)
     register(BROWSER_SESSION_UNAVAILABLE, _verify_live_session)
+    register(EXTENSION_INSTALL_REQUIRED, _verify_extension_installed)
     register(HUMAN_VERIFICATION, _verify_live_session)
     register(MISSING_AUTHENTICATION, _verify_authentication)
     register(MISSING_CONFIGURATION, _verify_configuration)

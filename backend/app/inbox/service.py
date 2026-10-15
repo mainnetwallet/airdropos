@@ -49,6 +49,7 @@ class InterventionReason(str, Enum):
     MISSING_AUTHENTICATION = "MISSING_AUTHENTICATION"
     TELEGRAM_SESSION_UNAVAILABLE = "TELEGRAM_SESSION_UNAVAILABLE"
     BROWSER_SESSION_UNAVAILABLE = "BROWSER_SESSION_UNAVAILABLE"
+    EXTENSION_INSTALL_REQUIRED = "EXTENSION_INSTALL_REQUIRED"
     HUMAN_VERIFICATION = "HUMAN_VERIFICATION"
     MISSING_CONFIGURATION = "MISSING_CONFIGURATION"
     AMBIGUOUS_INSTRUCTION = "AMBIGUOUS_INSTRUCTION"
@@ -61,6 +62,7 @@ class InterventionReason(str, Enum):
 MISSING_AUTHENTICATION = InterventionReason.MISSING_AUTHENTICATION.value
 TELEGRAM_SESSION_UNAVAILABLE = InterventionReason.TELEGRAM_SESSION_UNAVAILABLE.value
 BROWSER_SESSION_UNAVAILABLE = InterventionReason.BROWSER_SESSION_UNAVAILABLE.value
+EXTENSION_INSTALL_REQUIRED = InterventionReason.EXTENSION_INSTALL_REQUIRED.value
 HUMAN_VERIFICATION = InterventionReason.HUMAN_VERIFICATION.value
 MISSING_CONFIGURATION = InterventionReason.MISSING_CONFIGURATION.value
 AMBIGUOUS_INSTRUCTION = InterventionReason.AMBIGUOUS_INSTRUCTION.value
@@ -75,6 +77,7 @@ MACHINE_VERIFIABLE = frozenset(
         MISSING_AUTHENTICATION,
         TELEGRAM_SESSION_UNAVAILABLE,
         BROWSER_SESSION_UNAVAILABLE,
+        EXTENSION_INSTALL_REQUIRED,
         HUMAN_VERIFICATION,
         MISSING_CONFIGURATION,
     }
@@ -106,6 +109,11 @@ INFORMATION_RESOLVABLE = frozenset({AMBIGUOUS_INSTRUCTION, MISSING_CONFIGURATION
 # Substrings in the real failure text that identify each reason. Checked in this order, so the
 # more specific patterns come first.
 _REASON_SIGNATURES: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    # A Chrome Web Store install needs a person to press "Add to Chrome". Listed first: the
+    # wording is unmistakable and must not fall through to UNKNOWN (which has no real check).
+    (EXTENSION_INSTALL_REQUIRED, (
+        "add to chrome", "chrome web store", "web store listing", "install the extension",
+    )),
     (TELEGRAM_SESSION_UNAVAILABLE, (
         "telegram session", "telethon", "authkeyunregistered", "sessionrevoked",
         "sessionexpired", "userdeactivated", "sessionpasswordneeded", "apiidinvalid",

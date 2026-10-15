@@ -70,6 +70,7 @@ const REASON_LABELS: Record<string, string> = {
   MISSING_AUTHENTICATION: 'Authentication required',
   TELEGRAM_SESSION_UNAVAILABLE: 'Telegram session unavailable',
   BROWSER_SESSION_UNAVAILABLE: 'Browser session unavailable',
+  EXTENSION_INSTALL_REQUIRED: 'Extension install needed',
   HUMAN_VERIFICATION: 'Human verification',
   MISSING_CONFIGURATION: 'Configuration missing',
   AMBIGUOUS_INSTRUCTION: 'Instruction unclear',
