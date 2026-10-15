@@ -52,3 +52,6 @@ class SessionProvider:
 
     async def create(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         raise NotSupported(f"Sessions cannot be started from the dashboard for {self.label}.")
+
+    async def chat(self, key: str, op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        raise NotSupported(f"{self.label} sessions have no chat view.")

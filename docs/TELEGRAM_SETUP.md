@@ -409,3 +409,17 @@ teardown. It is a teardown artifact, not a test failure — the summary still re
 `test_inbox_llm_interpretation.py::TestClaimsAreVerifiedForReal::test_a_login_claim_is_checked_by_the_real_telegram_readiness_check`
 fails with `assert 'telegram_worker_session' == 'telegram_session_readiness'`. It fails
 identically at `7ffcb4a`, before any of this work, and was deliberately left failing.
+
+## Live chat view (Live Broadcast)
+
+Open a Telegram session on **Live Broadcast** to get a Telegram-like view of the logged-in
+account: chat list with search, the conversation, inline bot buttons you can press, and a
+send box. It is the same Telethon session the agent uses, so the two never run at the same
+time (they share one lock), and **Stop** still disconnects the account.
+
+- Reading chats needs the normal read permission. Sending and pressing buttons need the same
+  permission as any other Live Broadcast control, and are written to the audit log.
+- Text that looks like a private key or seed phrase is refused, as for the agent.
+- Only plain and callback buttons are pressed. Links open in your browser when you click them;
+  payment, phone/location sharing, login and Mini App buttons are refused.
+- The session card appears once the account has been used by the agent in this worker process.

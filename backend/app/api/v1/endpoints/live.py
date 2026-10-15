@@ -315,3 +315,59 @@ async def send_input(
     _check_ref(integration, key)
     payload = {**body.model_dump(exclude_none=True), **_owner(principal)}
     return await _gateway(client.post_json(f"/sessions/{integration}/{key}/input", payload))
+
+
+# ---------------------------------------------------------------------------
+# Chat view (message-based sessions such as Telegram)
+# ---------------------------------------------------------------------------
+class ChatBody(BaseModel):
+    peer: Optional[str] = Field(default=None, max_length=24)
+    limit: Optional[int] = Field(default=None, ge=1, le=100)
+    search: Optional[str] = Field(default=None, max_length=60)
+    text: Optional[str] = Field(default=None, max_length=4096)
+    reply_to: Optional[int] = Field(default=None, ge=1)
+    message_id: Optional[int] = Field(default=None, ge=1)
+    row: Optional[int] = Field(default=None, ge=0, le=50)
+    col: Optional[int] = Field(default=None, ge=0, le=50)
+
+
+async def _chat(integration: str, key: str, op: str, body: ChatBody, principal: Principal) -> Dict[str, Any]:
+    _check_ref(integration, key)
+    payload = {**body.model_dump(exclude_none=True), **_owner(principal)}
+    return await _gateway(client.post_json(f"/sessions/{integration}/{key}/chat/{op}", payload))
+
+
+@router.post("/sessions/{integration}/{key}/chat/dialogs")
+async def chat_dialogs(
+    integration: str, key: str, body: ChatBody, principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    return await _chat(integration, key, "dialogs", body, principal)
+
+
+@router.post("/sessions/{integration}/{key}/chat/history")
+async def chat_history(
+    integration: str, key: str, body: ChatBody, principal: Principal = Depends(require_read),
+) -> Dict[str, Any]:
+    return await _chat(integration, key, "history", body, principal)
+
+
+@router.post("/sessions/{integration}/{key}/chat/send")
+async def chat_send(
+    integration: str, key: str, body: ChatBody,
+    db: AsyncSession = Depends(get_db), principal: Principal = Depends(require_task_write),
+) -> Dict[str, Any]:
+    result = await _chat(integration, key, "send", body, principal)
+    await write_audit(db, principal, "LIVE_CHAT_SEND", "live_session", f"{integration}:{key}",
+                      after_state={"chars": len(body.text or "")})
+    return result
+
+
+@router.post("/sessions/{integration}/{key}/chat/click")
+async def chat_click(
+    integration: str, key: str, body: ChatBody,
+    db: AsyncSession = Depends(get_db), principal: Principal = Depends(require_task_write),
+) -> Dict[str, Any]:
+    result = await _chat(integration, key, "click", body, principal)
+    await write_audit(db, principal, "LIVE_CHAT_CLICK", "live_session", f"{integration}:{key}",
+                      after_state={"message_id": body.message_id})
+    return result

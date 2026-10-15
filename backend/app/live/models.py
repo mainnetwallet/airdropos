@@ -25,6 +25,7 @@ class Capabilities:
     stop: bool = False
     manual_control: bool = False  # operator can click / type into the real session
     keyboard: bool = False        # text + key input in addition to clicks
+    chat: bool = False            # message-based session: chat list, history, send, press buttons
     metadata: bool = True
 
     def as_dict(self) -> Dict[str, bool]:

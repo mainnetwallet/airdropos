@@ -18,6 +18,7 @@ import {
 import clsx from 'clsx'
 import LiveScreen from '@/components/live/LiveScreen'
 import ActivityList from '@/components/live/ActivityList'
+import TelegramChat from '@/components/live/TelegramChat'
 import SessionActions from '@/components/live/SessionActions'
 import { IntegrationBadge, StatusBadge, STATUS_DOT, STATUS_LABEL } from '@/components/live/meta'
 import { formatElapsed, useElapsed, useLiveFeed, useMediaQuery, useSessionControl, useStale, type StreamState } from '@/hooks/useLive'
@@ -303,6 +304,10 @@ export default function LiveSessionPage() {
         onFrameRefreshRequested={onRefreshHandle}
       />
     )
+  ) : caps.chat ? (
+    <div className="h-full w-full p-2 sm:p-3">
+      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} />
+    </div>
   ) : (
     <div className="mx-auto h-full w-full max-w-2xl overflow-y-auto p-4">
       <p className="mb-3 rounded-lg bg-surface-200 p-3 text-sm text-slate-400">
@@ -452,6 +457,10 @@ export default function LiveSessionPage() {
             )}
             <span className="absolute right-3 top-3"><StatusBadge status={session.status} streaming={streaming} /></span>
             <button type="button" onClick={enterFullscreen} aria-label="Open full screen" className="absolute bottom-3 right-3 flex h-10 w-10 items-center justify-center rounded-lg bg-black/60 text-white"><Maximize2 className="h-4 w-4" /></button>
+          </div>
+        ) : caps.chat ? (
+          <div className="h-[72vh] min-h-[420px]">
+            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} />
           </div>
         ) : (
           <div className="rounded-2xl bg-surface-200 p-3 text-sm text-slate-400">

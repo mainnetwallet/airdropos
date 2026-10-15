@@ -231,6 +231,20 @@ def build_app() -> FastAPI:
         except Exception as exc:
             raise _guard(exc)
 
+    @app.post("/sessions/{integration}/{key}/chat/{op}", dependencies=deps)
+    async def chat(integration: str, key: str, op: str, request: Request) -> Dict[str, Any]:
+        if op in ("send", "click"):
+            _refuse_while_stopped("send from a chat session")
+        body = await _json_body(request)
+        try:
+            return await _provider(integration).chat(key, op, body)
+        except HTTPException:
+            raise
+        except KeyError:
+            raise HTTPException(status_code=404, detail={"code": "not_found", "message": "Session not found."})
+        except Exception as exc:
+            raise _guard(exc)
+
     # ------------------------------------------------------------------ browser profiles
     # Profile lifecycle lives with the browsers, in this worker. The API never talks to
     # Chrome directly; it asks here and returns exactly what the worker observed.

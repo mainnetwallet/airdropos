@@ -34,6 +34,8 @@ import type {
   ControlGrant,
   InputEvent,
   InstalledExtension,
+  ChatDialog,
+  ChatHistory,
   LiveEventsResponse,
   LiveOverview,
   LiveSession,
@@ -620,6 +622,26 @@ Object.assign(api, {
       method: 'POST',
       body: JSON.stringify({ token }),
     }),
+  liveChatDialogs: (integration: string, key: string, search?: string) =>
+    request<{ dialogs: ChatDialog[] }>(`${ref(integration, key)}/chat/dialogs`, {
+      method: 'POST',
+      body: JSON.stringify({ limit: 60, search: search || undefined }),
+    }),
+  liveChatHistory: (integration: string, key: string, peer: string) =>
+    request<ChatHistory>(`${ref(integration, key)}/chat/history`, {
+      method: 'POST',
+      body: JSON.stringify({ peer, limit: 50 }),
+    }),
+  liveChatSend: (integration: string, key: string, peer: string, text: string, replyTo?: number) =>
+    request<{ sent_id: number }>(`${ref(integration, key)}/chat/send`, {
+      method: 'POST',
+      body: JSON.stringify({ peer, text, reply_to: replyTo }),
+    }),
+  liveChatClick: (integration: string, key: string, peer: string, messageId: number, row: number, col: number) =>
+    request<{ clicked: boolean; answer: string | null }>(`${ref(integration, key)}/chat/click`, {
+      method: 'POST',
+      body: JSON.stringify({ peer, message_id: messageId, row, col }),
+    }),
   liveInput: (integration: string, key: string, token: string, seq: number, event: InputEvent) =>
     request<Record<string, unknown>>(`${ref(integration, key)}/input`, {
       method: 'POST',
@@ -695,6 +717,10 @@ export type LiveApi = {
   liveRenewControl: (i: string, k: string, token: string) => Promise<Record<string, unknown>>
   liveReleaseControl: (i: string, k: string, token: string) => Promise<{ released: boolean; counts?: Record<string, number> }>
   liveInput: (i: string, k: string, token: string, seq: number, e: InputEvent) => Promise<Record<string, unknown>>
+  liveChatDialogs: (i: string, k: string, search?: string) => Promise<{ dialogs: ChatDialog[] }>
+  liveChatHistory: (i: string, k: string, peer: string) => Promise<ChatHistory>
+  liveChatSend: (i: string, k: string, peer: string, text: string, replyTo?: number) => Promise<{ sent_id: number }>
+  liveChatClick: (i: string, k: string, peer: string, messageId: number, row: number, col: number) => Promise<{ clicked: boolean; answer: string | null }>
   browserProfiles: () => Promise<BrowserProfilesResponse>
   createBrowserProfile: (b: BrowserProfileInput) => Promise<BrowserProfileInfo>
   updateBrowserProfile: (id: string, b: Partial<BrowserProfileInput>) => Promise<BrowserProfileInfo>

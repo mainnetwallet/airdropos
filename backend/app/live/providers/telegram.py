@@ -1,7 +1,8 @@
 """Telegram (MTProto / Telethon) session.
 
-This is an API session, not a screen: there is NO picture and NO clickable
-surface. The card shows genuine activity events and metadata only.
+This is an API session, not a screen, so there is no picture to stream. Instead the
+dashboard renders a real-Telegram-like CHAT view of the account (chat list, messages,
+inline buttons, send box) built from live Telethon data; see ``live/telegram_chat.py``.
 """
 
 from __future__ import annotations
@@ -35,10 +36,11 @@ STOPPED_VISIBLE_SECONDS = 5  # how long a stopped card stays on Live Broadcast
 class TelegramProvider(SessionProvider):
     integration = "telegram"
     label = "Telegram"
-    capabilities = Capabilities(visual=False, events=True, pause_resume=True, stop=True, manual_control=False)
+    capabilities = Capabilities(visual=False, events=True, pause_resume=True, stop=True, manual_control=False, chat=True)
     note = (
-        "API session (Telethon). It shows real activity events only: there is no graphical screen and no "
-        "screen streaming. Each logged-in account is its own session. Stop disconnects that account and blocks the agent until resumed."
+        "API session (Telethon). There is no screen streaming; the dashboard shows a live chat view of the account "
+        "(chats, messages, buttons, send box) plus real activity events. Each logged-in account is its own session. "
+        "Stop disconnects that account and blocks the agent until resumed."
     )
 
     _stopped_seen: Dict[str, float] = {}  # per account key: when this provider first saw it stopped
@@ -106,6 +108,14 @@ class TelegramProvider(SessionProvider):
                 "daily_action_limit": settings.TELEGRAM_USER_DAILY_ACTION_LIMIT,
             },
         }
+
+    async def chat(self, key: str, op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from backend.app.live import telegram_chat
+
+        tg = _session_by_key(key)
+        if tg is None:
+            raise SessionNotFound(key)
+        return await telegram_chat.run(tg, op, payload)
 
     async def action(self, key: str, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         tg = _session_by_key(key)

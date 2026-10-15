@@ -9,6 +9,7 @@ export interface Capabilities {
   stop: boolean
   manual_control: boolean
   keyboard: boolean
+  chat?: boolean
   metadata: boolean
 }
 
@@ -199,4 +200,46 @@ export interface BrowserProfilesResponse {
   chrome: ChromeInfo
   profile_root: string
   persistent_profiles_enabled: boolean
+}
+
+// --- Chat view (message-based sessions such as Telegram) -----------------------
+export interface ChatDialog {
+  peer: string
+  title: string
+  username: string | null
+  kind: string | null
+  unread: number
+  last_text: string
+  last_from_me: boolean
+  last_date: string | null
+  pinned: boolean
+}
+
+export interface ChatButton {
+  row: number
+  col: number
+  text: string
+  kind: string
+  clickable: boolean
+  url: string | null
+}
+
+export interface ChatMessage {
+  id: number
+  from_me: boolean
+  date: string | null
+  sender: string | null
+  text: string
+  media: string | null
+  reply_to: number | null
+  edited: boolean
+  buttons: ChatButton[][]
+}
+
+export interface ChatHistory {
+  peer: string
+  title: string
+  username: string | null
+  is_bot: boolean
+  messages: ChatMessage[]
 }
