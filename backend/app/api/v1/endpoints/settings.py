@@ -8,10 +8,9 @@ not its value. Writing a secret stores it; reading it back is not possible.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,7 +19,6 @@ from backend.app.database.session import get_db
 from backend.app.models import SystemSetting
 from backend.app.security.auth import (
     Principal,
-    Scope,
     enforce_rate_limit,
     require_read,
     require_system_admin,

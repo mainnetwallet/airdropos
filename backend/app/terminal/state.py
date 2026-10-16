@@ -609,7 +609,6 @@ class Collector:
     async def _probe_worker(self, state: RuntimeState) -> None:
         from sqlalchemy import select
 
-        from backend.app.database.session import AsyncSessionLocal
         from backend.app.models import IntegrationHealth
         from backend.app.scheduler.worker_status import STALE_AFTER_SECONDS, WORKER_SUBSYSTEM
 

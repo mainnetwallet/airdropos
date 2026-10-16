@@ -13,8 +13,7 @@ from __future__ import annotations
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from backend.app.core.config import settings
 from backend.app.live.events import EventLog, safe_url

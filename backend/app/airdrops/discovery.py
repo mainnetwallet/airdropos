@@ -13,10 +13,9 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from backend.app.tools.base import ToolResultStatus
 from backend.app.tools.registry import registry
 
 logger = logging.getLogger(__name__)

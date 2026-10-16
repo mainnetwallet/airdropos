@@ -34,14 +34,12 @@ from backend.app.inbox.service import (
     OPERATOR_PAUSE,
     REQUIRES_EXPLICIT_AUTHORIZATION,
     TELEGRAM_SESSION_UNAVAILABLE,
-    UNKNOWN_REASON,
     ConversationService,
     InterventionService,
     normalise_reply,
 )
 from backend.app.inbox.verification import VerificationResult
 from backend.app.llm.client import LLMError
-from backend.app.models import AgentConversation, Task
 from backend.app.tasks.checkpoints import CheckpointManager
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus

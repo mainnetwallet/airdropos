@@ -32,9 +32,8 @@ Security notes that shaped both layers:
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm

@@ -62,17 +62,15 @@ from backend.app.models.context import (
     OUTCOME_ATTEMPTED,
     OUTCOME_BLOCKED,
     OUTCOME_CONFIRMED,
-    OUTCOME_DUPLICATE_SUPPRESSED,
     OUTCOME_EXECUTED,
     OUTCOME_FAILED,
-    OUTCOME_SKIPPED,
     OUTCOME_UNVERIFIED,
     REQUIREMENT_DISCOVERED,
     REQUIREMENT_SATISFIED,
     REQUIREMENT_UNVERIFIABLE,
     REQUIREMENT_WAIVED,
 )
-from backend.app.models.memory import SCOPE_CAMPAIGN, SCOPE_GLOBAL, SCOPE_TASK
+from backend.app.models.memory import SCOPE_CAMPAIGN, SCOPE_GLOBAL
 
 logger = logging.getLogger(__name__)
 

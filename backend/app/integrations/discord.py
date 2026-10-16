@@ -7,10 +7,9 @@ A task created here is immediately visible there and vice versa.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 from backend.app.core.config import settings
-from backend.app.notifications.dispatcher import Severity, dispatcher
 
 logger = logging.getLogger(__name__)
 

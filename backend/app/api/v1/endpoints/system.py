@@ -20,7 +20,6 @@ from sqlalchemy.orm import load_only
 from backend.app.browser.controller import controller as browser_controller
 from backend.app.core.config import settings
 from backend.app.database.session import get_db, session_scope
-from backend.app.airdrops.verifier import ChangeDetector
 from backend.app.inbox.service import ConversationService
 from backend.app.integrations import telegram_accounts, telegram_leases
 from backend.app.integrations import telegram_login
@@ -35,7 +34,6 @@ from backend.app.models import (
     IntegrationHealth,
     Project,
     Task,
-    Tool,
     Wallet,
 )
 from backend.app.memory.manager import MemoryManager
@@ -51,7 +49,6 @@ from backend.app.security.auth import (
     require_task_write,
     require_tool_read,
     require_scopes,
-    require_wallet_read,
     write_audit,
 )
 from backend.app.security.emergency_stop import (

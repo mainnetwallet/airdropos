@@ -8,19 +8,17 @@ deterministic doubles. Nothing here touches the network, the provider or the fil
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
-from backend.app.agent.controller import AgentController, LoopOutcome
+from backend.app.agent.controller import AgentController
 from backend.app.database.session import Base
 from backend.app.planning.planner import (
     ExecutionPlanSpec,
     PlanStep,
-    ReplanTrigger,
     StepKind,
 )
 from backend.app.tools.base import SideEffect, ToolResult, ToolResultStatus

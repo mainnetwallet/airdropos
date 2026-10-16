@@ -19,14 +19,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.agent.context import TaskContextService, action_fingerprint
+from backend.app.agent.context import TaskContextService
 from backend.app.agent.guidance import (
     MAX_RENDERED_CHARS,
     reflect_on_guidance,
@@ -43,13 +42,10 @@ from backend.app.core.runlog import clip, param_keys
 from backend.app.llm.client import LLMError, Message, llm
 from backend.app.models import AirdropCampaign, Task
 from backend.app.models.context import (
-    OUTCOME_ATTEMPTED,
     OUTCOME_BLOCKED,
     OUTCOME_CONFIRMED,
     OUTCOME_DUPLICATE_SUPPRESSED,
-    OUTCOME_EXECUTED,
     OUTCOME_FAILED,
-    OUTCOME_SKIPPED,
     OUTCOME_UNVERIFIED,
 )
 from backend.app.planning.planner import (
@@ -68,7 +64,7 @@ from backend.app.tasks.recovery import FailureDiagnosisEngine, next_retry_at
 from backend.app.tasks.state_machine import CompletionProof, TaskStatus
 from backend.app.tasks.telemetry import registry as task_usage_registry
 from backend.app.tools.context import task_context
-from backend.app.tools.base import SideEffect, ToolResultStatus
+from backend.app.tools.base import ToolResultStatus
 from backend.app.tools.registry import AuthorizationPolicy, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -228,7 +224,6 @@ EVIDENCE_KINDS: Dict[str, frozenset] = {
     "miniapp_task_verified": frozenset({"miniapp_task_verified"}),
 }
 
-from backend.app.agent.prompts import AGENT_SYSTEM_PROMPT as SYSTEM_PROMPT  # noqa: E402
 from backend.app.inbox.raise_intervention import park_for_intervention  # noqa: E402
 from backend.app.inbox.service import (  # noqa: E402
     AMBIGUOUS_INSTRUCTION,
@@ -1080,7 +1075,6 @@ class AgentController:
         from backend.app.airdrops.campaign_context import CampaignContextService
 
         revision = await self._context_revision(task)
-        key = f"{task.id}:{revision}"
         cached = self._planning_context_cache.get(str(task.id))
         if cached is not None and cached[0] == revision:
             return cached[1], cached[2]
@@ -1827,7 +1821,7 @@ class AgentController:
             allow_model=False,
         )
 
-        observation = await self.context.record_observation(
+        await self.context.record_observation(
             task,
             action=step.description,
             outcome=outcome,

@@ -389,7 +389,6 @@ class GetWalletBalancesTool(BaseTool):
             )
 
         async with session_scope() as db:
-            service = WalletService(db)
             row, reason = await resolve_wallet(
                 db,
                 wallet_id=params.get("wallet_id"),

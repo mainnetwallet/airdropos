@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from backend.app.agent import guidance
 from backend.app.agent.guidance import (
     build_record_context,
     reflect_on_guidance,

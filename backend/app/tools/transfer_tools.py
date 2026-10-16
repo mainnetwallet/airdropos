@@ -51,7 +51,7 @@ from backend.app.transactions.engine import (
     decode_raw_transaction,
     engine,
 )
-from backend.app.wallets.service import WalletError, WalletService
+from backend.app.wallets.service import WalletService
 from backend.app.wallets.vault import DecryptionError, SigningDenied, SigningRequest, vault
 
 logger = logging.getLogger(__name__)
@@ -588,7 +588,6 @@ class ApproveTransferTool(BaseTool):
 
     async def execute(self, params: Dict[str, Any]) -> ToolResult:
         from backend.app.security.autonomous_policy import (
-            Category,
             get_policy,
             policy_approver_identity,
         )

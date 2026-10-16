@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from backend.app.agent.context import TaskContextService
-from backend.app.models import Base, Task, TaskRequirement
+from backend.app.models import Base, Task
 
 # Values that match MemoryManager.SECRET_PATTERNS.
 PRIVATE_KEY = "0x" + "a" * 64

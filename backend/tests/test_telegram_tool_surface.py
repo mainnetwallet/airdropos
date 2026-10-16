@@ -40,7 +40,6 @@ from backend.app.tools.telegram_user_tools import (
     CLICKABLE_BUTTON_KINDS,
     REFUSED_BUTTON_REASONS,
 )
-from backend.tests import fake_telegram
 from backend.tests.fake_telegram import FakeButton
 
 
@@ -1099,7 +1098,7 @@ def test_every_evidence_kind_the_telegram_tools_emit_is_mapped_by_the_controller
     reintroducing it by adding a tool that emits a kind nobody registered.
     """
     from backend.app.agent.controller import EVIDENCE_KINDS
-    from backend.app.tools import miniapp_tools, telegram_campaign_service
+    from backend.app.tools import telegram_campaign_service
 
     known: set = set()
     for kinds in EVIDENCE_KINDS.values():

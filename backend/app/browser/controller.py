@@ -1405,7 +1405,7 @@ class BrowserController:
     async def inspect(self, page) -> PageObservation:
         """Extract a structured view of the current page."""
         try:
-            content = await page.content()
+            await page.content()
         except Exception as exc:
             return PageObservation(
                 url=page.url, title="", text_excerpt=f"Inspection failed: {_safe_error(exc)}",

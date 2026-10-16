@@ -15,11 +15,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
-from backend.app.security.emergency_stop import StopPolicy, emergency_stop
+from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tools.context import task_context
 from backend.app.tools.timeouts import history as latency_history
 from backend.app.tools.timeouts import resolve_timeout

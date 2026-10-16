@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from backend.app.core.config import settings
-from backend.app.live import hub
 from backend.app.live.events import redact_text
 from backend.app.live.models import Capabilities, Conflict, NotSupported, SessionNotFound
 from backend.app.live.providers.base import SessionProvider

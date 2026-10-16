@@ -7,14 +7,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.core.config import settings
 from backend.app.database.session import get_db
-from backend.app.models import AirdropCampaign, Project, WalletEligibility
+from backend.app.models import AirdropCampaign, WalletEligibility
 from backend.app.security.auth import (
     Principal,
     enforce_rate_limit,
@@ -23,7 +22,6 @@ from backend.app.security.auth import (
     require_wallet_read,
     write_audit,
 )
-from backend.app.notifications.dispatcher import dispatcher
 
 logger = logging.getLogger(__name__)
 router = APIRouter()

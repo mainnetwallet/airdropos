@@ -25,7 +25,6 @@ The loop is deliberately small and entirely deterministic where it matters:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time

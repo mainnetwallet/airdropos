@@ -682,7 +682,6 @@ async def test_a_task_exceeding_its_window_persists_progress_and_is_requeued(fac
 
 async def test_a_long_task_continues_across_several_execution_windows(factory, monkeypatch):
     """A task needing more than several windows must finish, keeping its id."""
-    from backend.app.core.config import settings
 
     steps = [step(i, f"action {i}") for i in range(1, 13)]
     planner = StubPlanner()
@@ -713,7 +712,6 @@ async def test_a_long_task_continues_across_several_execution_windows(factory, m
 
 async def test_a_task_with_no_progress_at_all_is_stopped_with_an_accurate_blocker(factory, monkeypatch):
     """The anti-loop guard, and it must say WHY rather than fail vaguely."""
-    from backend.app.core.config import settings
 
     planner = StubPlanner()
     planner.decompositions = [[step(1, "the step", verification_method="page_observation")]]
@@ -989,7 +987,6 @@ def test_missing_provider_usage_is_unknown_not_zero():
 
 
 def test_a_served_model_that_is_not_the_configured_one_is_recorded():
-    from backend.app.core.config import settings
     from backend.app.tasks.telemetry import TaskUsage
 
     usage = TaskUsage()

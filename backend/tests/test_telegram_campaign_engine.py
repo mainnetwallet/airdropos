@@ -26,7 +26,6 @@ which is what a real account's dialog list contains.
 
 from __future__ import annotations
 
-import json
 import uuid
 
 import pytest
@@ -76,11 +75,7 @@ from backend.app.tools.telegram_campaign_tools import (
     TelegramGenerateTaskReportTool,
     TelegramGetNextActionTool,
     TelegramRecordTaskEvidenceTool,
-    TelegramReconcileTaskStateTool,
     TelegramResumeInterruptedTaskTool,
-    TelegramRetryFailedStepTool,
-    TelegramUpdateTaskStatusTool,
-    TelegramVerifyTaskCompletionTool,
 )
 from backend.app.tools.telegram_service import read_bot_state
 from backend.tests.fake_telegram import FakeButton, FakeDialog

@@ -51,12 +51,10 @@ from backend.app.tools.telegram_user_tools import (
     _button_kind,
     _describe_entity,
     _describe_message,
-    _flat_buttons,
     _locate_button,
     _membership_state,
     _numeric_chat_id,
     _ref_payload,
-    _type_names,
     looks_like_secret,
     parse_target,
 )

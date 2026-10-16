@@ -63,7 +63,7 @@ from backend.app.models.context import (
     REQUIREMENT_UNVERIFIABLE,
     TaskObservation,
 )
-from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
+from backend.app.tools.base import BaseTool, SideEffect, ToolResult
 from backend.app.tools.context import get_current_task_id
 from backend.app.tools.telegram_campaign_service import (
     MAX_ITEM_RETRIES,

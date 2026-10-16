@@ -11,7 +11,6 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select
@@ -22,7 +21,6 @@ from backend.app.api.v1.endpoints import system as system_endpoints
 from backend.app.database.session import get_db
 from backend.app.main import app
 from backend.app.models import (
-    AgentConversation,
     Base,
     ConversationMessage,
     Task,

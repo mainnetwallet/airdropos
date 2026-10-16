@@ -41,7 +41,6 @@ def test_every_network_timeout_phase_is_finite():
     no retry, no telemetry, and the task simply stopped. Every phase is now finite and
     configurable, which is a per-attempt bound and not a bound on the task.
     """
-    from backend.app.core.config import settings
 
     client = FixedLLMClient()
     for label, timeouts in (

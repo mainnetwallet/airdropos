@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import delete, func, or_, select
@@ -215,14 +215,12 @@ class KnowledgeGraphService:
         # Screen it so the graph cannot become a place secrets are persisted.
         try:
             MemoryManager.assert_no_secrets(str(payload))
-        except SecretLeakError as exc:
+        except SecretLeakError:
             raise InvalidRelationship(
                 "Relationship properties were rejected by the secret screener."
             ) from None
 
         existing = await self._find(source, relationship_type, target)
-        now = datetime.now(timezone.utc)
-
         if existing is not None:
             existing.weight = _clamp_weight(existing.weight * 0.5 + weight * 0.5)
             existing.properties = {**(existing.properties or {}), **payload}

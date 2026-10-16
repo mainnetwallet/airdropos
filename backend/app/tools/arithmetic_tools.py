@@ -22,12 +22,10 @@ from typing import Any, Dict
 
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult
 from backend.app.tools.verification_tools import (
-    AUTOMATICALLY_SOLVABLE,
     IMAGE_CAPTCHA,
     OTP_CHALLENGE,
     PAYMENT_APPROVAL,
     SECURITY_CAPTCHA,
-    UNSUPPORTED,
     classify_verification_challenge,
     solve_arithmetic,
 )

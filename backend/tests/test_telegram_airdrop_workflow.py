@@ -35,7 +35,6 @@ Two adaptations to the fake are worth naming:
 
 from __future__ import annotations
 
-import pytest
 from sqlalchemy import select
 
 from backend.app.database.session import session_scope

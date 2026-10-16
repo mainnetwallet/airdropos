@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -30,7 +30,6 @@ from backend.app.security.auth import (
     get_principal,
     hash_token,
     is_valid_password_hash,
-    require_system_admin,
     verify_against_dummy,
     verify_password,
     write_audit,

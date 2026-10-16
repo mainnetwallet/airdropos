@@ -3,24 +3,20 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 import uuid
 
-from backend.app.core.config import settings
 from backend.app.database.session import get_db
 from backend.app.models import AuditLog
 from backend.app.security.auth import (
     Principal,
     enforce_rate_limit,
-    require_read,
     require_audit_read,
-    write_audit,
 )
 
 logger = logging.getLogger(__name__)

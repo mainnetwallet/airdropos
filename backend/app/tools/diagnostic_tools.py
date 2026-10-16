@@ -10,7 +10,7 @@ report the real fault instead of asking the operator to guess.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from backend.app.database.session import session_scope
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult

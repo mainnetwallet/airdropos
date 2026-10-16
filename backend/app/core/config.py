@@ -6,7 +6,7 @@ Enforces strict single-LLM configuration, spending bounds, and security paramete
 
 import re
 from typing import Any, Dict, List, Optional
-from pydantic import AnyHttpUrl, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

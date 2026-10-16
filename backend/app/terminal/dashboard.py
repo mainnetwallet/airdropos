@@ -366,11 +366,9 @@ async def _run_live(collector, refresh: float, token: Optional[str] = None) -> i
             return True
         if key == controls.COPY_ACTIVITY:
             lines = list(collector.activity)
-            what = "RECENT ACTIVITY"
         elif key == controls.COPY_ALERTS:
             lines = list(state.alerts) if state is not None else []
             lines.reverse()  # oldest first, like the activity copy
-            what = "WARNINGS & ERRORS"
         elif key == controls.CLEAR_ACTIVITY:
             count = collector.clear_activity()
             scroll["offset"] = 0

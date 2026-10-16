@@ -8,10 +8,10 @@ import math
 import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from backend.app.browser import profiles as profile_store
-from backend.app.browser.controller import controller, url_block_reason, destination_block_reason
+from backend.app.browser.controller import controller, destination_block_reason
 from backend.app.browser.profiles import normalize_session_key
 from backend.app.core.config import settings
 from backend.app.live import hub

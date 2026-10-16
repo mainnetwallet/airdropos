@@ -26,7 +26,7 @@ from eth_account import Account
 from eth_account.messages import encode_defunct
 
 from backend.app.core.config import settings
-from backend.app.security.emergency_stop import EmergencyStopError, emergency_stop
+from backend.app.security.emergency_stop import emergency_stop
 
 logger = logging.getLogger(__name__)
 

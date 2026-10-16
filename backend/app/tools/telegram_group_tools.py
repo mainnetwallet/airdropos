@@ -38,7 +38,7 @@ from typing import Any, Dict, Optional
 
 from backend.app.core.config import settings
 from backend.app.tools import telegram_service as service
-from backend.app.tools.base import BaseTool, SideEffect, ToolResult
+from backend.app.tools.base import BaseTool, SideEffect, ToolResult, ToolResultStatus
 from backend.app.tools.telegram_user_tools import (
     ACCOUNT_PROPERTY,
     TELETHON_AVAILABLE,

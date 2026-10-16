@@ -791,7 +791,6 @@ def classify_task(
             reason="The requirement line was empty.",
         )
 
-    haystack = f" {text} "
     for pattern, task_type, confidence, reason in _CLASSIFIER_RULES:
         match = pattern.search(text)
         if not match:

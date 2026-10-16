@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict
 
-from backend.app.notifications.dispatcher import Channel, Severity, dispatcher
+from backend.app.notifications.dispatcher import Severity, dispatcher
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult
 
 

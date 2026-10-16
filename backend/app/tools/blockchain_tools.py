@@ -9,7 +9,7 @@ bypass any of those layers by constructing the call itself.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from backend.app.blockchain.chains import known_network_enum
 from backend.app.tools.base import BaseTool, SideEffect, ToolResult

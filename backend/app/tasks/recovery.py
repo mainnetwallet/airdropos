@@ -19,7 +19,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.models import FailureRecord, Task
-from backend.app.tasks.state_machine import TaskStatus
 
 logger = logging.getLogger(__name__)
 
