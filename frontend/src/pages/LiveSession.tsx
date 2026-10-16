@@ -19,6 +19,7 @@ import clsx from 'clsx'
 import LiveScreen from '@/components/live/LiveScreen'
 import ActivityList from '@/components/live/ActivityList'
 import TelegramChat from '@/components/live/TelegramChat'
+import { useChatView } from '@/hooks/useChatView'
 import SessionActions from '@/components/live/SessionActions'
 import { IntegrationBadge, StatusBadge, STATUS_DOT, STATUS_LABEL } from '@/components/live/meta'
 import { formatElapsed, useElapsed, useLiveFeed, useMediaQuery, useSessionControl, useStale, type StreamState } from '@/hooks/useLive'
@@ -266,8 +267,8 @@ export default function LiveSessionPage() {
     autoDone.current = false // a different session is a different explicit request
   }, [sid])
   const wantsClick = (location.state as { enableClick?: boolean } | null)?.enableClick === true
-  const [chatClick, setChatClick] = useState(wantsClick)
-  useEffect(() => setChatClick(wantsClick), [wantsClick, integration, key])
+  const chatView = useChatView(integration, key)
+  const chatClick = chatView.click
   useEffect(() => {
     if (!wantsClick || autoDone.current || !session || !canControl) return
     if (session.capabilities.manual_control && session.status !== 'stopped') {
@@ -338,7 +339,7 @@ export default function LiveSessionPage() {
     )
   ) : caps.chat ? (
     <div className="h-full w-full p-2 sm:p-3">
-      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} clickEnabled={chatClick} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
+      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
     </div>
   ) : (
     <div className="mx-auto h-full w-full max-w-2xl overflow-y-auto p-4">
@@ -414,7 +415,7 @@ export default function LiveSessionPage() {
           <main className="flex min-w-0 flex-1 flex-col">
             <div className="min-h-0 flex-1 bg-slate-950/95 p-2">{staleBanner}{screen}</div>
             <div className="border-t border-surface-300 bg-surface-100 px-4 py-3">
-              <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={() => setChatClick((v) => !v)} immersive={immersive} onToggleFullscreen={() => (immersive ? exitFullscreen() : enterFullscreen())} />
+              <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={chatView.toggleClick} immersive={immersive} onToggleFullscreen={() => (immersive ? exitFullscreen() : enterFullscreen())} />
             </div>
           </main>
           {drawer && (
@@ -439,7 +440,7 @@ export default function LiveSessionPage() {
         </div>
         <div className="min-h-0 flex-1 p-1">{staleBanner}{screen}</div>
         <div className="bg-black/60 px-3 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-2 text-white">
-          <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={() => setChatClick((v) => !v)} immersive onToggleFullscreen={exitFullscreen} dark />
+          <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={chatView.toggleClick} immersive onToggleFullscreen={exitFullscreen} dark />
         </div>
         {drawer && (
           <div className="absolute inset-x-0 bottom-0 z-10 max-h-[55dvh] overflow-y-auto rounded-t-2xl bg-surface-100 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] shadow-nav">
@@ -492,7 +493,7 @@ export default function LiveSessionPage() {
           </div>
         ) : caps.chat ? (
           <div className="h-[72vh] min-h-[420px]">
-            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} clickEnabled={chatClick} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
+            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
           </div>
         ) : (
           <div className="rounded-2xl bg-surface-200 p-3 text-sm text-slate-400">
@@ -500,7 +501,7 @@ export default function LiveSessionPage() {
           </div>
         )}
 
-        <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={() => setChatClick((v) => !v)} immersive={false} onToggleFullscreen={enterFullscreen} />
+        <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={chatView.toggleClick} immersive={false} onToggleFullscreen={enterFullscreen} />
 
         {session.profile && <InfoLink icon={<IntegrationBadge id={session.integration} size="sm" />} label="Browser Profile" value={session.profile.name} />}
         {session.url && <InfoLink icon={<Link2 className="h-4 w-4" />} label="Current URL" value={session.url} />}

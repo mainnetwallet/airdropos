@@ -8,11 +8,13 @@
  */
 
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Bot, Download, ExternalLink, FileText, Film, Globe, Loader2, Lock, Megaphone, Music, Play, Search, SendHorizontal, Users, X } from 'lucide-react'
 import clsx from 'clsx'
 import { fetchChatFile, fetchChatPreview, liveApi as api } from '@/services/api'
 import Modal from '@/components/live/Modal'
+import { useChatView } from '@/hooks/useChatView'
 import type { ChatButton, ChatDialog, ChatMediaInfo, ChatMessage, LiveSession } from '@/types/live'
 
 const AVATAR_COLORS = ['#e17076', '#7bc862', '#e5ca77', '#65aadd', '#a695e7', '#ee7aae', '#6ec9cb', '#faa774']
@@ -198,13 +200,15 @@ function MediaBlock({
         {showImage && info.size != null && <span className="text-[11px] text-slate-400">{info.name} · {fmtSize(info.size)}</span>}
       </div>
       {error && <p className="mt-1 text-xs text-red-300">{error}</p>}
-      {open && showImage && (
+      {open && showImage && createPortal(
+        // Portalled to <body>: a scaled card preview is CSS-transformed, which would otherwise trap fixed overlays inside it.
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/85 p-4" onMouseDown={() => setOpen(false)}>
           <button type="button" aria-label="Close" onClick={() => setOpen(false)} className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white hover:bg-white/20">
             <X className="h-5 w-5" />
           </button>
           <img src={src as string} alt={info.name} onMouseDown={(e) => e.stopPropagation()} className="max-h-[88vh] max-w-full rounded-lg object-contain" />
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   )
@@ -363,7 +367,6 @@ export default function TelegramChat({
   stopped,
   canWrite,
   onOpenSession,
-  clickEnabled = true,
   compact = false,
   active = true,
 }: {
@@ -372,15 +375,14 @@ export default function TelegramChat({
   stopped: boolean
   canWrite: boolean
   onOpenSession?: (session: LiveSession) => void
-  /** Click mode. While off, chats can be browsed but nothing is sent, pressed, opened or downloaded. */
-  clickEnabled?: boolean
   /** Card preview: the same two-pane UI as the full view (no chat open until one is picked), at a fixed wide layout the card scales down. */
   compact?: boolean
   /** Poll only while the view is on screen. */
   active?: boolean
 }) {
   const qc = useQueryClient()
-  const [peer, setPeer] = useState<string | null>(null)
+  // The open chat and click mode are shared with every other view of this session (card <-> full screen).
+  const { peer, setPeer, click: clickEnabled } = useChatView(integration, sessionKey)
   const [search, setSearch] = useState('')
   const [text, setText] = useState('')
   const [notice, setNotice] = useState<{ kind: 'info' | 'error'; text: string } | null>(null)
@@ -637,15 +639,17 @@ export default function TelegramChat({
           </>
         )}
       </section>
-      {mini && (
-        <MiniAppModal
-          buttonText={mini.b.text}
-          busy={openMini.isPending}
-          error={openMini.error instanceof Error ? openMini.error.message : null}
-          onClose={() => setMini(null)}
-          onOpen={(id) => openMini.mutate(id)}
-        />
-      )}
+      {mini &&
+        createPortal(
+          <MiniAppModal
+            buttonText={mini.b.text}
+            busy={openMini.isPending}
+            error={openMini.error instanceof Error ? openMini.error.message : null}
+            onClose={() => setMini(null)}
+            onOpen={(id) => openMini.mutate(id)}
+          />,
+          document.body,
+        )}
     </div>
   )
 }
