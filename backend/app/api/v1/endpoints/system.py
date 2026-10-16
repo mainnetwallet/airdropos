@@ -194,6 +194,12 @@ class ChatRequest(BaseModel):
     # of the stored history (the browser keeps just a text note), so a long conversation
     # does not re-upload them on every turn.
     images: List[str] = Field(default_factory=list, max_length=4)
+    # The console conversation this message belongs to (a UUID). When given, the server keeps
+    # the history itself and ignores any `history` the client sends, so a chat can only ever
+    # be answered from its own messages. Omitted: the original stateless behaviour.
+    conversation_id: Optional[str] = Field(default=None, max_length=64)
+    # Edit-and-resend / regenerate: keep only this many of the conversation's messages first.
+    keep_messages: Optional[int] = Field(default=None, ge=0)
 
     @field_validator("images")
     @classmethod
@@ -309,7 +315,8 @@ async def agent_chat(
     message = payload.message
     enforce_rate_limit(request, "chat")
 
-    history = _trim_history(payload.history)
+    conversation, history = await _open_chat_conversation(db, principal, payload)
+    await _record_chat_turn(db, conversation, "user", message)
     loop = ChatToolLoop(registry=registry, policy=registry.policy)
 
     async def create_task(spec: Dict[str, Any]):
@@ -332,8 +339,10 @@ async def agent_chat(
             },
         ) from exc
 
+    await _record_chat_turn(db, conversation, "assistant", turn.reply)
     return {
         **turn.to_dict(),
+        "conversation_id": str(conversation.id) if conversation is not None else None,
         "model_policy": "single_fixed_model",
         "note": "The configured fixed model is used for every AI operation. No fallback exists.",
     }
@@ -380,7 +389,6 @@ async def agent_chat_stream(
     message = payload.message
     enforce_rate_limit(request, "chat")
 
-    history = _trim_history(payload.history)
     loop = ChatToolLoop(registry=registry, policy=registry.policy)
 
     queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
@@ -391,6 +399,8 @@ async def agent_chat_stream(
             # The request-scoped session would be closed before a streamed body ends,
             # so the turn owns a session of its own, like tools do.
             async with session_scope() as db:
+                conversation, history = await _open_chat_conversation(db, principal, payload)
+                await _record_chat_turn(db, conversation, "user", message)
 
                 async def create_task(spec: Dict[str, Any]):
                     return await _persist_chat_task(
@@ -406,10 +416,12 @@ async def agent_chat_stream(
                     should_stop=lambda: client_gone,
                     images=payload.images,
                 )
+                await _record_chat_turn(db, conversation, "assistant", turn.reply)
             queue.put_nowait(
                 {
                     "type": "done",
                     **turn.to_dict(),
+                    "conversation_id": str(conversation.id) if conversation is not None else None,
                     "model_policy": "single_fixed_model",
                     "note": "The configured fixed model is used for every AI operation. No fallback exists.",
                 }
@@ -453,6 +465,51 @@ async def agent_chat_stream(
     return StreamingResponse(
         event_source(), media_type="text/event-stream", headers=_SSE_HEADERS
     )
+
+
+async def _open_chat_conversation(
+    db: AsyncSession, principal: Principal, payload: "ChatRequest"
+) -> tuple[Optional[Any], List["ChatTurn"]]:
+    """Resolve the conversation a message belongs to and the history the model may see.
+
+    Returns (None, client history) for the original stateless call. With a conversation id the
+    history comes only from that conversation's stored messages. An id the caller does not own
+    is reported as not found, exactly like one that does not exist. An id nobody has used yet
+    is created for the caller and seeded once from the history their browser already holds.
+    """
+    from backend.app.agent.chat_store import AgentChatStore, parse_conversation_id
+
+    if payload.conversation_id is None:
+        return None, _trim_history(payload.history)
+
+    parsed = parse_conversation_id(payload.conversation_id)
+    if parsed is None:
+        raise HTTPException(status_code=422, detail="conversation_id must be a UUID.")
+
+    chats = AgentChatStore(db)
+    conversation = await chats.get(parsed, principal.email)
+    if conversation is None:
+        if await chats.exists_for_anyone(parsed):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        conversation = await chats.create(principal.email, parsed)
+        for turn in _trim_history(payload.history):
+            await chats.append(conversation, turn.role, turn.content)
+    elif payload.keep_messages is not None:
+        await chats.truncate(conversation, payload.keep_messages)
+
+    stored = await chats.history_for_llm(conversation)
+    return conversation, _trim_history([ChatTurn(**t) for t in stored])
+
+
+async def _record_chat_turn(
+    db: AsyncSession, conversation: Optional[Any], role: str, content: str
+) -> None:
+    if conversation is None or not content.strip():
+        return
+    from backend.app.agent.chat_store import AgentChatStore
+
+    await AgentChatStore(db).append(conversation, role, content)
+    await db.commit()
 
 
 async def _persist_chat_task(

@@ -250,6 +250,8 @@ class ConversationService:
             select(AgentConversation).where(
                 AgentConversation.id == conversation_id,
                 AgentConversation.owner_email == owner_email,
+                # Console chats (AGENT_CHAT) are not inbox conversations.
+                AgentConversation.channel != "AGENT_CHAT",
             )
         )
 

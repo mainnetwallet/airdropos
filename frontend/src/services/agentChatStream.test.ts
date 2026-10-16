@@ -57,6 +57,21 @@ describe('api.agentChatStream', () => {
     expect((result as unknown as { type?: string }).type).toBeUndefined()
   })
 
+  it('sends the conversation id (and rewind count) so the server keeps each chat separate', async () => {
+    const fetchMock = vi.fn().mockImplementation(async () => sseResponse([frame(DONE)]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.agentChatStream('hi', [], () => {}, undefined, undefined, undefined, 'chat-A', 4)
+    await api.agentChatStream('hi', [], () => {})
+
+    const withId = JSON.parse(fetchMock.mock.calls[0][1].body)
+    expect(withId.conversation_id).toBe('chat-A')
+    expect(withId.keep_messages).toBe(4)
+    const without = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(without.conversation_id).toBeUndefined()
+    expect(without.keep_messages).toBeUndefined()
+  })
+
   it('rejects with the backend message when the stream reports an error', async () => {
     vi.stubGlobal(
       'fetch',

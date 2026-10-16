@@ -660,10 +660,13 @@ export default function AgentChat() {
       message,
       history,
       images,
+      rewind,
     }: {
       message: string
       history: Array<{ role: 'user' | 'assistant'; content: string }>
       images?: string[]
+      /** Edit/regenerate: the server keeps only this many stored messages first. */
+      rewind?: boolean
     }) => {
       // The turn streams: reply text and tool progress arrive live and are shown as a
       // preview. What is kept is the final result this resolves with, i.e. exactly what the
@@ -679,6 +682,9 @@ export default function AgentChat() {
           controller.signal,
           undefined,
           images,
+          // The server keeps this conversation's history itself, keyed by this id.
+          agentChatStore.getSnapshot().activeId,
+          rewind ? history.length : undefined,
         )
         .finally(() => agentChatStore.setAbort(null))
     },
@@ -769,7 +775,7 @@ export default function AgentChat() {
     if (!last || last.role !== 'agent' || !lastUser) return
     const history = historyBefore(true)
     agentChatStore.removeLast()
-    send.mutate({ message: lastUser.content, history })
+    send.mutate({ message: lastUser.content, history, rewind: true })
   }
 
   const addFiles = async (files: FileList | File[]) => {
@@ -811,7 +817,7 @@ export default function AgentChat() {
     agentChatStore.truncateFrom(messageId)
     agentChatStore.add({ role: 'user', content: text })
     setEditingId(null)
-    send.mutate({ message: text, history })
+    send.mutate({ message: text, history, rewind: true })
   }
 
   const resetComposer = () => {
@@ -839,6 +845,9 @@ export default function AgentChat() {
   const confirmDelete = () => {
     if (!toDelete) return
     agentChatStore.deleteConversation(toDelete.id)
+    // Also remove the server's copy (its messages only; tasks are never touched). A conversation
+    // that was never sent anywhere has none, so a 404 here is fine.
+    void api.deleteAgentConversation(toDelete.id).catch(() => undefined)
     setToDelete(null)
     resetComposer()
   }

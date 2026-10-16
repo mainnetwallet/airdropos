@@ -207,6 +207,8 @@ async function agentChatStream(
   signal?: AbortSignal,
   telegramAccount?: string,
   images?: string[],
+  conversationId?: string,
+  keepMessages?: number,
 ): Promise<AgentChatResponse> {
   const path = '/agent/chat/stream'
   const token = getToken()
@@ -223,6 +225,8 @@ async function agentChatStream(
       history,
       telegram_account: telegramAccount || undefined,
       images: images?.length ? images : undefined,
+      conversation_id: conversationId || undefined,
+      keep_messages: conversationId ? keepMessages : undefined,
     }),
   })
 
@@ -234,6 +238,8 @@ async function agentChatStream(
         history,
         telegram_account: telegramAccount || undefined,
         images: images?.length ? images : undefined,
+        conversation_id: conversationId || undefined,
+        keep_messages: conversationId ? keepMessages : undefined,
       }),
       signal,
     })
@@ -373,6 +379,8 @@ export const api = {
     history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
     telegramAccount?: string,
     images?: string[],
+    conversationId?: string,
+    keepMessages?: number,
   ) =>
     request<AgentChatResponse>('/agent/chat', {
       method: 'POST',
@@ -381,10 +389,18 @@ export const api = {
         history,
         telegram_account: telegramAccount || undefined,
         images: images?.length ? images : undefined,
+        conversation_id: conversationId || undefined,
+        keep_messages: conversationId ? keepMessages : undefined,
       }),
     }),
   /** Same turn as `agentChat`, with live progress. See `agentChatStream`. */
   agentChatStream,
+  /** Remove a console conversation (and only its messages) from the server. */
+  deleteAgentConversation: (conversationId: string) =>
+    request<{ id: string; deleted: boolean }>(
+      `/agent/conversations/${encodeURIComponent(conversationId)}`,
+      { method: 'DELETE' },
+    ),
 
   // --- Tasks ------------------------------------------------------------
   listTasks: (params?: { status?: string; limit?: number; offset?: number }) => {

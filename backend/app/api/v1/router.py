@@ -3,6 +3,7 @@
 from fastapi import APIRouter
 
 from backend.app.api.v1.endpoints import (
+    agent_conversations,
     auth,
     browser_profiles,
     campaigns,
@@ -21,6 +22,7 @@ api_router = APIRouter()
 api_router.include_router(auth.router)
 api_router.include_router(campaigns.router)
 api_router.include_router(system.router)
+api_router.include_router(agent_conversations.router)
 api_router.include_router(inbox.router)
 api_router.include_router(transactions.router)
 api_router.include_router(audit.router)
