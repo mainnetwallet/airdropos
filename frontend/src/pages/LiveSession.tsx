@@ -34,6 +34,8 @@ function ControlBar({
   immersive,
   onToggleFullscreen,
   dark = false,
+  chatClick = false,
+  onToggleChatClick,
 }: {
   session: LiveSession
   control: ControlApi
@@ -41,6 +43,8 @@ function ControlBar({
   immersive: boolean
   onToggleFullscreen: () => void
   dark?: boolean
+  chatClick?: boolean
+  onToggleChatClick?: () => void
 }) {
   const caps = session.capabilities
   const stopped = session.status === 'stopped'
@@ -82,6 +86,17 @@ function ControlBar({
             )}
           </>
         )}
+        {caps.chat && !stopped && onToggleChatClick && (
+          <button
+            type="button"
+            disabled={!canControl}
+            onClick={onToggleChatClick}
+            className={clsx(base, chatClick ? 'bg-accent text-white hover:bg-accent-hover' : 'bg-accent/15 text-accent hover:bg-accent/25')}
+          >
+            <MousePointerClick className="h-4 w-4" />
+            {chatClick ? 'Disable Click' : 'Enable Click'}
+          </button>
+        )}
         <SessionActions session={session} canControl={canControl} compact />
         <button type="button" onClick={onToggleFullscreen} className={clsx(base, idle, 'ml-auto')}>
           {immersive ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
@@ -103,6 +118,21 @@ function ControlBar({
             <span>Read-only login: view only.</span>
           ) : (
             <span>View-only. Taps on the screen do nothing until you press Enable Click.</span>
+          )}
+        </p>
+      )}
+      {caps.chat && !stopped && (
+        <p className={clsx('flex items-center gap-1.5 text-xs', dark ? 'text-white/80' : 'text-slate-400')}>
+          {!canControl ? (
+            <span>Read-only login: view only.</span>
+          ) : chatClick ? (
+            <>
+              <MousePointer2 className="h-3.5 w-3.5 text-accent" />
+              <span className="font-semibold text-accent">Click ON</span>
+              <span>· you can send messages, press buttons, open Mini Apps and download files.</span>
+            </>
+          ) : (
+            <span>View-only. You can browse chats, but nothing is sent or pressed until you press Enable Click.</span>
           )}
         </p>
       )}
@@ -236,6 +266,8 @@ export default function LiveSessionPage() {
     autoDone.current = false // a different session is a different explicit request
   }, [sid])
   const wantsClick = (location.state as { enableClick?: boolean } | null)?.enableClick === true
+  const [chatClick, setChatClick] = useState(wantsClick)
+  useEffect(() => setChatClick(wantsClick), [wantsClick, integration, key])
   useEffect(() => {
     if (!wantsClick || autoDone.current || !session || !canControl) return
     if (session.capabilities.manual_control && session.status !== 'stopped') {
@@ -306,7 +338,7 @@ export default function LiveSessionPage() {
     )
   ) : caps.chat ? (
     <div className="h-full w-full p-2 sm:p-3">
-      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
+      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} clickEnabled={chatClick} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
     </div>
   ) : (
     <div className="mx-auto h-full w-full max-w-2xl overflow-y-auto p-4">
@@ -382,7 +414,7 @@ export default function LiveSessionPage() {
           <main className="flex min-w-0 flex-1 flex-col">
             <div className="min-h-0 flex-1 bg-slate-950/95 p-2">{staleBanner}{screen}</div>
             <div className="border-t border-surface-300 bg-surface-100 px-4 py-3">
-              <ControlBar session={session} control={control} canControl={canControl} immersive={immersive} onToggleFullscreen={() => (immersive ? exitFullscreen() : enterFullscreen())} />
+              <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={() => setChatClick((v) => !v)} immersive={immersive} onToggleFullscreen={() => (immersive ? exitFullscreen() : enterFullscreen())} />
             </div>
           </main>
           {drawer && (
@@ -407,7 +439,7 @@ export default function LiveSessionPage() {
         </div>
         <div className="min-h-0 flex-1 p-1">{staleBanner}{screen}</div>
         <div className="bg-black/60 px-3 pb-[calc(0.5rem+env(safe-area-inset-bottom))] pt-2 text-white">
-          <ControlBar session={session} control={control} canControl={canControl} immersive onToggleFullscreen={exitFullscreen} dark />
+          <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={() => setChatClick((v) => !v)} immersive onToggleFullscreen={exitFullscreen} dark />
         </div>
         {drawer && (
           <div className="absolute inset-x-0 bottom-0 z-10 max-h-[55dvh] overflow-y-auto rounded-t-2xl bg-surface-100 p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] shadow-nav">
@@ -460,7 +492,7 @@ export default function LiveSessionPage() {
           </div>
         ) : caps.chat ? (
           <div className="h-[72vh] min-h-[420px]">
-            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
+            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} clickEnabled={chatClick} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
           </div>
         ) : (
           <div className="rounded-2xl bg-surface-200 p-3 text-sm text-slate-400">
@@ -468,7 +500,7 @@ export default function LiveSessionPage() {
           </div>
         )}
 
-        <ControlBar session={session} control={control} canControl={canControl} immersive={false} onToggleFullscreen={enterFullscreen} />
+        <ControlBar session={session} control={control} canControl={canControl} chatClick={chatClick} onToggleChatClick={() => setChatClick((v) => !v)} immersive={false} onToggleFullscreen={enterFullscreen} />
 
         {session.profile && <InfoLink icon={<IntegrationBadge id={session.integration} size="sm" />} label="Browser Profile" value={session.profile.name} />}
         {session.url && <InfoLink icon={<Link2 className="h-4 w-4" />} label="Current URL" value={session.url} />}

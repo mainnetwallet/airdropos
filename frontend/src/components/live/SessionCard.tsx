@@ -41,7 +41,6 @@ export default function SessionCard({
       ref={ref}
       className={clsx(
         'card flex flex-col gap-2.5 !p-3',
-        caps.chat && 'col-span-full',
         session.status === 'waiting_for_user' && 'ring-2 ring-amber-500/70',
         session.status === 'failed' && 'ring-1 ring-red-500/50',
       )}
@@ -92,15 +91,37 @@ export default function SessionCard({
           )}
         </div>
       ) : caps.chat ? (
-        // A message-based account has no screen, so its card IS the live chat view.
-        <div className="h-[480px]">
-          <TelegramChat
-            integration={session.integration}
-            sessionKey={session.key}
-            stopped={stopped}
-            canWrite={canControl}
-            onOpenSession={(sess) => onOpen(sess, false)}
+        // A message-based account has no screen, so its preview is the live chat list. It is view-only:
+        // tapping it opens the full view, and Enable Click turns interaction on there.
+        <div className="relative aspect-[16/10] w-full overflow-hidden rounded-lg">
+          {stopped ? (
+            <div className="flex h-full w-full items-center justify-center bg-slate-900/80 text-xs text-slate-400">
+              Session stopped
+            </div>
+          ) : (
+            <div className="pointer-events-none absolute inset-0">
+              <TelegramChat
+                integration={session.integration}
+                sessionKey={session.key}
+                stopped={stopped}
+                canWrite={false}
+                clickEnabled={false}
+                compact
+                active={inView}
+              />
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => onOpen(session, false)}
+            aria-label={`Open ${session.name} full screen`}
+            className="absolute inset-0 cursor-pointer"
           />
+          {!stopped && (
+            <span className="pointer-events-none absolute bottom-2 right-2 flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900/70 text-white backdrop-blur">
+              <Maximize2 className="h-4 w-4" />
+            </span>
+          )}
         </div>
       ) : (
         <div className={clsx('rounded-lg bg-surface-200 p-2.5', dense ? 'min-h-[88px]' : 'min-h-[120px]')}>
@@ -130,12 +151,12 @@ export default function SessionCard({
 
       {/* Controls: only what this integration really supports */}
       <div className="flex flex-wrap items-center gap-2">
-        {caps.manual_control && !stopped && (
+        {(caps.manual_control || caps.chat) && !stopped && (
           <button
             type="button"
             disabled={!canControl}
             onClick={() => onOpen(session, true)}
-            title="Opens the full-screen view with Screen Click Mode on, so clicks land accurately"
+            title={caps.chat ? 'Opens the full chat with clicking switched on' : 'Opens the full-screen view with Screen Click Mode on, so clicks land accurately'}
             className="inline-flex min-h-[36px] items-center justify-center gap-1.5 rounded-lg bg-accent/10 px-3 text-xs font-semibold text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <MousePointerClick className="h-3.5 w-3.5" /> {dense ? 'Click' : 'Enable Click'}

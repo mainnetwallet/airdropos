@@ -363,12 +363,21 @@ export default function TelegramChat({
   stopped,
   canWrite,
   onOpenSession,
+  clickEnabled = true,
+  compact = false,
+  active = true,
 }: {
   integration: string
   sessionKey: string
   stopped: boolean
   canWrite: boolean
   onOpenSession?: (session: LiveSession) => void
+  /** Click mode. While off, chats can be browsed but nothing is sent, pressed, opened or downloaded. */
+  clickEnabled?: boolean
+  /** Card preview: only the chat list, filling the space it is given. */
+  compact?: boolean
+  /** Poll only while the view is on screen. */
+  active?: boolean
 }) {
   const qc = useQueryClient()
   const [peer, setPeer] = useState<string | null>(null)
@@ -380,14 +389,14 @@ export default function TelegramChat({
   const dialogs = useQuery({
     queryKey: ['tg-dialogs', integration, sessionKey],
     queryFn: () => api.liveChatDialogs(integration, sessionKey),
-    enabled: !stopped,
+    enabled: !stopped && active,
     refetchInterval: 8000,
     retry: false,
   })
   const history = useQuery({
     queryKey: ['tg-history', integration, sessionKey, peer],
     queryFn: () => api.liveChatHistory(integration, sessionKey, peer as string),
-    enabled: !stopped && !!peer,
+    enabled: !stopped && active && !!peer,
     refetchInterval: 3000,
     placeholderData: (prev) => prev,
     retry: false,
@@ -448,7 +457,7 @@ export default function TelegramChat({
     return q ? all.filter((d) => `${d.title} ${d.username ?? ''}`.toLowerCase().includes(q)) : all
   }, [dialogs.data, search])
 
-  const readOnly = stopped || !canWrite
+  const readOnly = stopped || !canWrite || !clickEnabled
   const submit = () => {
     const t = text.trim()
     if (!t || readOnly || send.isPending || !peer) return
@@ -475,9 +484,12 @@ export default function TelegramChat({
   }
 
   return (
-    <div className="flex h-full min-h-[420px] overflow-hidden rounded-xl border border-white/5 bg-[#0e1621] text-slate-100">
+    <div className={clsx('flex h-full overflow-hidden rounded-xl border border-white/5 bg-[#0e1621] text-slate-100', !compact && 'min-h-[420px]')}>
       {/* ---------------------------------------------------------- chat list */}
-      <aside className={clsx('w-full shrink-0 flex-col border-r border-white/5 bg-[#17212b] md:flex md:w-72', peer ? 'hidden' : 'flex')}>
+      <aside className={clsx(
+          'shrink-0 flex-col border-r border-white/5 bg-[#17212b]',
+          compact ? 'flex w-full' : clsx('w-full md:flex md:w-72', peer ? 'hidden' : 'flex'),
+        )}>
         <div className="p-2">
           <div className="flex items-center gap-2 rounded-full bg-[#242f3d] px-3 py-2">
             <Search className="h-4 w-4 text-slate-400" />
@@ -536,7 +548,7 @@ export default function TelegramChat({
       </aside>
 
       {/* ---------------------------------------------------------- conversation */}
-      <section className={clsx('min-w-0 flex-1 flex-col md:flex', peer ? 'flex' : 'hidden')}>
+      <section className={clsx('min-w-0 flex-1 flex-col', compact ? 'hidden' : clsx('md:flex', peer ? 'flex' : 'hidden'))}>
         {!peer ? (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-slate-500">Select a chat to start</div>
         ) : (
@@ -589,7 +601,10 @@ export default function TelegramChat({
             <footer className="flex items-end gap-2 border-t border-white/5 bg-[#17212b] p-2">
               {readOnly ? (
                 <p className="flex flex-1 items-center gap-2 px-2 py-2 text-xs text-slate-500">
-                  <Lock className="h-3.5 w-3.5" /> This login is read-only, so messages cannot be sent.
+                  <Lock className="h-3.5 w-3.5" />
+                  {canWrite
+                    ? 'Click is off. Press Enable Click to send messages, press buttons or download files.'
+                    : 'This login is read-only, so messages cannot be sent.'}
                 </p>
               ) : (
                 <>
