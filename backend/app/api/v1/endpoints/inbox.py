@@ -18,8 +18,9 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from backend.app.database.session import get_db
 from backend.app.inbox.replies import ReplyRouter
@@ -102,11 +103,13 @@ async def list_conversations(
 
     tasks = await _tasks_by_pk(db, [c.task_id for c in rows if c.task_id is not None])
 
+    previews = await _latest_previews(db, [c.id for c in rows])
+
     items: List[Dict[str, Any]] = []
     for conversation in rows:
         task = tasks.get(conversation.task_id)
         view = service.conversation_view(conversation, task)
-        view["last_message_preview"] = await _latest_preview(db, conversation)
+        view["last_message_preview"] = previews.get(conversation.id)
         items.append(view)
 
     if search:
@@ -324,21 +327,47 @@ async def _tasks_by_pk(db: AsyncSession, pks: List[Any]) -> Dict[Any, Task]:
     pks = [pk for pk in pks if pk is not None]
     if not pks:
         return {}
-    rows = (await db.execute(select(Task).where(Task.id.in_(pks)))).scalars().all()
+    # Callers only read id, task_id, title, status and progress (conversation_view and the
+    # summary counts), so the large JSONB columns are not loaded.
+    rows = (
+        await db.execute(
+            select(Task)
+            .options(load_only(Task.task_id, Task.title, Task.status, Task.progress))
+            .where(Task.id.in_(pks))
+        )
+    ).scalars().all()
     return {t.id: t for t in rows}
 
 
-async def _latest_preview(db: AsyncSession, conversation: AgentConversation) -> Optional[str]:
-    """One line of the most recent message. Read from the stored message, never invented."""
+async def _latest_previews(db: AsyncSession, conversation_ids: List[Any]) -> Dict[Any, Optional[str]]:
+    """One-line previews of the newest message for many conversations in a single query."""
+    ids = [cid for cid in conversation_ids if cid is not None]
+    if not ids:
+        return {}
     from backend.app.models import ConversationMessage
 
-    latest = await db.scalar(
-        select(ConversationMessage)
-        .where(ConversationMessage.conversation_id == conversation.id)
-        .order_by(ConversationMessage.seq.desc())
-        .limit(1)
+    newest = (
+        select(
+            ConversationMessage.conversation_id.label("cid"),
+            func.max(ConversationMessage.seq).label("max_seq"),
+        )
+        .where(ConversationMessage.conversation_id.in_(ids))
+        .group_by(ConversationMessage.conversation_id)
+        .subquery()
     )
-    if latest is None:
-        return None
-    text = " ".join((latest.content or "").split())
-    return text[:160] if text else None
+    rows = (
+        await db.execute(
+            select(ConversationMessage.conversation_id, ConversationMessage.content).join(
+                newest,
+                and_(
+                    ConversationMessage.conversation_id == newest.c.cid,
+                    ConversationMessage.seq == newest.c.max_seq,
+                ),
+            )
+        )
+    ).all()
+    previews: Dict[Any, Optional[str]] = {}
+    for conversation_id, content in rows:
+        text = " ".join((content or "").split())
+        previews[conversation_id] = text[:160] if text else None
+    return previews

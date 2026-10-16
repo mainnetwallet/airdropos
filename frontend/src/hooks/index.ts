@@ -15,7 +15,11 @@ import type { WsEvent } from '@/types'
  * in this tab, so mounting several of these does not open several connections.
  * This hook only keeps the caller's own view of the stream.
  */
-export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
+export function useLiveEvents(
+  onEvent?: (event: WsEvent) => void,
+  options: { keepEvents?: boolean } = {},
+) {
+  const keepEvents = options.keepEvents === true
   const [connected, setConnected] = useState(isLiveConnected())
   const [events, setEvents] = useState<WsEvent[]>([])
   const handlerRef = useRef(onEvent)
@@ -23,7 +27,9 @@ export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
 
   useEffect(() => {
     const releaseEvents = subscribeLiveEvents((event) => {
-      setEvents((prev) => [...prev.slice(-99), event])
+      // Buffering is opt-in: a state update here re-renders the caller on EVERY frame,
+      // which for the dashboard shell and the Inbox page meant a full re-render per event.
+      if (keepEvents) setEvents((prev) => [...prev.slice(-99), event])
       handlerRef.current?.(event)
     })
     const releaseStatus = subscribeConnectionStatus(setConnected)
@@ -33,7 +39,17 @@ export function useLiveEvents(onEvent?: (event: WsEvent) => void) {
       releaseEvents()
       releaseStatus()
     }
-  }, [])
+  }, [keepEvents])
 
   return { connected, events, latest: events[events.length - 1] }
+}
+
+const noopHandler = () => undefined
+
+/**
+ * Connection state only. Keeps the shared socket open (a subscriber is required for that)
+ * but never re-renders on an incoming event, only when the connection goes up or down.
+ */
+export function useLiveConnection(): boolean {
+  return useLiveEvents(noopHandler).connected
 }

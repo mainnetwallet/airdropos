@@ -786,6 +786,41 @@ function TaskDetailsPanel({
 // ======================================================================
 // Page
 // ======================================================================
+/** How long a burst of live events is batched before the Inbox queries are refetched. */
+const INVALIDATE_COALESCE_MS = 800
+
+/**
+ * Batch query invalidations. A running task can push many `live.event` / `agent.inbox`
+ * frames per second; refetching the conversation list, the summary and the open
+ * conversation on every one of them hammers the API. Keys are de-duplicated and flushed
+ * together once per window, so a burst costs one refetch per key.
+ */
+function useCoalescedInvalidate(queryClient: ReturnType<typeof useQueryClient>, delayMs = INVALIDATE_COALESCE_MS) {
+  const pending = useRef<Map<string, readonly unknown[]>>(new Map())
+  const timer = useRef<number | null>(null)
+
+  useEffect(
+    () => () => {
+      if (timer.current !== null) window.clearTimeout(timer.current)
+    },
+    [],
+  )
+
+  return useCallback(
+    (queryKey: readonly unknown[]) => {
+      pending.current.set(JSON.stringify(queryKey), queryKey)
+      if (timer.current !== null) return
+      timer.current = window.setTimeout(() => {
+        timer.current = null
+        const keys = [...pending.current.values()]
+        pending.current.clear()
+        for (const key of keys) void queryClient.invalidateQueries({ queryKey: key })
+      }, delayMs)
+    },
+    [queryClient, delayMs],
+  )
+}
+
 export default function AgentInbox() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
@@ -814,6 +849,8 @@ export default function AgentInbox() {
     markSeen(selectedId, new Date().toISOString())
   }, [selectedId, detailQuery.data?.messages.length])
 
+  const invalidateSoon = useCoalescedInvalidate(queryClient)
+
   const onWsEvent = useCallback(
     (event: WsEvent) => {
       // The backend publishes a typed event from the API process and relays the worker's
@@ -823,8 +860,8 @@ export default function AgentInbox() {
         event.type === 'agent.inbox' ||
         (event.type === 'live.event' && (event.payload as { integration?: string })?.integration === 'agent')
       if (!isInbox) return
-      void queryClient.invalidateQueries({ queryKey: ['agent-inbox'] })
-      void queryClient.invalidateQueries({ queryKey: ['inbox-summary'] })
+      invalidateSoon(['agent-inbox'])
+      invalidateSoon(['inbox-summary'])
       const payload = event.payload as { event?: string; conversation_id?: string }
       if (payload.conversation_id && payload.conversation_id !== selectedId) return
       if (event.type === 'live.event') return
@@ -845,14 +882,14 @@ export default function AgentInbox() {
         case 'task.completed':
         case 'task.failed':
         case 'task.cancelled':
-          if (selectedId) void queryClient.invalidateQueries({ queryKey: ['agent-inbox-conversation', selectedId] })
-          if (detailQuery.data?.task_id) void queryClient.invalidateQueries({ queryKey: ['task', detailQuery.data.task_id] })
+          if (selectedId) invalidateSoon(['agent-inbox-conversation', selectedId])
+          if (detailQuery.data?.task_id) invalidateSoon(['task', detailQuery.data.task_id])
           break
         default:
-          if (selectedId) void queryClient.invalidateQueries({ queryKey: ['agent-inbox-conversation', selectedId] })
+          if (selectedId) invalidateSoon(['agent-inbox-conversation', selectedId])
       }
     },
-    [queryClient, selectedId, detailQuery.data?.task_id],
+    [invalidateSoon, selectedId, detailQuery.data?.task_id],
   )
 
   const { connected } = useLiveEvents(onWsEvent)

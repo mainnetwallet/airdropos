@@ -9,14 +9,14 @@ import { Suspense, useCallback, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { LogOut, ShieldAlert } from 'lucide-react'
 import clsx from 'clsx'
-import { useLiveEvents } from '@/hooks'
+import { useLiveConnection } from '@/hooks'
 import { useQuery } from '@tanstack/react-query'
 import { api, getEmail, UNAUTHORIZED_EVENT } from '@/services/api'
 import { NAV_SECTIONS } from '@/layouts/navigation'
 import { BottomNav, MobileDrawer, MobileHeader, useKeyboardOpen } from '@/components/mobile/MobileChrome'
 
 export default function DashboardLayout() {
-  const { connected } = useLiveEvents()
+  const connected = useLiveConnection()
   const { pathname } = useLocation()
   const [menuOpen, setMenuOpen] = useState(false)
   const closeMenu = useCallback(() => setMenuOpen(false), [])

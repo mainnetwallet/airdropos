@@ -15,6 +15,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from backend.app.browser.controller import controller as browser_controller
 from backend.app.core.config import settings
@@ -652,7 +653,30 @@ async def list_tasks(
     principal: Principal = Depends(require_read),
 ) -> Dict[str, Any]:
     enforce_rate_limit(request, "read")
-    stmt = select(Task).order_by(Task.created_at.desc()).limit(limit).offset(offset)
+    # The list only shows summary columns. Without load_only every row also pulled the JSONB
+    # columns (planned/completed/failed actions, error_details, operator_instructions, ...),
+    # which can be large and are never serialised here.
+    stmt = (
+        select(Task)
+        .options(
+            load_only(
+                Task.task_id,
+                Task.title,
+                Task.status,
+                Task.priority,
+                Task.progress,
+                Task.network,
+                Task.telegram_account,
+                Task.retry_count,
+                Task.created_at,
+                Task.updated_at,
+                Task.next_execution_at,
+            )
+        )
+        .order_by(Task.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
     if status_filter:
         stmt = stmt.where(Task.status == status_filter.upper())
     tasks = list((await db.execute(stmt)).scalars().all())
