@@ -374,7 +374,7 @@ export default function TelegramChat({
   onOpenSession?: (session: LiveSession) => void
   /** Click mode. While off, chats can be browsed but nothing is sent, pressed, opened or downloaded. */
   clickEnabled?: boolean
-  /** Card preview: only the chat list, filling the space it is given. */
+  /** Card preview: the whole two-pane UI at a fixed wide layout (the card scales it down) with the latest chat open. */
   compact?: boolean
   /** Poll only while the view is on screen. */
   active?: boolean
@@ -397,7 +397,7 @@ export default function TelegramChat({
     queryKey: ['tg-history', integration, sessionKey, peer],
     queryFn: () => api.liveChatHistory(integration, sessionKey, peer as string),
     enabled: !stopped && active && !!peer,
-    refetchInterval: 3000,
+    refetchInterval: compact ? 8000 : 3000,
     placeholderData: (prev) => prev,
     retry: false,
   })
@@ -457,6 +457,10 @@ export default function TelegramChat({
     return q ? all.filter((d) => `${d.title} ${d.username ?? ''}`.toLowerCase().includes(q)) : all
   }, [dialogs.data, search])
 
+  useEffect(() => {
+    if (compact && !peer && list.length) setPeer(list[0].peer)
+  }, [compact, peer, list])
+
   const readOnly = stopped || !canWrite || !clickEnabled
   const submit = () => {
     const t = text.trim()
@@ -488,7 +492,7 @@ export default function TelegramChat({
       {/* ---------------------------------------------------------- chat list */}
       <aside className={clsx(
           'shrink-0 flex-col border-r border-white/5 bg-[#17212b]',
-          compact ? 'flex w-full' : clsx('w-full md:flex md:w-72', peer ? 'hidden' : 'flex'),
+          compact ? 'flex w-72' : clsx('w-full md:flex md:w-72', peer ? 'hidden' : 'flex'),
         )}>
         <div className="p-2">
           <div className="flex items-center gap-2 rounded-full bg-[#242f3d] px-3 py-2">
@@ -548,7 +552,7 @@ export default function TelegramChat({
       </aside>
 
       {/* ---------------------------------------------------------- conversation */}
-      <section className={clsx('min-w-0 flex-1 flex-col', compact ? 'hidden' : clsx('md:flex', peer ? 'flex' : 'hidden'))}>
+      <section className={clsx('min-w-0 flex-1 flex-col', compact ? 'flex' : clsx('md:flex', peer ? 'flex' : 'hidden'))}>
         {!peer ? (
           <div className="flex h-full items-center justify-center p-6 text-center text-sm text-slate-500">Select a chat to start</div>
         ) : (

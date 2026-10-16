@@ -1,6 +1,6 @@
 /** One card per real running session (browser, Telegram, future integrations). */
 
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Clock, Maximize2, MousePointerClick, User } from 'lucide-react'
 import clsx from 'clsx'
 import LiveScreen from '@/components/live/LiveScreen'
@@ -11,6 +11,32 @@ import { IntegrationBadge, StatusBadge } from '@/components/live/meta'
 import { formatElapsed, useElapsed, useInView } from '@/hooks/useLive'
 import type { LiveEvent, LiveSession } from '@/types/live'
 import type { StreamState } from '@/hooks/useLive'
+
+/** Draws children at a fixed design size and scales the whole thing down to the card's width. */
+function ScaledPreview({ width, height, children }: { width: number; height: number; children: ReactNode }) {
+  const box = useRef<HTMLDivElement>(null)
+  const [scale, setScale] = useState(0.5)
+  useEffect(() => {
+    const el = box.current
+    if (!el) return
+    const fit = () => setScale(Math.max(0.1, el.clientWidth / width))
+    fit()
+    const ro = new ResizeObserver(fit)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [width])
+  return (
+    <div ref={box} className="relative w-full overflow-hidden rounded-lg" style={{ height: height * scale }}>
+      <div
+        className="pointer-events-none absolute left-0 top-0 select-none"
+        style={{ width, height, transform: `scale(${scale})`, transformOrigin: 'top left' }}
+        aria-hidden
+      >
+        {children}
+      </div>
+    </div>
+  )
+}
 
 export default function SessionCard({
   session,
@@ -91,36 +117,35 @@ export default function SessionCard({
           )}
         </div>
       ) : caps.chat ? (
-        // A message-based account has no screen, so its preview is the live chat list. It is view-only:
-        // tapping it opens the full view, and Enable Click turns interaction on there.
-        <div className="relative aspect-[16/10] w-full overflow-hidden rounded-lg">
+        // A message-based account has no screen, so its preview is the whole chat UI drawn small. It is
+        // view-only and only the Maximize button opens the full view (Enable Click turns interaction on there).
+        <div className="relative">
           {stopped ? (
-            <div className="flex h-full w-full items-center justify-center bg-slate-900/80 text-xs text-slate-400">
+            <div className="flex aspect-[16/10] w-full items-center justify-center rounded-lg bg-slate-900/80 text-xs text-slate-400">
               Session stopped
             </div>
           ) : (
-            <div className="pointer-events-none absolute inset-0">
+            <ScaledPreview width={720} height={450}>
               <TelegramChat
                 integration={session.integration}
                 sessionKey={session.key}
                 stopped={stopped}
-                canWrite={false}
+                canWrite
                 clickEnabled={false}
                 compact
                 active={inView}
               />
-            </div>
+            </ScaledPreview>
           )}
-          <button
-            type="button"
-            onClick={() => onOpen(session, false)}
-            aria-label={`Open ${session.name} full screen`}
-            className="absolute inset-0 cursor-pointer"
-          />
           {!stopped && (
-            <span className="pointer-events-none absolute bottom-2 right-2 flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900/70 text-white backdrop-blur">
+            <button
+              type="button"
+              onClick={() => onOpen(session, false)}
+              aria-label={`Open ${session.name} full screen`}
+              className="absolute bottom-2 right-2 flex h-10 w-10 items-center justify-center rounded-lg bg-slate-900/70 text-white backdrop-blur hover:bg-slate-900/90"
+            >
               <Maximize2 className="h-4 w-4" />
-            </span>
+            </button>
           )}
         </div>
       ) : (
