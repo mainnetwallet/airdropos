@@ -332,6 +332,7 @@ class ChatBody(BaseModel):
     message_id: Optional[int] = Field(default=None, ge=1)
     row: Optional[int] = Field(default=None, ge=0, le=50)
     col: Optional[int] = Field(default=None, ge=0, le=50)
+    profile_id: Optional[str] = Field(default=None, min_length=1, max_length=64)  # miniapp: browser profile
 
 
 async def _chat(integration: str, key: str, op: str, body: ChatBody, principal: Principal) -> Dict[str, Any]:
@@ -362,6 +363,7 @@ async def chat_send(
     result = await _chat(integration, key, "send", body, principal)
     await write_audit(db, principal, "LIVE_CHAT_SEND", "live_session", f"{integration}:{key}",
                       after_state={"chars": len(body.text or "")})
+    await db.commit()
     return result
 
 
@@ -373,6 +375,7 @@ async def chat_click(
     result = await _chat(integration, key, "click", body, principal)
     await write_audit(db, principal, "LIVE_CHAT_CLICK", "live_session", f"{integration}:{key}",
                       after_state={"message_id": body.message_id})
+    await db.commit()
     return result
 
 
@@ -380,3 +383,55 @@ async def chat_click(
 async def telegram_accounts(principal: Principal = Depends(require_read)) -> Dict[str, Any]:
     """Logged-in Telegram accounts that can be opened in Live Broadcast."""
     return await _gateway(client.get_json("/telegram/accounts"))
+
+
+@router.post("/sessions/{integration}/{key}/chat/miniapp")
+async def chat_miniapp(
+    integration: str, key: str, body: ChatBody, request: Request,
+    db: AsyncSession = Depends(get_db), principal: Principal = Depends(require_task_write),
+) -> Dict[str, Any]:
+    """Open a Mini App button in a browser session. The signed launch link never leaves the worker."""
+    enforce_rate_limit(request, "write")
+    if emergency_stop.is_stopped:
+        raise HTTPException(status_code=409, detail={"error": "Emergency stop is active. Release it before opening a browser."})
+    result = await _chat(integration, key, "miniapp", body, principal)
+    await write_audit(db, principal, "LIVE_CHAT_MINIAPP", "live_session", f"{integration}:{key}",
+                      after_state={"message_id": body.message_id, "profile_id": body.profile_id})
+    await db.commit()
+    return result
+
+
+async def _media(integration: str, key: str, peer: str, message_id: int, variant: str) -> Response:
+    _check_ref(integration, key)
+    if not re.match(r"^-?\d{1,20}$", peer):
+        raise HTTPException(status_code=400, detail="Invalid chat reference.")
+    resp = await _gateway(client.request(
+        "GET", f"/sessions/{integration}/{key}/chat/media",
+        params={"peer": peer, "message_id": message_id, "variant": variant},
+    ))
+    headers = {k: v for k, v in resp.headers.items() if k.lower() in ("content-disposition", "x-content-type-options")}
+    headers["Cache-Control"] = "private, max-age=3600"
+    return Response(content=resp.content, media_type=resp.headers.get("content-type", "application/octet-stream"), headers=headers)
+
+
+@router.get("/sessions/{integration}/{key}/chat/media")
+async def chat_media(
+    integration: str, key: str, peer: str = Query(...), message_id: int = Query(..., ge=1),
+    principal: Principal = Depends(require_read),
+) -> Response:
+    """A small, safe image preview (jpeg/png/webp/gif only) of a message's attachment."""
+    return await _media(integration, key, peer, message_id, "preview")
+
+
+@router.get("/sessions/{integration}/{key}/chat/download")
+async def chat_download(
+    integration: str, key: str, request: Request, peer: str = Query(...), message_id: int = Query(..., ge=1),
+    db: AsyncSession = Depends(get_db), principal: Principal = Depends(require_task_write),
+) -> Response:
+    """The original attachment, always as an opaque download (never rendered by the dashboard)."""
+    enforce_rate_limit(request, "write")
+    out = await _media(integration, key, peer, message_id, "file")
+    await write_audit(db, principal, "LIVE_CHAT_DOWNLOAD", "live_session", f"{integration}:{key}",
+                      after_state={"message_id": message_id})
+    await db.commit()
+    return out

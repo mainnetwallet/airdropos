@@ -231,10 +231,25 @@ def build_app() -> FastAPI:
         except Exception as exc:
             raise _guard(exc)
 
+    @app.get("/sessions/{integration}/{key}/chat/media", dependencies=deps)
+    async def chat_media(integration: str, key: str, peer: str, message_id: int, variant: str = "preview") -> Response:
+        try:
+            data, mime, name = await _provider(integration).media(
+                key, {"peer": peer, "message_id": message_id, "variant": variant}
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+        headers = {"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"}
+        if variant == "file":
+            headers["Content-Disposition"] = f"attachment; filename=\"{name}\""
+        return Response(content=data, media_type=mime, headers=headers)
+
     @app.post("/sessions/{integration}/{key}/chat/{op}", dependencies=deps)
     async def chat(integration: str, key: str, op: str, request: Request) -> Dict[str, Any]:
-        if op in ("send", "click"):
-            _refuse_while_stopped("send from a chat session")
+        if op in ("send", "click", "miniapp"):
+            _refuse_while_stopped("act from a chat session")
         body = await _json_body(request)
         try:
             return await _provider(integration).chat(key, op, body)

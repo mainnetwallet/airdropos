@@ -542,6 +542,36 @@ export interface FetchedFrame {
  * One frame of a session. Fetched with the Authorization header (never a token in the
  * URL) and turned into a blob by the caller.
  */
+/** An attachment fetched with the login token (an <img> tag cannot send it). */
+async function fetchChatBlob(path: string): Promise<Blob> {
+  const token = getToken()
+  const response = await fetch(`${API_BASE}${path}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!response.ok) {
+    if (response.status === 401) {
+      clearSession()
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT))
+    }
+    let message = `Request failed with ${response.status}`
+    try {
+      const body = await response.json()
+      const d = body?.detail
+      message = (typeof d === 'string' ? d : d?.error ?? d?.message) || message
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(message, response.status)
+  }
+  return response.blob()
+}
+
+export const fetchChatPreview = (integration: string, key: string, peer: string, messageId: number) =>
+  fetchChatBlob(`${ref(integration, key)}/chat/media?peer=${encodeURIComponent(peer)}&message_id=${messageId}`)
+
+export const fetchChatFile = (integration: string, key: string, peer: string, messageId: number) =>
+  fetchChatBlob(`${ref(integration, key)}/chat/download?peer=${encodeURIComponent(peer)}&message_id=${messageId}`)
+
 export async function fetchFrame(
   integration: string,
   key: string,
@@ -628,6 +658,11 @@ Object.assign(api, {
     request<{ session: LiveSession }>('/live/sessions', {
       method: 'POST',
       body: JSON.stringify({ integration: 'telegram', account }),
+    }),
+  liveChatMiniApp: (integration: string, key: string, peer: string, messageId: number, row: number, col: number, profileId: string) =>
+    request<{ session: LiveSession }>(`${ref(integration, key)}/chat/miniapp`, {
+      method: 'POST',
+      body: JSON.stringify({ peer, message_id: messageId, row, col, profile_id: profileId }),
     }),
   liveChatDialogs: (integration: string, key: string, search?: string) =>
     request<{ dialogs: ChatDialog[] }>(`${ref(integration, key)}/chat/dialogs`, {
@@ -726,6 +761,7 @@ export type LiveApi = {
   liveInput: (i: string, k: string, token: string, seq: number, e: InputEvent) => Promise<Record<string, unknown>>
   liveTelegramAccounts: () => Promise<{ accounts: LiveTelegramAccount[] }>
   liveOpenTelegram: (account: string) => Promise<{ session: LiveSession }>
+  liveChatMiniApp: (i: string, k: string, peer: string, messageId: number, row: number, col: number, profileId: string) => Promise<{ session: LiveSession }>
   liveChatDialogs: (i: string, k: string, search?: string) => Promise<{ dialogs: ChatDialog[] }>
   liveChatHistory: (i: string, k: string, peer: string) => Promise<ChatHistory>
   liveChatSend: (i: string, k: string, peer: string, text: string, replyTo?: number) => Promise<{ sent_id: number }>

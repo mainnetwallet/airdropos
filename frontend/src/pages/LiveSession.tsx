@@ -306,7 +306,7 @@ export default function LiveSessionPage() {
     )
   ) : caps.chat ? (
     <div className="h-full w-full p-2 sm:p-3">
-      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} />
+      <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
     </div>
   ) : (
     <div className="mx-auto h-full w-full max-w-2xl overflow-y-auto p-4">
@@ -460,7 +460,7 @@ export default function LiveSessionPage() {
           </div>
         ) : caps.chat ? (
           <div className="h-[72vh] min-h-[420px]">
-            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} />
+            <TelegramChat integration={integration} sessionKey={key} stopped={stopped} canWrite={canControl} onOpenSession={(sess) => navigate(`/live/${encodeURIComponent(sess.integration)}/${encodeURIComponent(sess.key)}`)} />
           </div>
         ) : (
           <div className="rounded-2xl bg-surface-200 p-3 text-sm text-slate-400">

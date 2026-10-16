@@ -247,6 +247,31 @@ class BrowserProvider(SessionProvider):
             await self._start(key, profile, url)
         return await self.get_session(key)
 
+    async def open_url(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Open ``url`` in a profile's browser: start the session, or reuse it if it is already running."""
+        try:
+            return await self.create(payload)
+        except Conflict as exc:
+            if exc.code != "already_running":
+                raise
+        profile_id = str(payload.get("profile_id") or "")
+        profile = profile_store.get_profile(profile_id) if profile_store.valid_profile_id(profile_id) else None
+        if profile is None:
+            raise Conflict("Choose an existing browser profile.", "no_profile")
+        key = normalize_session_key(profile.id)
+        url = str(payload.get("url") or "").strip()
+        async with self._create_locks.setdefault(key, asyncio.Lock()):
+            result = await controller.navigate(key, url)
+            if not result.get("ok"):
+                raise Conflict(
+                    f"Could not open the URL ({result.get('reason', 'error')}): {result.get('detail', '')}",
+                    "navigation_failed",
+                )
+            obs = result["observation"]
+            if obs.requires_human:
+                hub.browser_sessions.mark_waiting(key, obs.human_reason or "Human interaction required.")
+        return await self.get_session(key)
+
     async def _start(self, key: str, profile, url: str) -> None:
         """Bring the browser up for a profile and navigate it if a URL was given.
 

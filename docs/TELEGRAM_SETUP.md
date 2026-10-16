@@ -428,3 +428,19 @@ time (they share one lock), and **Stop** still disconnects the account.
   account. Opening an account that is already open just returns it. Accounts come from
   `python scripts/telegram_login.py`; an account without a saved login is not listed.
 - A card also appears on its own when the agent first uses an account.
+
+### Photos, files and Mini Apps in the chat view
+
+- **Photos, stickers, GIFs and videos** show a small preview (an image of at most ~1280 px; for a
+  video, its cover frame). Click it to enlarge. Only jpeg/png/webp/gif are ever shown inline, and
+  that is decided from the file's bytes. Videos are not played; download them instead.
+- **Download** saves the original file. It needs the same permission as sending, is limited to
+  15 MB (larger files must be opened in Telegram), is always served as an opaque download (never
+  rendered by the dashboard), and is written to the audit log.
+- **Mini App buttons** show a globe icon. Clicking one asks which browser profile to use, then
+  asks Telegram, as the signed-in account, for the launch link (what the official Telegram app does)
+  and opens it in that profile's browser session, which you can watch and click in Live Broadcast.
+  The link carries Telegram's signed login data for the account, so it goes straight from the
+  worker to the browser: it is never sent to the dashboard, logged, or shown in errors (errors and
+  session cards show the address without its query/fragment). Only open Mini Apps you trust. The
+  bot's menu-button Mini App (the "Open" button beside the message box) is not supported yet.

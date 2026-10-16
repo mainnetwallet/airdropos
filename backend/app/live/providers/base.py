@@ -55,3 +55,6 @@ class SessionProvider:
 
     async def chat(self, key: str, op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         raise NotSupported(f"{self.label} sessions have no chat view.")
+
+    async def media(self, key: str, query: Dict[str, Any]):
+        raise NotSupported(f"{self.label} sessions have no attachments.")

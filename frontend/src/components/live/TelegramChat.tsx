@@ -9,10 +9,11 @@
 
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Bot, ExternalLink, Loader2, Lock, Megaphone, Search, SendHorizontal, Users } from 'lucide-react'
+import { ArrowLeft, Bot, Download, ExternalLink, FileText, Film, Globe, Loader2, Lock, Megaphone, Music, Play, Search, SendHorizontal, Users, X } from 'lucide-react'
 import clsx from 'clsx'
-import { liveApi as api } from '@/services/api'
-import type { ChatButton, ChatDialog, ChatMessage } from '@/types/live'
+import { fetchChatFile, fetchChatPreview, liveApi as api } from '@/services/api'
+import Modal from '@/components/live/Modal'
+import type { ChatButton, ChatDialog, ChatMediaInfo, ChatMessage, LiveSession } from '@/types/live'
 
 const AVATAR_COLORS = ['#e17076', '#7bc862', '#e5ca77', '#65aadd', '#a695e7', '#ee7aae', '#6ec9cb', '#faa774']
 
@@ -72,16 +73,204 @@ function DialogKindIcon({ kind }: { kind: string | null }) {
   return null
 }
 
+function fmtSize(n: number | null): string {
+  if (n == null) return ''
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+function saveBlob(blob: Blob, name: string) {
+  // A download, never a navigation: the file is saved, not rendered inside the dashboard.
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+function useBlobUrl(blob: Blob | undefined): string | null {
+  const [url, setUrl] = useState<string | null>(null)
+  useEffect(() => {
+    if (!blob) {
+      setUrl(null)
+      return
+    }
+    const u = URL.createObjectURL(blob)
+    setUrl(u)
+    return () => URL.revokeObjectURL(u)
+  }, [blob])
+  return url
+}
+
+function KindIcon({ kind }: { kind: ChatMediaInfo['kind'] }) {
+  if (kind === 'video' || kind === 'gif') return <Film className="h-5 w-5" />
+  if (kind === 'audio' || kind === 'voice') return <Music className="h-5 w-5" />
+  return <FileText className="h-5 w-5" />
+}
+
+function MediaBlock({
+  info,
+  messageId,
+  integration,
+  sessionKey,
+  peer,
+  canWrite,
+}: {
+  info: ChatMediaInfo
+  messageId: number
+  integration: string
+  sessionKey: string
+  peer: string
+  canWrite: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const preview = useQuery({
+    queryKey: ['tg-media', integration, sessionKey, peer, messageId],
+    queryFn: () => fetchChatPreview(integration, sessionKey, peer, messageId),
+    enabled: info.preview,
+    staleTime: Infinity,
+    gcTime: 10 * 60_000,
+    retry: false,
+  })
+  const src = useBlobUrl(preview.data)
+  const download = useMutation({
+    mutationFn: () => fetchChatFile(integration, sessionKey, peer, messageId),
+    onSuccess: (blob) => {
+      setError(null)
+      saveBlob(blob, info.name)
+    },
+    onError: (e) => setError(e instanceof Error ? e.message : 'Download failed.'),
+  })
+  const canDownload = canWrite && info.downloadable && info.kind !== 'voice'
+  const downloadBtn = (
+    <button
+      type="button"
+      disabled={!canDownload || download.isPending}
+      onClick={() => download.mutate()}
+      title={!canWrite ? 'Downloading needs control permission' : !info.downloadable ? 'Too large to download here' : 'Download'}
+      className="flex items-center gap-1 rounded-full bg-black/30 px-2.5 py-1 text-xs font-medium text-white hover:bg-black/50 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {download.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+      Download
+    </button>
+  )
+
+  const showImage = info.preview && !!src
+  const stillLoading = info.preview && preview.isLoading
+  return (
+    <div className="mb-1">
+      {showImage ? (
+        <button type="button" onClick={() => setOpen(true)} className="relative block overflow-hidden rounded-lg" aria-label={`Open ${info.name}`}>
+          <img src={src as string} alt={info.name} className="max-h-64 w-full max-w-[320px] object-cover" />
+          {(info.kind === 'video' || info.kind === 'gif') && (
+            <span className="absolute inset-0 flex items-center justify-center bg-black/25">
+              <span className="flex h-11 w-11 items-center justify-center rounded-full bg-black/55">
+                <Play className="h-5 w-5 text-white" />
+              </span>
+            </span>
+          )}
+        </button>
+      ) : stillLoading ? (
+        <div className="flex h-32 w-52 items-center justify-center rounded-lg bg-black/25 text-slate-400">
+          <Loader2 className="h-5 w-5 animate-spin" />
+        </div>
+      ) : (
+        <div className="flex items-center gap-3 rounded-lg bg-black/25 p-2">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#3b9bdc] text-white">
+            <KindIcon kind={info.kind} />
+          </span>
+          <span className="min-w-0">
+            <span className="block truncate text-sm font-medium">{info.name}</span>
+            <span className="block text-xs text-slate-400">
+              {fmtSize(info.size)}
+              {!info.downloadable ? ' · too large to download here' : ''}
+            </span>
+          </span>
+        </div>
+      )}
+      <div className="mt-1 flex items-center gap-2">
+        {(showImage || info.kind !== 'voice') && downloadBtn}
+        {showImage && info.size != null && <span className="text-[11px] text-slate-400">{info.name} · {fmtSize(info.size)}</span>}
+      </div>
+      {error && <p className="mt-1 text-xs text-red-300">{error}</p>}
+      {open && showImage && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/85 p-4" onMouseDown={() => setOpen(false)}>
+          <button type="button" aria-label="Close" onClick={() => setOpen(false)} className="absolute right-4 top-4 rounded-full bg-white/10 p-2 text-white hover:bg-white/20">
+            <X className="h-5 w-5" />
+          </button>
+          <img src={src as string} alt={info.name} onMouseDown={(e) => e.stopPropagation()} className="max-h-[88vh] max-w-full rounded-lg object-contain" />
+        </div>
+      )}
+    </div>
+  )
+}
+
+function MiniAppModal({
+  buttonText,
+  busy,
+  error,
+  onClose,
+  onOpen,
+}: {
+  buttonText: string
+  busy: boolean
+  error: string | null
+  onClose: () => void
+  onOpen: (profileId: string) => void
+}) {
+  const profiles = useQuery({ queryKey: ['browser-profiles'], queryFn: api.browserProfiles, retry: false })
+  const list = profiles.data?.profiles ?? []
+  const [choice, setChoice] = useState('')
+  const selected = choice || list[0]?.id || ''
+  return (
+    <Modal title="Open Mini App in a browser" onClose={onClose}>
+      <p className="mb-3 text-sm text-slate-400">
+        "{buttonText}" opens in a browser session you can watch and click in Live Broadcast. Telegram signs the launch for this account, and
+        the link is passed straight to the browser, never shown here. Only open Mini Apps you trust: they run in the chosen profile.
+      </p>
+      {profiles.isLoading ? (
+        <p className="text-sm text-slate-500">Loading profiles…</p>
+      ) : list.length === 0 ? (
+        <p className="rounded-lg bg-surface-200 p-3 text-sm text-slate-400">Create a browser profile first (Browser Profiles page), then try again.</p>
+      ) : (
+        <div className="space-y-3">
+          <label className="block text-xs font-medium text-slate-400">
+            Browser profile
+            <select className="input mt-1 w-full" value={selected} onChange={(e) => setChoice(e.target.value)}>
+              {list.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {error && <p className="text-sm text-status-error">{error}</p>}
+          <button type="button" disabled={busy || !selected} onClick={() => onOpen(selected)} className="btn btn-primary w-full">
+            {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Globe className="h-4 w-4" />} Open in browser
+          </button>
+        </div>
+      )}
+    </Modal>
+  )
+}
+
 function ButtonGrid({
   message,
   disabled,
   pending,
   onPress,
+  onMiniApp,
 }: {
   message: ChatMessage
   disabled: boolean
   pending: boolean
   onPress: (m: ChatMessage, b: ChatButton) => void
+  onMiniApp: (m: ChatMessage, b: ChatButton) => void
 }) {
   if (!message.buttons.length) return null
   const base =
@@ -96,6 +285,18 @@ function ButtonGrid({
                 <span className="truncate">{b.text}</span>
                 <ExternalLink className="h-3 w-3 shrink-0 opacity-70" />
               </a>
+            ) : b.miniapp ? (
+              <button
+                key={b.col}
+                type="button"
+                disabled={disabled}
+                onClick={() => onMiniApp(message, b)}
+                title="Open this Mini App in a browser session"
+                className={clsx(base, disabled ? 'cursor-not-allowed opacity-50' : 'hover:bg-black/55')}
+              >
+                <Globe className="h-3 w-3 shrink-0 opacity-70" />
+                <span className="truncate">{b.text}</span>
+              </button>
             ) : (
               <button
                 key={b.col}
@@ -120,18 +321,26 @@ function Bubble({
   disabled,
   pending,
   onPress,
+  onMiniApp,
+  media,
 }: {
   m: ChatMessage
   disabled: boolean
   pending: boolean
   onPress: (m: ChatMessage, b: ChatButton) => void
+  onMiniApp: (m: ChatMessage, b: ChatButton) => void
+  media: { integration: string; sessionKey: string; peer: string; canWrite: boolean }
 }) {
   return (
     <div className={clsx('flex', m.from_me ? 'justify-end' : 'justify-start')}>
       <div className={clsx('max-w-[85%] sm:max-w-[70%]', m.buttons.length && 'w-full sm:w-auto sm:min-w-[260px]')}>
         <div className={clsx('rounded-2xl px-3 py-1.5 text-sm text-white', m.from_me ? 'rounded-br-md bg-[#2b5278]' : 'rounded-bl-md bg-[#182533]')}>
           {!m.from_me && m.sender && <p className="text-xs font-semibold" style={{ color: avatarColor(m.sender) }}>{m.sender}</p>}
-          {m.media && <p className="text-xs font-medium text-[#6ab3f3]">{m.media}</p>}
+          {m.media_info ? (
+            <MediaBlock info={m.media_info} messageId={m.id} {...media} />
+          ) : (
+            m.media && <p className="text-xs font-medium text-[#6ab3f3]">{m.media}</p>
+          )}
           {m.text && (
             <p className="whitespace-pre-wrap break-words">
               <Linkified text={m.text} />
@@ -142,7 +351,7 @@ function Bubble({
             {clock(m.date)}
           </p>
         </div>
-        <ButtonGrid message={m} disabled={disabled} pending={pending} onPress={onPress} />
+        <ButtonGrid message={m} disabled={disabled} pending={pending} onPress={onPress} onMiniApp={onMiniApp} />
       </div>
     </div>
   )
@@ -153,11 +362,13 @@ export default function TelegramChat({
   sessionKey,
   stopped,
   canWrite,
+  onOpenSession,
 }: {
   integration: string
   sessionKey: string
   stopped: boolean
   canWrite: boolean
+  onOpenSession?: (session: LiveSession) => void
 }) {
   const qc = useQueryClient()
   const [peer, setPeer] = useState<string | null>(null)
@@ -205,6 +416,17 @@ export default function TelegramChat({
       refresh()
     },
     onError: fail,
+  })
+
+  const [mini, setMini] = useState<{ m: ChatMessage; b: ChatButton } | null>(null)
+  const openMini = useMutation({
+    mutationFn: (profileId: string) =>
+      api.liveChatMiniApp(integration, sessionKey, peer as string, mini!.m.id, mini!.b.row, mini!.b.col, profileId),
+    onSuccess: ({ session }) => {
+      setMini(null)
+      void qc.invalidateQueries({ queryKey: ['live'] })
+      onOpenSession?.(session)
+    },
   })
 
   const messages = history.data?.messages ?? []
@@ -324,7 +546,18 @@ export default function TelegramChat({
                 </p>
               )}
               {messages.map((m) => (
-                <Bubble key={m.id} m={m} disabled={readOnly} pending={press.isPending} onPress={(msg, b) => press.mutate({ m: msg, b })} />
+                <Bubble
+                  key={m.id}
+                  m={m}
+                  disabled={readOnly}
+                  pending={press.isPending}
+                  onPress={(msg, b) => press.mutate({ m: msg, b })}
+                  onMiniApp={(msg, b) => {
+                    openMini.reset()
+                    setMini({ m: msg, b })
+                  }}
+                  media={{ integration, sessionKey, peer, canWrite: !readOnly }}
+                />
               ))}
               <div ref={bottomRef} />
             </div>
@@ -371,6 +604,15 @@ export default function TelegramChat({
           </>
         )}
       </section>
+      {mini && (
+        <MiniAppModal
+          buttonText={mini.b.text}
+          busy={openMini.isPending}
+          error={openMini.error instanceof Error ? openMini.error.message : null}
+          onClose={() => setMini(null)}
+          onOpen={(id) => openMini.mutate(id)}
+        />
+      )}
     </div>
   )
 }

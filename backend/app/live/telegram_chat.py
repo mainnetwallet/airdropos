@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.app.live.events import redact_text
 from backend.app.live.models import Conflict, NotSupported
 
 MAX_TEXT = 4096
+MAX_FILE_BYTES = 15 * 1024 * 1024  # the gateway call has a short timeout; bigger files belong in Telegram
+MAX_PREVIEW_BYTES = 6 * 1024 * 1024
 _PEER_RE = re.compile(r"^-?\d{1,20}$")
 
 _MEDIA_LABELS = (
@@ -73,6 +75,74 @@ def _sender_name(msg: Any) -> Optional[str]:
     return str(name)[:80] if name else None
 
 
+_IMAGE_MIMES = ("image/jpeg", "image/png", "image/webp", "image/gif")
+
+
+def _clean_name(name: Optional[str], fallback: str) -> str:
+    cleaned = re.sub(r"[^\w.\- ]", "_", str(name or "")).strip(" .")[:120]
+    return cleaned or fallback
+
+
+def _media_info(msg: Any) -> Optional[Dict[str, Any]]:
+    """What the dashboard may show for a message's attachment (never a Telegram file reference)."""
+    if getattr(msg, "media", None) is None:
+        return None
+    f = getattr(msg, "file", None)
+    mime = getattr(f, "mime_type", None) or ""
+    if getattr(msg, "photo", None):
+        kind = "photo"
+    elif getattr(msg, "sticker", None):
+        kind = "sticker"
+    elif getattr(msg, "gif", None):
+        kind = "gif"
+    elif getattr(msg, "video_note", None) or getattr(msg, "video", None):
+        kind = "video"
+    elif getattr(msg, "voice", None):
+        kind = "voice"
+    elif getattr(msg, "audio", None):
+        kind = "audio"
+    elif getattr(msg, "document", None):
+        kind = "image" if mime in _IMAGE_MIMES else "file"
+    else:
+        return None  # poll, location, contact: shown as a label only
+    size = getattr(f, "size", None)
+    size = int(size) if isinstance(size, int) else None
+    return {
+        "kind": kind,
+        "name": _clean_name(getattr(f, "name", None), f"{kind}{getattr(f, 'ext', '') or ''}"),
+        "size": size,
+        "mime": mime or None,
+        "preview": kind in ("photo", "sticker", "gif", "video", "image"),
+        "downloadable": size is None or size <= MAX_FILE_BYTES,
+    }
+
+
+def _pick_photo_size(photo: Any) -> Any:
+    """The largest ordinary size up to ~1280px, so a preview stays light."""
+    from telethon.tl import types
+
+    sizes = [s for s in (getattr(photo, "sizes", None) or []) if isinstance(s, types.PhotoSize)]
+    if not sizes:
+        return -1
+    fits = [s for s in sizes if max(s.w, s.h) <= 1280]
+    return max(fits, key=lambda s: s.w * s.h) if fits else min(sizes, key=lambda s: s.w * s.h)
+
+
+def _sniff_image(data: Optional[bytes]) -> Optional[str]:
+    """Only these formats are ever served inline, decided from the bytes, not from a claim."""
+    if not data:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:4] == b"GIF8":
+        return "image/gif"
+    return None
+
+
 def _describe(msg: Any) -> Dict[str, Any]:
     t = _tools()
     rows: List[List[Dict[str, Any]]] = []
@@ -88,6 +158,8 @@ def _describe(msg: Any) -> Dict[str, Any]:
                     "text": str(getattr(button, "text", ""))[:80],
                     "kind": kind,
                     "clickable": kind in t.CLICKABLE_BUTTON_KINDS,
+                    # A Mini App is opened in a browser session on request; its signed link never leaves the worker.
+                    "miniapp": kind == "webapp",
                     # Only plain web links are ever handed to the browser.
                     "url": url if kind == "url" and isinstance(url, str) and url.lower().startswith(("https://", "http://")) else None,
                 }
@@ -100,6 +172,7 @@ def _describe(msg: Any) -> Dict[str, Any]:
         "sender": _sender_name(msg),
         "text": (getattr(msg, "message", None) or "")[:MAX_TEXT],
         "media": _media_label(msg),
+        "media_info": _media_info(msg),
         "reply_to": getattr(getattr(msg, "reply_to", None), "reply_to_msg_id", None),
         "edited": bool(getattr(msg, "edit_date", None)),
         "buttons": rows,
@@ -259,3 +332,116 @@ async def run(tg: Any, op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return await _with_client(tg, click)
 
     raise NotSupported(f"Unknown chat operation '{op}'.")
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+async def _message(client: Any, peer: int, message_id: int) -> Tuple[Any, Any]:
+    entity = await client.get_entity(peer)
+    msg = await client.get_messages(entity, ids=message_id)
+    if msg is None:
+        raise Conflict("Message not found.", "not_found")
+    return entity, msg
+
+
+async def media(tg: Any, peer: int, message_id: int, variant: str) -> Tuple[bytes, str, str]:
+    """(bytes, mime, filename) of a message's attachment.
+
+    ``preview`` is a small image decided by its bytes (jpeg/png/webp/gif only). ``file`` is the
+    original, always served as an opaque download so a hostile file can never run in the dashboard.
+    """
+    if variant not in ("preview", "file"):
+        raise NotSupported("Unknown media variant.")
+
+    async def go(client: Any) -> Tuple[bytes, str, str]:
+        _, msg = await _message(client, peer, message_id)
+        info = _media_info(msg)
+        if info is None:
+            raise Conflict("This message has no attachment.", "not_found")
+        if variant == "preview":
+            if not info["preview"]:
+                raise Conflict("No preview for this attachment.", "no_preview")
+            if info["kind"] == "photo":
+                data = await client.download_media(msg, file=bytes, thumb=_pick_photo_size(msg.photo))
+            elif info["mime"] == "image/webp" and (info["size"] or 0) <= 512 * 1024:
+                data = await client.download_media(msg, file=bytes)  # a still sticker
+            elif info["kind"] == "image" and (info["size"] or MAX_PREVIEW_BYTES) <= MAX_PREVIEW_BYTES:
+                data = await client.download_media(msg, file=bytes)
+            else:
+                data = await client.download_media(msg, file=bytes, thumb=-1)
+            mime = _sniff_image(data)
+            if mime is None or len(data) > MAX_PREVIEW_BYTES:
+                raise Conflict("No preview for this attachment.", "no_preview")
+            return data, mime, ""
+        if not info["downloadable"]:
+            raise Conflict(
+                f"This file is larger than {MAX_FILE_BYTES // 1048576} MB. Open it in Telegram instead.", "too_large"
+            )
+        data = await client.download_media(msg, file=bytes)
+        if not data:
+            raise Conflict("The file could not be downloaded.", "download_failed")
+        if len(data) > MAX_FILE_BYTES:
+            raise Conflict(f"This file is larger than {MAX_FILE_BYTES // 1048576} MB.", "too_large")
+        return data, "application/octet-stream", info["name"]
+
+    return await _with_client(tg, go)
+
+
+# ---------------------------------------------------------------------------
+# Mini Apps
+# ---------------------------------------------------------------------------
+def scrub(text: str, url: str) -> str:
+    """Remove a Mini App link (it carries Telegram's signed login data) from a message."""
+    from backend.app.live.events import safe_url
+
+    out = str(text).replace(url, safe_url(url))
+    return re.sub(r"tgWebApp\w*=[^\s&\"')]+", "tgWebApp…", out)
+
+
+async def miniapp_url(tg: Any, payload: Dict[str, Any]) -> str:
+    """Ask Telegram, as the signed-in account, for the launch link of a Mini App button.
+
+    This is what the official Telegram clients do when the button is tapped. The link includes
+    Telegram's signed ``initData`` for THIS account, so it is a credential: it is handed straight
+    to the browser session by the caller and is never returned to the dashboard, logged or stored.
+    Nothing is forged; Telegram issues the data.
+    """
+    t = _tools()
+    peer = _peer(payload.get("peer"))
+    message_id = int(payload.get("message_id") or 0)
+    row, col = int(payload.get("row", -1)), int(payload.get("col", -1))
+    if message_id <= 0 or row < 0 or col < 0:
+        raise NotSupported("Invalid button reference.")
+
+    async def go(client: Any) -> str:
+        from telethon.tl import functions
+
+        entity, msg = await _message(client, peer, message_id)
+        try:
+            button = msg.buttons[row][col]
+        except (TypeError, IndexError):
+            raise Conflict("That button is no longer on the message.", "not_found")
+        if t._button_kind(button) != "webapp":
+            raise Conflict("This button is not a Mini App.", "not_miniapp")
+        raw = getattr(button, "button", None)
+        url = (
+            getattr(button, "url", None)
+            or getattr(getattr(raw, "type", None), "url", None)
+            or getattr(raw, "url", None)
+        )
+        if not isinstance(url, str) or not url.lower().startswith("https://"):
+            raise Conflict("The Mini App has no secure (https) address.", "bad_url")
+        sender = getattr(msg, "sender_id", None)
+        bot = await client.get_input_entity(sender if sender else entity)
+        simple = any("simplewebview" in n for n in t._type_names(raw))
+        if simple:
+            result = await client(functions.messages.RequestSimpleWebViewRequest(bot=bot, platform="weba", url=url))
+        else:
+            result = await client(functions.messages.RequestWebViewRequest(peer=entity, bot=bot, platform="weba", url=url))
+        launch = getattr(result, "url", None)
+        if not isinstance(launch, str) or not launch.lower().startswith("https://"):
+            raise Conflict("Telegram did not return a launch link for this Mini App.", "no_launch")
+        return launch
+
+    return await _with_client(tg, go)

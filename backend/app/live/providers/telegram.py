@@ -191,7 +191,45 @@ class TelegramProvider(SessionProvider):
         tg = _session_by_key(key)
         if tg is None:
             raise SessionNotFound(key)
+        if op == "miniapp":
+            return await self._open_miniapp(tg, payload)
         return await telegram_chat.run(tg, op, payload)
+
+    async def _open_miniapp(self, tg: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Open a Mini App button in a browser session (the one the operator picked)."""
+        import logging
+
+        from backend.app.live import telegram_chat
+        from backend.app.live.providers import PROVIDERS
+
+        profile_id = str(payload.get("profile_id") or "")
+        if not profile_id:
+            raise Conflict("Choose a browser profile to open the Mini App in.", "no_profile")
+        url = await telegram_chat.miniapp_url(tg, payload)  # a credential: stays in this function
+        try:
+            session = await PROVIDERS["browser"].open_url(
+                {"profile_id": profile_id, "url": url, "operator": payload.get("operator")}
+            )
+        except Conflict as exc:
+            raise Conflict(telegram_chat.scrub(str(exc), url), exc.code) from None
+        except Exception as exc:  # noqa: BLE001 - the message could carry the link
+            logging.getLogger(__name__).error("Mini App open failed (%s)", type(exc).__name__)
+            raise Conflict("The browser could not open the Mini App.", "browser_error") from None
+        tg._emit("telegram.operator", "Operator opened a Mini App in the browser", "ok")
+        return {"session": session}
+
+    async def media(self, key: str, query: Dict[str, Any]):
+        from backend.app.live import telegram_chat
+
+        tg = _session_by_key(key)
+        if tg is None:
+            raise SessionNotFound(key)
+        return await telegram_chat.media(
+            tg,
+            telegram_chat._peer(query.get("peer")),
+            int(query.get("message_id") or 0),
+            str(query.get("variant") or "preview"),
+        )
 
     async def action(self, key: str, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         tg = _session_by_key(key)

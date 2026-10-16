@@ -221,7 +221,17 @@ export interface ChatButton {
   text: string
   kind: string
   clickable: boolean
+  miniapp?: boolean
   url: string | null
+}
+
+export interface ChatMediaInfo {
+  kind: 'photo' | 'sticker' | 'gif' | 'video' | 'voice' | 'audio' | 'image' | 'file'
+  name: string
+  size: number | null
+  mime: string | null
+  preview: boolean
+  downloadable: boolean
 }
 
 export interface ChatMessage {
@@ -231,6 +241,7 @@ export interface ChatMessage {
   sender: string | null
   text: string
   media: string | null
+  media_info?: ChatMediaInfo | null
   reply_to: number | null
   edited: boolean
   buttons: ChatButton[][]
