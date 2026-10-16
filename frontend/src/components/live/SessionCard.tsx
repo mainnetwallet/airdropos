@@ -92,7 +92,7 @@ export default function SessionCard({
       ) : (
         <div className={clsx('rounded-lg bg-surface-200 p-2.5', dense ? 'min-h-[88px]' : 'min-h-[120px]')}>
           <ActivityList events={own} limit={3} emptyText="No activity yet" />
-          <p className="mt-1 text-[11px] text-slate-500">{caps.chat ? 'API session. Open it to see the live chats and reply.' : 'API session. It has no graphical screen to show or click.'}</p>
+          <p className="mt-1 text-[11px] text-slate-500">{caps.chat ? (stopped ? 'Stopped and disconnected. Open it and press Reconnect.' : 'API session. Open it to see the live chats and reply.') : 'API session. It has no graphical screen to show or click.'}</p>
         </div>
       )}
 

@@ -418,6 +418,13 @@ export default function TelegramChat({
     onError: fail,
   })
 
+  const reconnect = useMutation({
+    mutationFn: () => api.liveResume(integration, sessionKey),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['live'] })
+      void qc.invalidateQueries({ queryKey: ['tg-dialogs', integration, sessionKey] })
+    },
+  })
   const [mini, setMini] = useState<{ m: ChatMessage; b: ChatButton } | null>(null)
   const openMini = useMutation({
     mutationFn: (profileId: string) =>
@@ -450,8 +457,19 @@ export default function TelegramChat({
 
   if (stopped) {
     return (
-      <div className="flex h-full min-h-[240px] items-center justify-center rounded-xl bg-[#0e1621] p-6 text-center text-sm text-slate-400">
-        This Telegram session is stopped. Resume it to open the chats.
+      <div className="flex h-full min-h-[240px] flex-col items-center justify-center gap-3 rounded-xl bg-[#0e1621] p-6 text-center text-sm text-slate-400">
+        <p>This Telegram account was stopped, so it is disconnected.</p>
+        <button
+          type="button"
+          disabled={!canWrite || reconnect.isPending}
+          onClick={() => reconnect.mutate()}
+          className="flex items-center gap-2 rounded-full bg-[#3b9bdc] px-5 py-2 text-sm font-semibold text-white hover:bg-[#2f8acb] disabled:opacity-50"
+        >
+          {reconnect.isPending && <Loader2 className="h-4 w-4 animate-spin" />}
+          Reconnect and open chats
+        </button>
+        {!canWrite && <p className="text-xs text-slate-500">This login is read-only, so it cannot reconnect.</p>}
+        {reconnect.error instanceof Error && <p className="text-xs text-red-300">{reconnect.error.message}</p>}
       </div>
     )
   }
