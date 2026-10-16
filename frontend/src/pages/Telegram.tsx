@@ -2,9 +2,9 @@
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Link } from 'react-router-dom'
-import { CheckCircle2, ChevronRight, Info, Plus, Send, Star, Trash2, UserRound, XCircle } from 'lucide-react'
-import { api } from '@/services/api'
+import { Link, useNavigate } from 'react-router-dom'
+import { CheckCircle2, ChevronRight, ExternalLink, Info, Loader2, Plus, Send, Star, Trash2, UserRound, XCircle } from 'lucide-react'
+import { api, liveApi } from '@/services/api'
 import AddAccountModal from '@/components/telegram/AddAccountModal'
 import RemoveAccountModal from '@/components/telegram/RemoveAccountModal'
 import type { TelegramAccount } from '@/types'
@@ -26,6 +26,19 @@ export default function Telegram() {
   const qc = useQueryClient()
   const [adding, setAdding] = useState(false)
   const [removing, setRemoving] = useState<TelegramAccount | null>(null)
+  const navigate = useNavigate()
+  const [opening, setOpening] = useState<string | null>(null)
+  const openLive = useMutation({
+    mutationFn: (label: string) => {
+      setOpening(label)
+      return liveApi.liveOpenTelegram(label)
+    },
+    onSuccess: ({ session }) => {
+      void qc.invalidateQueries({ queryKey: ['live'] })
+      navigate(`/live/${encodeURIComponent(session.integration)}/${encodeURIComponent(session.key)}`)
+    },
+    onSettled: () => setOpening(null),
+  })
   const makeDefault = useMutation({
     mutationFn: (label: string) => api.telegramSetDefault(label),
     onSuccess: () => void qc.invalidateQueries({ queryKey: ['telegram-accounts'] }),
@@ -133,7 +146,17 @@ export default function Telegram() {
                     {!a.logged_in && <Pill tone="red">Logged out</Pill>}
                   </div>
                 </div>
-                <div className="flex shrink-0 gap-1">
+                <div className="flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    disabled={!a.logged_in || openLive.isPending}
+                    onClick={() => openLive.mutate(a.label)}
+                    title={a.logged_in ? 'Open this account as a live chat in Live Broadcast' : 'Log in again first'}
+                    className="btn btn-primary !px-3 !py-1.5 text-xs"
+                  >
+                    {opening === a.label ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ExternalLink className="h-3.5 w-3.5" />}
+                    Open
+                  </button>
                   {!a.is_default && !a.legacy && (
                     <button
                       type="button"
@@ -165,6 +188,7 @@ export default function Telegram() {
             ))}
           </ul>
         )}
+        {openLive.error && <p className="mt-3 text-xs text-status-error">{(openLive.error as Error).message}</p>}
         {makeDefault.error && <p className="mt-3 text-xs text-status-error">{(makeDefault.error as Error).message}</p>}
         <p className="mt-3 text-xs text-slate-500">
           The agent uses the default account unless a task names a label. While a task is
