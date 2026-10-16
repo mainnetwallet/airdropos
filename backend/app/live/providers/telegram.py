@@ -23,7 +23,8 @@ def _sessions():
     from backend.app.integrations.telegram_accounts import slugify
     from backend.app.tools.telegram_user_tools import _extra_sessions, _session as legacy
 
-    return [("agent", legacy), *[(slugify(s.label), s) for s in _extra_sessions.values()]]
+    # An account literally labelled "agent" must not shadow the legacy session's key.
+    return [("agent", legacy), *[(slugify(s.label) if slugify(s.label) != "agent" else "account-agent", s) for s in _extra_sessions.values()]]
 
 
 def _session_by_key(key: str):
