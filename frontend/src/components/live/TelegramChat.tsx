@@ -374,7 +374,7 @@ export default function TelegramChat({
   onOpenSession?: (session: LiveSession) => void
   /** Click mode. While off, chats can be browsed but nothing is sent, pressed, opened or downloaded. */
   clickEnabled?: boolean
-  /** Card preview: the whole two-pane UI at a fixed wide layout (the card scales it down) with the latest chat open. */
+  /** Card preview: the same two-pane UI as the full view (no chat open until one is picked), at a fixed wide layout the card scales down. */
   compact?: boolean
   /** Poll only while the view is on screen. */
   active?: boolean
@@ -397,7 +397,7 @@ export default function TelegramChat({
     queryKey: ['tg-history', integration, sessionKey, peer],
     queryFn: () => api.liveChatHistory(integration, sessionKey, peer as string),
     enabled: !stopped && active && !!peer,
-    refetchInterval: compact ? 8000 : 3000,
+    refetchInterval: 3000,
     placeholderData: (prev) => prev,
     retry: false,
   })
@@ -456,10 +456,6 @@ export default function TelegramChat({
     const all = dialogs.data?.dialogs ?? []
     return q ? all.filter((d) => `${d.title} ${d.username ?? ''}`.toLowerCase().includes(q)) : all
   }, [dialogs.data, search])
-
-  useEffect(() => {
-    if (compact && !peer && list.length) setPeer(list[0].peer)
-  }, [compact, peer, list])
 
   const readOnly = stopped || !canWrite || !clickEnabled
   const submit = () => {
