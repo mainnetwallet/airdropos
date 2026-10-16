@@ -250,7 +250,35 @@ def telegram_state(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path, telegram_state):
+def telegram_user_configured(monkeypatch):
+    """Give the test an *operator-enabled and configured* Telegram user client.
+
+    Production keeps ``TELEGRAM_USER_ENABLED`` false and the API id/hash unset by
+    default, and registers the Telegram tools only when all three are present
+    (``register_telegram_user_tools`` and its siblings). A test that registers or runs
+    those tools therefore needs that configuration -- and it must not get it from a
+    developer's ``.env``: on a clean checkout there is no ``.env`` (39 tests failed
+    for exactly that reason), and on a machine that has one the test would be handed
+    the operator's REAL API credentials.
+
+    So the three settings are pinned here to obviously fake values, for this test
+    only (``monkeypatch`` restores the real ones afterwards). Nothing here can reach
+    Telegram: the client factory is replaced by the fake in ``client`` below and, for
+    every other test, by ``_telegram_never_reaches_the_network``.
+
+    Deliberately NOT autouse: the shipped default (disabled) must stay what every other
+    test sees, and tests that assert the disabled or unconfigured behaviour set those
+    settings themselves, after this fixture, with their own ``monkeypatch``.
+    """
+    from backend.app.core.config import settings
+
+    monkeypatch.setattr(settings, "TELEGRAM_USER_ENABLED", True)
+    monkeypatch.setattr(settings, "TELEGRAM_API_ID", 123456)
+    monkeypatch.setattr(settings, "TELEGRAM_API_HASH", "0123456789abcdef0123456789abcdef")
+
+
+@pytest.fixture
+def client(monkeypatch, tmp_path, telegram_state, telegram_user_configured):
     """Install ``fake_telegram.FakeClient`` as the client every Telegram tool gets.
 
     The seam patched is the one production builds the client at --
@@ -258,6 +286,8 @@ def client(monkeypatch, tmp_path, telegram_state):
     hands the fake to every tool without a single production change. ``telegram_state``
     clears the session's own ``_client`` first, which is what guarantees the patched
     factory is actually reached instead of a client another test left behind.
+    ``telegram_user_configured`` supplies the (fake) enabled flag and API id/hash that
+    the tools require before they register or build a client at all.
 
     The fake is also published as ``fake_telegram.ACTIVE_CLIENT``, which is where
     buttons record their presses.
