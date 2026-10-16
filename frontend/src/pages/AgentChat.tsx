@@ -44,6 +44,7 @@ import {
   readAttachment,
   type PendingAttachment,
 } from '@/services/chatAttachments'
+import ConfirmModal from '@/components/ConfirmModal'
 import { Alert } from '@/components/ui'
 import type { AgentToolCall, AutonomousRule, AutonomyPolicy } from '@/types'
 
@@ -625,6 +626,7 @@ export default function AgentChat() {
     () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches,
   )
   const [editingId, setEditingId] = useState<string | null>(null)
+  const [toDelete, setToDelete] = useState<ConversationSummary | null>(null)
   const [editText, setEditText] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -834,9 +836,10 @@ export default function AgentChat() {
     resetComposer()
     closeHistoryOnMobile()
   }
-  const deleteConversation = (id: string) => {
-    if (!window.confirm('Delete this conversation?')) return
-    agentChatStore.deleteConversation(id)
+  const confirmDelete = () => {
+    if (!toDelete) return
+    agentChatStore.deleteConversation(toDelete.id)
+    setToDelete(null)
     resetComposer()
   }
 
@@ -869,13 +872,30 @@ export default function AgentChat() {
           Drop photos or text files to attach
         </div>
       )}
+      {toDelete && (
+        <ConfirmModal
+          title="Delete conversation"
+          confirmLabel="Delete"
+          onConfirm={confirmDelete}
+          onClose={() => setToDelete(null)}
+        >
+          <p>
+            Delete <span className="font-semibold text-slate-100">“{toDelete.title}”</span>?
+          </p>
+          <p className="mt-1 text-slate-400">
+            Its {toDelete.messageCount} message{toDelete.messageCount === 1 ? '' : 's'} will be removed from
+            this browser. This cannot be undone.
+            {busy && ' If the agent is working in it, that turn is stopped.'}
+          </p>
+        </ConfirmModal>
+      )}
       <HistorySidebar
         open={historyOpen}
         conversations={conversations}
         activeId={activeId}
         onNew={newConversation}
         onOpen={openConversation}
-        onDelete={deleteConversation}
+        onDelete={(id) => setToDelete(conversations.find((c) => c.id === id) ?? null)}
         onClose={() => setHistoryOpen(false)}
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
