@@ -6,6 +6,7 @@ import clsx from 'clsx'
 import LiveScreen from '@/components/live/LiveScreen'
 import SessionActions from '@/components/live/SessionActions'
 import ActivityList from '@/components/live/ActivityList'
+import TelegramChat from '@/components/live/TelegramChat'
 import { IntegrationBadge, StatusBadge } from '@/components/live/meta'
 import { formatElapsed, useElapsed, useInView } from '@/hooks/useLive'
 import type { LiveEvent, LiveSession } from '@/types/live'
@@ -40,6 +41,7 @@ export default function SessionCard({
       ref={ref}
       className={clsx(
         'card flex flex-col gap-2.5 !p-3',
+        caps.chat && 'col-span-full',
         session.status === 'waiting_for_user' && 'ring-2 ring-amber-500/70',
         session.status === 'failed' && 'ring-1 ring-red-500/50',
       )}
@@ -88,6 +90,17 @@ export default function SessionCard({
               <Maximize2 className="h-4 w-4" />
             </button>
           )}
+        </div>
+      ) : caps.chat ? (
+        // A message-based account has no screen, so its card IS the live chat view.
+        <div className="h-[480px]">
+          <TelegramChat
+            integration={session.integration}
+            sessionKey={session.key}
+            stopped={stopped}
+            canWrite={canControl}
+            onOpenSession={(sess) => onOpen(sess, false)}
+          />
         </div>
       ) : (
         <div className={clsx('rounded-lg bg-surface-200 p-2.5', dense ? 'min-h-[88px]' : 'min-h-[120px]')}>
