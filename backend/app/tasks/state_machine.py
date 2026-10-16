@@ -8,9 +8,10 @@ with UNVERIFIED rather than being silently folded into success.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, FrozenSet, Optional, Set
+from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,13 @@ VALID_TRANSITIONS: Dict[TaskStatus, Set[TaskStatus]] = {
         TaskStatus.PARTIALLY_COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.RETRYING,
+        # Yielding an execution window back to the queue. NOT a failure: the run spent its
+        # per-run iteration budget, the plan, evidence and checkpoints are persisted, and
+        # the worker re-claims the task from READY and continues from the latest
+        # checkpoint. This is what lets a long objective span many execution windows
+        # without a human having to press Retry, and without any arbitrary small limit
+        # deciding the task's fate.
+        TaskStatus.READY,
         TaskStatus.WAITING,
         TaskStatus.NEEDS_USER_ACTION,
         TaskStatus.UNVERIFIED,
@@ -172,17 +180,90 @@ def assert_transition(current: TaskStatus, requested: TaskStatus) -> None:
         raise InvalidTransition(current, requested)
 
 
-def assert_completion_verified(status: TaskStatus, verified: bool, evidence_count: int = 0) -> None:
+@dataclass(frozen=True)
+class CompletionProof:
+    """What the system could actually prove about a finished task.
+
+    `verified` and `evidence_count` on their own are two scalars a caller asserts about
+    itself, and a caller that wanted COMPLETED could assert anything. This carries the
+    substance instead: how many persisted observations independently confirmed the
+    outcome, whether anything is still unaccounted for, and what is missing when the proof
+    is not sufficient.
+
+    The state machine checks the *shape* of the proof; `TaskManager` additionally checks
+    that the confirmations really exist in this task's persisted observations. Together
+    they enforce the same invariant the controller decides on, so a task cannot reach
+    COMPLETED by asserting that it verified itself.
+    """
+
+    authoritative_confirmations: int = 0
+    outstanding_requirements: int = 0
+    unverified_steps: Tuple[str, ...] = ()
+    failed_steps: Tuple[str, ...] = ()
+    blocked_steps: Tuple[str, ...] = ()
+    # Steps the current policy refused. These are gaps too: a plan whose value-moving
+    # step was denied by the authorization policy has not had that action carried out,
+    # and evidence belonging to some *other* step must not stand in for it.
+    skipped_steps: Tuple[str, ...] = ()
+    missing: Tuple[str, ...] = ()
+
+    @property
+    def is_sufficient(self) -> bool:
+        return (
+            self.authoritative_confirmations > 0
+            and self.outstanding_requirements == 0
+            and not self.unverified_steps
+            and not self.failed_steps
+            and not self.blocked_steps
+            and not self.skipped_steps
+        )
+
+    def explain(self) -> str:
+        """Why this proof is not sufficient, in the operator's terms. Empty when it is."""
+        gaps: List[str] = []
+        if self.authoritative_confirmations <= 0:
+            gaps.append(
+                "no observation in this task's history authoritatively confirmed any outcome"
+            )
+        if self.outstanding_requirements:
+            gaps.append(
+                f"{self.outstanding_requirements} discovered requirement(s) were never "
+                f"satisfied ({'; '.join(self.missing[:3]) or 'no detail recorded'})"
+            )
+        for label, items in (
+            ("ran but could not be proven", self.unverified_steps),
+            ("failed", self.failed_steps),
+            ("blocked", self.blocked_steps),
+            ("were skipped, so the action they describe was not carried out", self.skipped_steps),
+        ):
+            if items:
+                gaps.append(f"{len(items)} step(s) {label}: {'; '.join(items[:3])}")
+        return "; ".join(gaps)
+
+
+def assert_completion_verified(
+    status: TaskStatus,
+    verified: bool,
+    evidence_count: int = 0,
+    proof: Optional[CompletionProof] = None,
+) -> None:
     """Guard the COMPLETED transition.
 
     A task is COMPLETED only when its completion conditions were verified against
     evidence. Otherwise the caller must use PARTIALLY_COMPLETED or UNVERIFIED.
+
+    When a `CompletionProof` is supplied it must also be sufficient on its own terms. That
+    is what stops "the model said complete" plus a floored-up evidence count from being
+    enough: the proof has to name real confirmations and must not conceal an unverified,
+    failed or blocked step, or an outstanding requirement nobody satisfied.
     """
     if status is not TaskStatus.COMPLETED:
         return
     if not verified:
         raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
-    if evidence_count == 0:
+    if evidence_count <= 0:
+        raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
+    if proof is not None and not proof.is_sufficient:
         raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
 
 

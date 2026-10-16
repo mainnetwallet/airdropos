@@ -34,6 +34,63 @@ from backend.app.tasks.state_machine import TaskStatus
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/live", tags=["live"])
 
+
+async def _resolve_open_intervention(
+    db: AsyncSession, task: Any, principal: Any
+) -> None:
+    """Close whatever this task was parked on, when something other than a reply answers it.
+
+    Resuming a live session IS an operator answering the intervention, so it has to go
+    through the same bookkeeping a reply does. Skipping it left the `InterventionRequest`
+    PENDING and the conversation flagged `requires_reply`, and since READY is not a
+    status a reply may resume from, any later reply was then refused with "I cannot safely
+    resume this task yet" -- an inbox permanently asking for an answer it could no longer
+    accept.
+
+    The record states only what is actually known: that an authenticated operator resumed
+    the session. It does NOT claim the pending action was performed -- the gateway already
+    re-inspected before returning, but a recorded outcome that overstates what was
+    verified would outlive this request.
+    """
+    from backend.app.inbox.service import InterventionService
+    from backend.app.models import InterventionRequest
+    from sqlalchemy import select
+
+    service = InterventionService(db)
+    resolved_by = getattr(principal, "email", None) or "unknown-operator"
+    try:
+        request = await db.scalar(
+            select(InterventionRequest)
+            .where(
+                InterventionRequest.task_id == task.id,
+                InterventionRequest.status == "PENDING",
+            )
+            .order_by(InterventionRequest.created_at.desc())
+            .limit(1)
+        )
+        if request is None:
+            return
+        # A SAVEPOINT, so a failure rolls back only this bookkeeping rather than leaving
+        # the whole session aborted. Without it, a failure after a flush would poison the
+        # transaction and the endpoint's commit would raise -- which is worse than not
+        # resolving at all: the browser session is already resumed, and the database would
+        # disagree with it.
+        async with db.begin_nested():
+            await service.mark_resolved(
+                request,
+                resolved_by=f"{resolved_by} (live-session-resume)",
+                outcome=(
+                    "The operator resumed the live session from the dashboard. The session was "
+                    "re-inspected before this task was re-queued; what the step actually needs "
+                    "will be established by the task's own verification."
+                ),
+            )
+    except Exception as exc:
+        # Never fail the resume over bookkeeping. Worst case the request stays open and an
+        # operator can still answer it through the Inbox.
+        logger.warning("Could not resolve the intervention for task %s: %s", task.task_id, exc)
+
+
 _KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _INTEGRATION_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
 STATUSES = ("running", "waiting_for_user", "paused", "failed", "stopped")
@@ -243,11 +300,31 @@ async def resume(
         manager = TaskManager(db)
         task = await manager.get_by_task_id(task_id)
         if task is not None and task.status == TaskStatus.NEEDS_USER_ACTION.value:
-            try:
-                await manager.transition(task, TaskStatus.READY, reason="Operator completed verification; session resumed")
+            # Compare-and-set, exactly like the Agent Inbox reply path. A plain transition
+            # would overwrite whatever else has claimed the task since it was read, and two
+            # concurrent resumes could both queue it.
+            moved = await manager.transition_if_current(
+                task,
+                (TaskStatus.NEEDS_USER_ACTION,),
+                TaskStatus.READY,
+                reason="Operator completed verification; session resumed",
+                progress=task.progress,
+                next_planned_action=task.next_planned_action,
+            )
+            if moved:
                 task_resumed = task.task_id
-            except Exception as exc:  # leave the task parked rather than guess
-                logger.warning("Could not re-queue task %s: %s", task_id, exc)
+                task.next_execution_at = None
+                # The intervention this task was parked on is now answered, so its request
+                # and the conversation's "needs reply" flag are resolved too. Leaving them
+                # open left the Inbox showing a request nobody could ever satisfy: a reply
+                # arriving later was refused because READY is not a resumable-from status,
+                # so the conversation got stuck on a task that was already moving again.
+                await _resolve_open_intervention(db, task, principal)
+            else:
+                logger.info(
+                    "Task %s was no longer NEEDS_USER_ACTION when the session resumed; "
+                    "not re-queued a second time.", task_id,
+                )
     result["task_requeued"] = task_resumed
     await write_audit(db, principal, "LIVE_SESSION_RESUME", "live_session", f"{integration}:{key}",
                       after_state={"resumed_from": result.get("resumed_from"), "task_requeued": task_resumed})

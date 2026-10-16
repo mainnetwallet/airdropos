@@ -43,6 +43,8 @@ from backend.app.llm.compaction import (
     detect_billing_refusal_in_content,
 )
 from backend.app.llm.token_budget import TokenBudget, count_request_tokens, record_usage
+from backend.app.tasks.telemetry import record_llm_call
+from backend.app.tools.context import get_current_task_id
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +186,9 @@ class FixedLLMClient:
         # Every distinct model the provider has said it served. Exposed so an
         # operator can SEE routing instead of inferring it.
         self._served_models: set = set()
+        # Set once this endpoint rejects `stream_options`. Per-process, like the served
+        # model set, because it is a property of the endpoint rather than of a request.
+        self._stream_usage_rejected: bool = False
 
     # ------------------------------------------------------------------
     # Fixed-model integrity
@@ -237,6 +242,11 @@ class FixedLLMClient:
             payload["stop"] = stop
         if stream:
             payload["stream"] = True
+            # Without this, an OpenAI-compatible endpoint emits no usage block on a
+            # streamed response at all, so streamed traffic was invisible to accounting
+            # while identical non-streamed traffic was counted. Endpoints that do not
+            # understand the option ignore it; those that do now report honestly.
+            payload["stream_options"] = {"include_usage": True}
         return payload
 
     def describe(self) -> Dict[str, Any]:
@@ -475,6 +485,12 @@ class FixedLLMClient:
                 ):
                     empty_retries += 1
                     record_usage(estimated, raw.get("usage"))
+                    # The discarded reply still cost a round trip, so it is still counted.
+                    # Without this a task that repeatedly draws empty answers would look
+                    # cheaper than one that did not.
+                    self._record_task_usage(
+                        raw.get("usage"), raw.get("model") or None
+                    )
                     logger.warning(
                         "llm.empty_content the model returned reasoning but no answer; "
                         "retrying the same request (%s/%s)",
@@ -487,6 +503,7 @@ class FixedLLMClient:
 
         record_usage(estimated, raw.get("usage"))
         self._record_served_model(response.model)
+        self._record_task_usage(response.usage, response.model)
         return response
 
     def _normalize(self, raw: Dict[str, Any]) -> "LLMResponse":
@@ -567,6 +584,37 @@ class FixedLLMClient:
                 category="MODEL_MISMATCH",
                 retryable=False,
             )
+
+    def _record_task_usage(
+        self,
+        usage: Optional[Dict[str, Any]],
+        served_model: Optional[str],
+    ) -> None:
+        """Attribute this request's usage and served model to the running task, if any.
+
+        The client is a process-wide singleton shared by operator chat, the planner, the
+        completion judge and the worker, so it cannot know on its own which task a request
+        belongs to. `backend.app.tools.context` already publishes that id for the duration
+        of a tool call; the controller publishes it around a whole execution window, which
+        is what lets planner calls, replan calls, discovery extraction and the completion
+        verdict all land on the right task.
+
+        A request made outside any task (operator chat with no task id) records nothing:
+        chat usage is reported in the chat response itself, and attributing it to an
+        arbitrary task would be a fabrication.
+        """
+        try:
+            task_id = get_current_task_id()
+            if not task_id:
+                return
+            record_llm_call(
+                usage=usage,
+                requested_model=self._model_id,
+                served_model=served_model,
+                task_id=task_id,
+            )
+        except Exception as exc:  # pragma: no cover - telemetry is best effort
+            logger.debug("Could not attribute LLM usage to a task: %s", exc)
 
     async def complete_json(
         self,
@@ -687,49 +735,83 @@ class FixedLLMClient:
         }
         url = f"{self.base_url}/chat/completions"
 
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                async with client.stream("POST", url, json=payload, headers=headers) as response:
-                    if response.status_code != 200:
-                        body = await response.aread()
-                        text = body.decode("utf-8", "replace")
-                        # The stream never yields partial output before this point,
-                        # so a context overflow here is still safely retryable. Once
-                        # the first token has been yielded below, no retry is ever
-                        # attempted: replaying would duplicate output the caller has
-                        # already seen.
-                        if classify_provider_error(response.status_code, text) == "CONTEXT_OVERFLOW":
+        # `stream_options.include_usage` is what makes a streamed response report token
+        # usage at all; without it streamed traffic was invisible to accounting while the
+        # identical non-streamed request was counted. Some strict OpenAI-compatible
+        # endpoints (Azure, several gateways) validate the request body and reject the
+        # argument with HTTP 400, which would otherwise silently cost this deployment its
+        # live token streaming. So the rejection is detected, remembered, and the option
+        # is never sent again.
+        send_usage_option = settings.LLM_STREAM_INCLUDE_USAGE and not self._stream_usage_rejected
+
+        for attempt in (1, 2):
+            body = dict(payload)
+            if not send_usage_option:
+                body.pop("stream_options", None)
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    async with client.stream("POST", url, json=body, headers=headers) as response:
+                        if response.status_code != 200:
+                            text = (await response.aread()).decode("utf-8", "replace")
+                            if (
+                                attempt == 1
+                                and send_usage_option
+                                and response.status_code == 400
+                                and "stream_options" in text
+                            ):
+                                self._stream_usage_rejected = True
+                                logger.warning(
+                                    "LLM endpoint rejected stream_options; streamed requests "
+                                    "will not carry usage. Accounting for streamed turns will "
+                                    "be unavailable on this endpoint."
+                                )
+                                continue
+                            # The stream never yields partial output before this point,
+                            # so a context overflow here is still safely retryable. Once
+                            # the first token has been yielded below, no retry is ever
+                            # attempted: replaying would duplicate output the caller has
+                            # already seen.
+                            if classify_provider_error(response.status_code, text) == "CONTEXT_OVERFLOW":
+                                raise LLMError(
+                                    "The model refused the streamed request because it exceeded "
+                                    "the context window.",
+                                    category="CONTEXT_OVERFLOW",
+                                    retryable=False,
+                                )
                             raise LLMError(
-                                "The model refused the streamed request because it exceeded "
-                                "the context window.",
-                                category="CONTEXT_OVERFLOW",
-                                retryable=False,
+                                f"LLM stream failed with HTTP {response.status_code}: {text[:300]!r}",
+                                category="HTTP_ERROR",
+                                retryable=response.status_code >= 500,
                             )
-                        raise LLMError(
-                            f"LLM stream failed with HTTP {response.status_code}: {text[:300]!r}",
-                            category="HTTP_ERROR",
-                            retryable=response.status_code >= 500,
-                        )
-                    async for line in response.aiter_lines():
-                        if not line or not line.startswith("data:"):
-                            continue
-                        data = line[5:].strip()
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                        except json.JSONDecodeError:
-                            continue
-                        if isinstance(chunk, dict):
-                            yield chunk
-        except httpx.HTTPError as exc:
-            # A transport failure is an LLM failure the caller can classify, not a
-            # raw httpx exception that would surface as an unexplained 500.
-            raise LLMError(
-                f"LLM stream connection failed: {type(exc).__name__}: {exc}",
-                category="CONNECTION_ERROR",
-                retryable=True,
-            ) from exc
+                        async for line in response.aiter_lines():
+                            if not line or not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                            except json.JSONDecodeError:
+                                continue
+                            if isinstance(chunk, dict):
+                                yield chunk
+                return
+            except httpx.HTTPError as exc:
+                # A transport failure is an LLM failure the caller can classify, not a
+                # raw httpx exception that would surface as an unexplained 500.
+                self._record_task_usage(None, None)
+                raise LLMError(
+                    f"LLM stream connection failed: {type(exc).__name__}: {exc}",
+                    category="CONNECTION_ERROR",
+                    retryable=True,
+                ) from exc
+            except GeneratorExit:
+                raise
+        # Both attempts consumed without returning or raising: treat as a transport fault
+        # rather than silently ending the stream.
+        raise LLMError(
+            "LLM stream ended without completing.", category="HTTP_ERROR", retryable=True
+        )
 
     async def stream(
         self,
@@ -813,6 +895,7 @@ class FixedLLMClient:
                 retryable=False,
             )
         self._record_served_model(model)
+        self._record_task_usage(usage, model)
         return LLMResponse(
             content=content,
             model=model or None,
@@ -879,6 +962,10 @@ class FixedLLMClient:
 
                 body_snippet = response.text[:400]
 
+                # Every error response below leaves the loop by raising rather than by
+                # exhausting retries, so they are counted here instead of at the bottom.
+                self._record_task_usage(None, None)
+
                 # A genuine context-window refusal is the one 4xx that is worth
                 # acting on rather than merely reporting, because the caller can
                 # genuinely fix it by sending a smaller request. It is detected
@@ -931,6 +1018,10 @@ class FixedLLMClient:
                         category="BAD_REQUEST",
                         retryable=False,
                     )
+                # 429 and 5xx fall through to the retry below instead of raising, so the
+                # attempt is counted here rather than at the bottom of the loop -- counting
+                # in both places reported three rejected attempts as six.
+                self._record_task_usage(None, None)
 
             except httpx.TimeoutException as exc:
                 last_error = LLMError(f"LLM request timed out: {exc}", category="TIMEOUT", retryable=True)
@@ -942,6 +1033,11 @@ class FixedLLMClient:
                 )
             except httpx.HTTPError as exc:
                 last_error = LLMError(f"LLM transport error: {exc}", category="TRANSPORT_ERROR", retryable=True)
+                # A transport-level attempt still cost a round trip against the configured
+                # model. Recorded so the per-task request count reflects real spend, and
+                # recorded WITHOUT usage because no response carried any -- which is
+                # "unknown", not "zero".
+                self._record_task_usage(None, None)
 
             if attempt < self._max_attempts:
                 backoff = min(2 ** (attempt - 1), 8)

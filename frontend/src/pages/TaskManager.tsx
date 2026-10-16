@@ -157,12 +157,33 @@ const STATUSES: Array<TaskStatus | 'ALL'> = [
   'IN_PROGRESS',
   'READY',
   'RETRYING',
+  'WAITING',
   'NEEDS_USER_ACTION',
   'COMPLETED',
   'FAILED',
+  'CANCELLED',
   'UNVERIFIED',
   'PARTIALLY_COMPLETED',
 ]
+
+/**
+ * Stop polling once nothing further can happen on its own.
+ *
+ * `TERMINAL` is not the right test: `NEEDS_USER_ACTION`, `WAITING`, `PARTIALLY_COMPLETED`
+ * and `UNVERIFIED` are all parked states that will not move until a person or a worker
+ * acts, and a task parked in the Inbox overnight would otherwise issue thousands of
+ * requests for a value that cannot have changed. A task that is still READY, RETRYING or
+ * IN_PROGRESS has NOT stopped, so it keeps polling.
+ */
+const PARKED_STATUSES = new Set<TaskStatus>([
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED',
+  'NEEDS_USER_ACTION',
+  'WAITING',
+  'PARTIALLY_COMPLETED',
+  'UNVERIFIED',
+])
 
 // Phone filter groups, built from the real task statuses.
 type Group = 'all' | 'running' | 'pending' | 'completed' | 'failed'
@@ -279,6 +300,19 @@ export default function TaskManagerPage() {
     queryKey: ['task', selected],
     queryFn: () => api.getTask(selected!),
     enabled: Boolean(selected),
+    // The open task's detail used to be fetched once and then frozen at whatever it said
+    // when it was opened. A task that yields an execution window, parks for the operator,
+    // recovers, or finishes would keep showing its opening state, so the blocker, the
+    // progress and the next action were all stale. A background task's state is exactly
+    // what an operator is watching this panel for.
+    refetchInterval: (query) => {
+      // On error there is no status, and the task may well be gone: a deleted task's
+      // endpoint 404s, so polling on that basis would re-request a deleted task for ever.
+      if (query.state.status === 'error') return false
+      const status = query.state.data?.status
+      if (!status) return 8000
+      return PARKED_STATUSES.has(status) ? false : 8000
+    },
   })
 
   const cancel = useMutation({
@@ -599,6 +633,58 @@ export default function TaskManagerPage() {
                         {detailQuery.data.next_planned_action}
                       </p>
                     )}
+
+                  {/* A task that stopped for any reason other than a human must say why.
+                      UNVERIFIED and FAILED were previously indistinguishable here: both
+                      showed only a progress bar, so "we could not prove it" and "we tried
+                      and it broke" looked identical. */}
+                  {detailQuery.data.status !== 'NEEDS_USER_ACTION' &&
+                    (detailQuery.data.status === 'FAILED' ||
+                      detailQuery.data.status === 'UNVERIFIED') && (
+                      <Alert
+                        kind={detailQuery.data.status === 'UNVERIFIED' ? 'warning' : 'error'}
+                        title={
+                          detailQuery.data.status === 'UNVERIFIED'
+                            ? 'Ran, but not verified'
+                            : 'Stopped'
+                        }
+                      >
+                        <p>
+                          {detailQuery.data.error_details &&
+                          Object.keys(detailQuery.data.error_details).length > 0
+                            ? JSON.stringify(detailQuery.data.error_details).slice(0, 900)
+                            : detailQuery.data.status === 'UNVERIFIED'
+                              ? 'Steps were processed but no authoritative evidence proved the objective. The completed work is preserved — resume this task to verify the rest.'
+                              : 'The task stopped. See the execution history below for the last action and its result.'}
+                        </p>
+                        {detailQuery.data.status === 'UNVERIFIED' && (
+                          <button
+                            type="button"
+                            onClick={() => retry.mutate(detailQuery.data.task_id)}
+                            className="btn-primary mt-2 w-full justify-center"
+                          >
+                            Resume verification
+                          </button>
+                        )}
+                      </Alert>
+                    )}
+
+                  {detailQuery.data.telemetry && (
+                    <div className="text-[11px] text-slate-500">
+                      <span className="font-semibold uppercase text-slate-500">Ran: </span>
+                      {detailQuery.data.telemetry.llm_requests} model request(s),{' '}
+                      {detailQuery.data.telemetry.tool_calls} tool call(s),{' '}
+                      {detailQuery.data.telemetry.replans_total} replan(s) across{' '}
+                      {detailQuery.data.telemetry.execution_windows} execution window(s)
+                      {detailQuery.data.telemetry.llm_input_tokens === null &&
+                        detailQuery.data.telemetry.llm_input_tokens !== undefined && (
+                        <>
+                          {' '}
+                          (token usage not reported by the provider)
+                        </>
+                      )}
+                    </div>
+                  )}
 
                   {detailQuery.data.context &&
                     !('error' in detailQuery.data.context) && (

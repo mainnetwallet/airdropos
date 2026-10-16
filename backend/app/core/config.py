@@ -135,6 +135,16 @@ class Settings(BaseSettings):
         ),
     )
     # Retries after the first attempt. Capped at 1 by the client: one retry on error, then fail.
+    LLM_STREAM_INCLUDE_USAGE: bool = Field(
+        default=True,
+        description=(
+            "Ask the provider for token usage on streamed responses. Without it a streamed "
+            "turn reports no tokens at all while the identical non-streamed request does, "
+            "so streamed traffic is invisible to cost accounting. If an endpoint rejects "
+            "the argument the client stops sending it and logs a warning, so this can be "
+            "left on for OpenAI-compatible routers that validate the request body."
+        ),
+    )
     LLM_MAX_RETRIES: int = Field(default=1)
 
     # ------------------------------------------------------------------
@@ -321,8 +331,54 @@ class Settings(BaseSettings):
         description="Maximum automatic retries before marking FAILED or NEEDS_USER_ACTION",
     )
     MAX_EXECUTION_LOOP_ITERATIONS: int = Field(
-        default=20,
-        description="Prevent runaway Observe-Plan-Act-Verify loops",
+        default=40,
+        ge=1,
+        description=(
+            "How many reasoning cycles ONE worker run may spend on a task. This bounds an "
+            "execution *window*, not the lifetime of the task: when it is reached the "
+            "controller checkpoints, hands the task back to the queue (READY) and the "
+            "worker claims it again. Raising it makes windows longer, never makes a task "
+            "stop sooner. Genuine stalls are caught by "
+            "MAX_UNPRODUCTIVE_EXECUTION_WINDOWS instead of by this number."
+        ),
+    )
+    EXECUTION_WINDOW_YIELD_DELAY_SECONDS: float = Field(
+        default=5.0,
+        ge=0.0,
+        description=(
+            "How long a task waits after an execution window yields before it becomes "
+            "claimable again. Spaces out continued work so a long task does not spin the "
+            "worker, and gives the operator a moment to cancel."
+        ),
+    )
+    MAX_UNPRODUCTIVE_EXECUTION_WINDOWS: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "How many consecutive execution windows may end without ANY progress (no "
+            "verified step, no plan revision, no new evidence, no outstanding-requirement "
+            "change) before the task is stopped with an accurate blocker. This is the real "
+            "anti-loop guard; MAX_EXECUTION_LOOP_ITERATIONS only bounds one window."
+        ),
+    )
+    MAX_RECOVERY_REPLANS_PER_TASK: int = Field(
+        default=12,
+        ge=0,
+        description=(
+            "How many times a task may revise its plan to recover from failures, counted "
+            "across its whole lifetime from the persisted revision history. A replan that "
+            "produces no new plan does not consume this budget. Reaching it stops the task "
+            "with the last problem named rather than failing it silently."
+        ),
+    )
+    MAX_REPEATED_NO_CHANGE_REPLANS: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "How many consecutive replans may return a plan identical to the current one "
+            "before the run stops with 'replanning produced no new plan'. This is what "
+            "stops the same ineffective plan being regenerated indefinitely."
+        ),
     )
     MAX_PROSE_EXTRACTIONS_PER_RUN: Optional[int] = Field(
         default=None,
@@ -340,10 +396,48 @@ class Settings(BaseSettings):
         ge=0,
         le=12,
         description=(
-            "How many times a run may revise its plan because executing it discovered "
-            "something new. Separate from the failure-replan budget: discovering that a "
-            "bot wants a channel joined is progress, not a failure, and must not exhaust "
-            "the retry allowance."
+            "DEPRECATED per-run name kept so an existing deployment's configuration still "
+            "reads. Use MAX_DISCOVERY_REPLANS_PER_TASK, which is counted per task and "
+            "persisted across worker restarts and execution windows."
+        ),
+    )
+    MAX_DISCOVERY_REPLANS_PER_TASK: int = Field(
+        default=12,
+        ge=0,
+        description=(
+            "How many times ONE TASK may revise its plan because executing it discovered "
+            "something genuinely new. Counted from the persisted revision history, so it "
+            "survives worker restarts and further execution windows instead of resetting "
+            "to three on every run. A replan that adds no step addressing the outstanding "
+            "requirement is not charged. Separate from the recovery-replan budget: "
+            "discovering that a bot wants a channel joined is progress, not a failure."
+        ),
+    )
+    CHAT_MAX_TOOL_ROUNDS: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "How many reasoning rounds ONE chat message may spend. A chat turn is a "
+            "conversation turn, not task execution: anything long-running belongs in a "
+            "task, which the worker runs with its own budget and checkpoints."
+        ),
+    )
+    CHAT_MAX_TOOL_CALLS_PER_TURN: int = Field(
+        default=40,
+        ge=1,
+        description=(
+            "Maximum tool calls the chat loop will execute for one message. Tool calls the "
+            "model requested beyond this are reported back to the model rather than "
+            "silently discarded."
+        ),
+    )
+    CHAT_TURN_TIME_BUDGET_SECONDS: float = Field(
+        default=600.0,
+        gt=0.0,
+        description=(
+            "Wall-clock budget for one chat turn, checked at safe boundaries (before a "
+            "model round and before each tool call) so an in-flight tool is never abandoned "
+            "half-run."
         ),
     )
     REQUIRE_CONFIRMATION_ABOVE_USD: float = Field(

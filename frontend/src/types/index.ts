@@ -92,6 +92,27 @@ export interface TaskReport {
     at: string
   }>
   recent_events: Array<{ type: string; severity: string; reason: string | null; at: string }>
+  /**
+   * Cumulative for the whole lifetime of the task, across every execution window and
+   * worker restart. `llm_input_tokens` / `llm_output_tokens` are `null` when the provider
+   * reported no usage, which is NOT the same as zero — see `llm_calls_without_usage`.
+   */
+  telemetry?: {
+    execution_windows: number
+    unproductive_windows: number
+    llm_requests: number
+    llm_input_tokens: number | null
+    llm_output_tokens: number | null
+    llm_calls_without_usage: number
+    last_served_model: string | null
+    served_model_mismatches: number
+    tool_calls: number
+    tool_failures: number
+    replans_total: number
+    recovery_replans_total: number
+    discovery_replans_total: number
+    last_blocker: string | null
+  }
   transactions: Array<{
     hash: string | null
     status: string

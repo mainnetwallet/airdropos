@@ -1229,6 +1229,23 @@ class TaskContextService:
         self._touch(context)
         await self.db.flush()
 
+    async def refused_permission(self, task: Task, permission: str) -> Optional[str]:
+        """Why this permission was already refused for this task, or None.
+
+        A refusal is a decision, not an outage: repeating the same call cannot change the
+        answer, and doing it anyway turns one clear refusal into a loop. Read back from
+        the persisted context, so it also survives a replan and a worker restart.
+        """
+        try:
+            context = await self.get(task)
+        except Exception:
+            return None
+        entry = (getattr(context, "authorization_state", None) or {}).get(str(permission)[:128])
+        if not isinstance(entry, dict) or entry.get("granted"):
+            return None
+        detail = str(entry.get("detail") or "").strip()
+        return detail or "The current policy does not permit this."
+
     async def record_failure(
         self, task: Task, *, error: str, category: str = "", recovery: str = ""
     ) -> None:

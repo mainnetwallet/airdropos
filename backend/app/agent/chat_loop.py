@@ -30,11 +30,12 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.prompts import build_chat_system_prompt
+from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, LLMResponse, Message, llm
 from backend.app.llm.json_stream import JsonStringFieldStreamer
 from backend.app.tools.base import ToolResultStatus
@@ -43,9 +44,9 @@ from backend.app.tools.registry import AuthorizationPolicy, ToolRegistry
 logger = logging.getLogger(__name__)
 
 # Bounds. One operator message must not become an unbounded agent run.
-MAX_TOOL_ROUNDS = 6
-MAX_TOOL_CALLS_PER_TURN = 12
-TURN_TIME_BUDGET_SECONDS = 150.0
+MAX_TOOL_ROUNDS = int(settings.CHAT_MAX_TOOL_ROUNDS)
+MAX_TOOL_CALLS_PER_TURN = int(settings.CHAT_MAX_TOOL_CALLS_PER_TURN)
+TURN_TIME_BUDGET_SECONDS = float(settings.CHAT_TURN_TIME_BUDGET_SECONDS)
 
 # Side effects that may never be taken on a single ambiguous sentence. The model is
 # asked for an approval request instead; the deterministic policy is what enforces it.
@@ -149,19 +150,26 @@ def _render_tool_result(record: ToolCallRecord) -> str:
     )
 
 
-def _parse_tool_calls(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _parse_tool_calls(
+    parsed: Dict[str, Any], limit: int
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Read the model's tool requests defensively.
 
     The model is told to emit `tool_calls: [{"tool": ..., "arguments": {...}}]`. Anything
     malformed is discarded here rather than half-executed: a tool call with no name, or
     with arguments that are not an object, cannot be validated, and an unvalidated call
     must never reach the registry.
+
+    Returns the calls to run and, separately, the names of any calls beyond this turn's
+    own ceiling. The dropped ones are NOT discarded silently -- the loop reports them back
+    to the model, because a model that believes work it requested has happened will not
+    ask again.
     """
     raw = parsed.get("tool_calls")
     if not isinstance(raw, list):
-        return []
+        return [], []
     calls: List[Dict[str, Any]] = []
-    for entry in raw[:MAX_TOOL_CALLS_PER_TURN]:
+    for entry in raw[:limit]:
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("tool") or entry.get("name") or "").strip()
@@ -171,7 +179,12 @@ def _parse_tool_calls(parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
         if arguments is None:
             arguments = entry.get("parameters")
         calls.append({"tool": name, "arguments": arguments if isinstance(arguments, dict) else {}})
-    return calls
+    deferred = [
+        str(e.get("tool") or e.get("name") or "?").strip()
+        for e in raw[limit:]
+        if isinstance(e, dict) and (e.get("tool") or e.get("name"))
+    ]
+    return calls, deferred
 
 
 class ChatToolLoop:
@@ -182,11 +195,35 @@ class ChatToolLoop:
         *,
         registry: ToolRegistry,
         policy: Optional[AuthorizationPolicy] = None,
-        max_rounds: int = MAX_TOOL_ROUNDS,
+        max_rounds: Optional[int] = None,
+        max_tool_calls: Optional[int] = None,
+        time_budget_seconds: Optional[float] = None,
     ) -> None:
         self.registry = registry
         self.policy = policy if policy is not None else registry.policy
-        self.max_rounds = max_rounds
+        # Operator-configurable rather than hard-coded. A chat turn is a conversation turn,
+        # not task execution: anything long-running belongs in a task, which the worker runs
+        # under its own budget with checkpoints and resumability.
+        self.max_rounds = max_rounds or MAX_TOOL_ROUNDS
+        self.max_tool_calls = max_tool_calls or MAX_TOOL_CALLS_PER_TURN
+        self.time_budget_seconds = (
+            time_budget_seconds if time_budget_seconds is not None else TURN_TIME_BUDGET_SECONDS
+        )
+        # Per-instance, never module-level: two chat turns can run concurrently in the same
+        # process, and a shared list would let one turn's model be told about another
+        # operator's requested tools.
+        self._deferred_tool_calls: List[str] = []
+        # Tool names actually invoked, per turn, so the "not run" report is about THIS
+        # round rather than about the accumulated history of the whole message.
+        self.tool_calls_this_turn: set = set()
+
+    def take_deferred_tool_calls(self) -> List[str]:
+        """Drain the tool calls this turn could not run."""
+        if not self._deferred_tool_calls:
+            return []
+        deferred = list(self._deferred_tool_calls)
+        self._deferred_tool_calls.clear()
+        return deferred
 
     async def run(
         self,
@@ -236,7 +273,7 @@ class ChatToolLoop:
                     "The client disconnected, so the remaining steps were not run."
                 )
                 break
-            if time.perf_counter() - started > TURN_TIME_BUDGET_SECONDS:
+            if time.perf_counter() - started > self.time_budget_seconds:
                 result.truncated = True
                 result.blockers.append(
                     "The turn hit its time budget before finishing. Nothing further was run."
@@ -283,12 +320,23 @@ class ChatToolLoop:
                 break
 
             reply = str(parsed.get("reply") or "").strip()
-            requested = _parse_tool_calls(parsed)
+            requested, deferred = _parse_tool_calls(parsed, self.max_tool_calls)
+            self._deferred_tool_calls.extend(deferred)
 
             if isinstance(parsed.get("create_task"), dict):
                 spec = parsed["create_task"]
 
             if not requested:
+                # Nothing survived the ceiling or the schema check, but the model may
+                # still have asked for real work. Say so rather than letting it believe
+                # the request simply did not happen.
+                if deferred:
+                    result.blockers.append(
+                        "This message asked for more tools than one turn allows; none were "
+                        f"run. Not run: {', '.join(deferred[:8])}. Create a task if this work "
+                        "needs to continue."
+                    )
+                    result.truncated = True
                 result.reply = reply
                 break
 
@@ -305,14 +353,24 @@ class ChatToolLoop:
                     )
                     exhausted = True
                     break
-                if len(result.tool_calls) >= MAX_TOOL_CALLS_PER_TURN:
+                if len(self.tool_calls_this_turn) >= self.max_tool_calls:
                     result.truncated = True
+                    # Only calls from THIS round that have not actually run. `result
+                    # .tool_calls` accumulates across rounds, so comparing against it
+                    # would hide a call that this round never got to.
+                    not_run = [
+                        str(c.get("tool") or "?")
+                        for c in requested
+                        if str(c.get("tool") or "") not in self.tool_calls_this_turn
+                    ]
                     result.blockers.append(
-                        f"Reached the {MAX_TOOL_CALLS_PER_TURN}-tool limit for one message."
+                        f"Reached the {self.max_tool_calls}-tool limit for one message; "
+                        + (f"not run: {', '.join(not_run[:8])}. " if not_run else "")
+                        + "Create a task if this work needs to continue."
                     )
                     exhausted = True
                     break
-                if time.perf_counter() - started > TURN_TIME_BUDGET_SECONDS:
+                if time.perf_counter() - started > self.time_budget_seconds:
                     result.truncated = True
                     result.blockers.append(
                         "The turn hit its time budget; remaining calls were skipped."
@@ -329,6 +387,7 @@ class ChatToolLoop:
                 )
                 record = await self._invoke(call)
                 result.tool_calls.append(record)
+                self.tool_calls_this_turn.add(record.tool)
                 transcript.append(_render_tool_result(record))
                 self._emit(
                     on_event,
@@ -345,14 +404,23 @@ class ChatToolLoop:
                 break
 
             messages.append(Message("assistant", response.content))
-            messages.append(
-                Message(
-                    "user",
-                    "Here are the real results of the tools you asked for. Continue with what "
-                    "you can now prove, and call a tool again only if you still need data you "
-                    "do not have.\n\n" + "\n\n".join(transcript),
-                )
+            feedback = (
+                "Here are the real results of the tools you asked for. Continue with what "
+                "you can now prove, and call a tool again only if you still need data you "
+                "do not have.\n\n" + "\n\n".join(transcript)
             )
+            # Tool calls beyond this turn's ceiling were not discarded silently. Say so, or
+            # the model will believe work it requested has happened.
+            deferred = self.take_deferred_tool_calls()
+            if deferred:
+                feedback += (
+                    "\n\nNOT RUN: you also asked for "
+                    + ", ".join(deferred[:10])
+                    + f", beyond the {self.max_tool_calls}-tool limit for one message. They were "
+                    "not executed. If they are still needed, create a task with "
+                    "`create_task` so the worker can carry them out properly."
+                )
+            messages.append(Message("user", feedback))
 
         if not result.reply:
             result.reply = self._fallback_reply(result)

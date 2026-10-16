@@ -470,6 +470,29 @@ async def task_execution_loop(slot: int = 0) -> None:
                         {"failures": [redact(str(f))[:300] for f in report.failures[:5]]},
                     )
 
+                if report.outcome.value == "continued":
+                    # The execution window yielded. The controller has already put the task
+                    # back in a claimable state with its checkpoints intact, so there is
+                    # nothing to settle -- but a task left IN_PROGRESS here would be
+                    # unclaimable and invisible, so that is treated as a fault rather than
+                    # silently accepted.
+                    if task.status == TaskStatus.IN_PROGRESS.value:
+                        logger.error(
+                            "Task %s yielded its execution window but is still IN_PROGRESS; "
+                            "settling it so it is claimable again.",
+                            task.task_id,
+                        )
+                        await _settle_failed_execution(
+                            current_task_pk,
+                            "execution window yielded without re-queueing the task",
+                            {"blockers": [redact(str(b))[:300] for b in report.blockers[:5]]},
+                        )
+                    else:
+                        logger.info(
+                            "Task %s yielded its execution window as %s; it will be claimed again.",
+                            task.task_id, task.status,
+                        )
+
                 if report.outcome.value == "needs_user_action" and report.blockers:
                     await dispatcher.notify(
                         f"Task {task.task_id} needs your action",

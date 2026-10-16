@@ -1,7 +1,7 @@
 /** AI Agent Console: natural-language chat with the central agent (dark "Agent Chat" screen on mobile). */
 
 import { memo, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
-import { useLocation, useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate, Link } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Activity,
@@ -153,6 +153,27 @@ const TOOL_STATUS_STYLE: Record<AgentToolCall['status'], string> = {
   needs_user_action: 'text-amber-300',
   not_authorized: 'text-amber-300',
   unavailable: 'text-slate-400',
+}
+
+/**
+ * What the status at task-creation time actually means, so "READY" is not read as
+ * "finished". A task created here is queued: the worker claims it, runs it, and may
+ * return it to the queue between execution windows.
+ */
+const TASK_STATUS_HINTS: Record<string, string> = {
+  CREATED: 'created',
+  READY: 'queued — the worker will pick it up',
+  RESEARCHING: 'researching',
+  PLANNING: 'planning',
+  IN_PROGRESS: 'running in the background',
+  WAITING: 'waiting on a condition',
+  RETRYING: 'will be retried automatically',
+  NEEDS_USER_ACTION: 'needs you — see Agent Inbox',
+  PARTIALLY_COMPLETED: 'partly done',
+  COMPLETED: 'done',
+  FAILED: 'stopped',
+  CANCELLED: 'cancelled',
+  UNVERIFIED: 'ran, but not verified',
 }
 
 /** One tool call, with its real outcome. */
@@ -1080,9 +1101,30 @@ export default function AgentChat() {
                 >
                   {m.error ? m.content : <Markdown text={m.content} />}
                   {m.taskId && (
-                    <div className="mt-2 inline-flex flex-wrap items-center gap-1.5 rounded-md bg-emerald-500/15 px-2 py-1 font-mono text-xs text-emerald-300">
-                      {m.taskId}
-                      {m.taskStatus && <span className="font-sans text-[11px] opacity-80">{m.taskStatus}</span>}
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <span className="inline-flex flex-wrap items-center gap-1.5 rounded-md bg-emerald-500/15 px-2 py-1 font-mono text-xs text-emerald-300">
+                        {m.taskId}
+                        {m.taskStatus && (
+                          <span className="font-sans text-[11px] opacity-80">
+                            {TASK_STATUS_HINTS[m.taskStatus] ?? m.taskStatus}
+                          </span>
+                        )}
+                      </span>
+                      {/* The chip used to be inert text: the task ran in the background
+                          with its progress, blockers and final outcome somewhere the
+                          operator could not reach from here. */}
+                      <Link
+                        to={`/tasks?task=${encodeURIComponent(m.taskId)}`}
+                        className="text-[11px] text-slate-400 underline decoration-dotted underline-offset-2 hover:text-slate-200"
+                      >
+                        Open in Task Manager
+                      </Link>
+                      <Link
+                        to="/inbox"
+                        className="text-[11px] text-slate-400 underline decoration-dotted underline-offset-2 hover:text-slate-200"
+                      >
+                        Agent Inbox
+                      </Link>
                     </div>
                   )}
                   <MessageDetail message={m} />

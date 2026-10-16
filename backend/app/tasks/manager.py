@@ -22,9 +22,12 @@ from backend.app.models import (
     TaskEvidence,
     TaskExecution,
 )
+from backend.app.models.context import OUTCOME_CONFIRMED
 from backend.app.tasks.id_generator import reserve_task_id
 from backend.app.tasks.state_machine import (
     VALID_TRANSITIONS,
+    CompletionProof,
+    InvalidTransition,
     TaskStatus,
     assert_completion_verified,
     assert_transition,
@@ -37,6 +40,20 @@ logger = logging.getLogger(__name__)
 EVIDENCE_URI_MAX = 512
 DESCRIPTION_MAX = 6000
 EVIDENCE_LIST_LIMIT = 50
+
+# Statuses whose latest transition reason is the operator's explanation of what is
+# happening. `UNVERIFIED` and `FAILED` are included because "we ran it and could not prove
+# it" and "this stopped for reason X" are the two things an operator most needs to read,
+# and neither was visible before.
+_BLOCKER_REPORTING_STATUSES = frozenset(
+    {
+        TaskStatus.NEEDS_USER_ACTION,
+        TaskStatus.UNVERIFIED,
+        TaskStatus.PARTIALLY_COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.WAITING,
+    }
+)
 
 SEVERITY_BY_STATUS = {
     TaskStatus.COMPLETED: "INFO",
@@ -129,6 +146,7 @@ class TaskManager:
         progress: Optional[float] = None,
         error_details: Optional[Dict[str, Any]] = None,
         next_planned_action: Optional[str] = None,
+        proof: Optional[CompletionProof] = None,
     ) -> Task:
         """Apply a validated state transition and log the event."""
         current = TaskStatus(task.status)
@@ -136,7 +154,12 @@ class TaskManager:
 
         if new_status is TaskStatus.COMPLETED:
             # Enforces that completion was verified against evidence.
-            assert_completion_verified(new_status, verified, evidence_count)
+            assert_completion_verified(new_status, verified, evidence_count, proof)
+            # ...and that the evidence it claims actually exists in this task's persisted
+            # history. `verified`/`evidence_count` are caller assertions; this is not.
+            # Without the re-read, a caller could satisfy the guard above with a floored-up
+            # number and no observation behind it.
+            await self._assert_completion_is_evidenced(task, proof, evidence_count)
             task.completed_at = datetime.now(timezone.utc)
             task.last_verification_at = datetime.now(timezone.utc)
             task.progress = 1.0
@@ -171,6 +194,59 @@ class TaskManager:
             {"from": current.value, "to": new_status.value, "reason": reason, "verified": verified},
         )
         return task
+
+    async def _assert_completion_is_evidenced(
+        self,
+        task: Task,
+        proof: Optional[CompletionProof],
+        claimed_count: int,
+    ) -> None:
+        """Refuse COMPLETED when this task's own history does not show the confirmations.
+
+        The state machine validates the shape of what the caller claims. This re-reads the
+        rows that claim rests on: `TaskObservation` rows for *this task* whose outcome is a
+        confirmation and whose evidence is flagged authoritative. A task with no such
+        observation cannot be COMPLETED, however confident the caller (or the model that
+        advised it) was.
+
+        Only that count matters. `TaskEvidence` rows are deliberately NOT counted: the
+        column that would qualify them (`is_verified`) is never set anywhere in the
+        backend, so counting them would let an unverified screenshot row satisfy a guard
+        whose entire purpose is refusing unverified evidence. A tool that captures
+        evidence always records a confirming observation alongside it, so nothing real
+        is lost by requiring the stronger fact.
+        """
+        from backend.app.models import TaskObservation
+
+        # Everything the caller has flushed so far must be visible to this query.
+        await self.db.flush()
+
+        observations = int(
+            await self.db.scalar(
+                select(func.count(TaskObservation.id)).where(
+                    TaskObservation.task_id == task.id,
+                    TaskObservation.outcome == OUTCOME_CONFIRMED,
+                    TaskObservation.evidence_authoritative.is_(True),
+                )
+            )
+            or 0
+        )
+
+        if observations <= 0:
+            logger.warning(
+                "Refusing COMPLETED for %s: it claimed %s item(s) of evidence but this task "
+                "has no authoritative confirming observation in its history.",
+                task.task_id, claimed_count,
+            )
+            raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
+
+        if proof is not None and proof.authoritative_confirmations > observations:
+            # The proof over-reports. Trust the rows, not the summary.
+            logger.warning(
+                "Completion proof for %s claimed %s authoritative confirmation(s) but only "
+                "%s exist in this task's history; using the persisted count.",
+                task.task_id, proof.authoritative_confirmations, observations,
+            )
 
     # ------------------------------------------------------------------
     # Progress recording
@@ -503,15 +579,35 @@ class TaskManager:
             )
         ).scalars().all()
 
-        # Why the task is parked. The reason is stored on the status-transition
-        # event; surface it so the operator can see what they must do.
+        # Why the task is parked, or stopped. The reason is stored on the status-transition
+        # event; surface it so the operator can see what they must do. Shown for every
+        # status that represents "not finished and not moving", not only for a human
+        # hand-off: a task that stopped with a real reason is far more useful than one
+        # that simply reads FAILED.
         blocker: Optional[str] = None
-        if task.status == TaskStatus.NEEDS_USER_ACTION.value:
-            for e in events:  # newest first
+        if task.status in _BLOCKER_REPORTING_STATUSES:
+            # Queried directly rather than read off the capped event list above: an
+            # execution-window yield writes a STATUS_TRANSITION event every window, so on a
+            # long-running task the transition into the *current* status can fall outside
+            # `EVIDENCE_LIST_LIMIT`-style windows and the reason would silently vanish --
+            # exactly the "FAILED with no explanation" this was added to prevent.
+            transition = await self.db.scalar(
+                select(TaskEvent)
+                .where(
+                    TaskEvent.task_id == task.id,
+                    TaskEvent.event_type == "STATUS_TRANSITION",
+                )
+                .order_by(TaskEvent.created_at.desc(), TaskEvent.id)
+                .limit(50)
+            )
+            for e in ([transition] if transition is not None else []):
                 payload = e.payload or {}
-                if e.event_type == "STATUS_TRANSITION" and payload.get("to") == task.status:
+                if payload.get("to") == task.status:
                     blocker = str(payload.get("reason") or "") or None
                     break
+            if blocker is None:
+                # Fall back to the durable column, which never expires.
+                blocker = task.last_blocker
 
         pending = [
             a for a in (task.planned_actions or [])
@@ -586,6 +682,34 @@ class TaskManager:
                 for t in tx_rows
             ],
             "context": context_view,
+            "telemetry": self._telemetry_view(task),
+        }
+
+    @staticmethod
+    def _telemetry_view(task: Task) -> Dict[str, Any]:
+        """Cumulative execution telemetry for the whole lifetime of the task.
+
+        The token figures stay `None` when the provider never reported them. That is not
+        the same as zero, and rendering it as `0` would tell an operator a task cost
+        nothing on the very endpoints that omit usage.
+        """
+        return {
+            "execution_windows": task.execution_windows or 0,
+            "unproductive_windows": task.unproductive_windows or 0,
+            "llm_requests": task.llm_requests or 0,
+            "llm_input_tokens": task.llm_input_tokens,
+            "llm_output_tokens": task.llm_output_tokens,
+            # How many requests reported no usage block at all: the number whose token
+            # cost is genuinely unknown.
+            "llm_calls_without_usage": task.llm_calls_without_usage or 0,
+            "last_served_model": task.last_served_model,
+            "served_model_mismatches": task.served_model_mismatches or 0,
+            "tool_calls": task.tool_calls or 0,
+            "tool_failures": task.tool_failures or 0,
+            "replans_total": task.replans_total or 0,
+            "recovery_replans_total": task.recovery_replans_total or 0,
+            "discovery_replans_total": task.discovery_replans_total or 0,
+            "last_blocker": task.last_blocker,
         }
 
     async def _execution_context_view(self, task: Task) -> Dict[str, Any]:

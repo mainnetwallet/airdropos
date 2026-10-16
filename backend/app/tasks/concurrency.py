@@ -62,6 +62,21 @@ class LeaseManager:
     def _now() -> datetime:
         return datetime.now(timezone.utc)
 
+    @staticmethod
+    def _as_utc(value: Optional[datetime]) -> Optional[datetime]:
+        """Read a stored timestamp back as UTC-aware.
+
+        SQLite has no timezone type, so a timestamp written as aware comes back naive.
+        Comparing that to an aware `now()` raised TypeError rather than reporting a stale
+        lease, which meant the second `acquire` on an existing task crashed instead of
+        correctly raising LeaseConflict or taking over an expired lease.
+        """
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
     # ------------------------------------------------------------------
     async def acquire(
         self,
@@ -78,7 +93,7 @@ class LeaseManager:
         )
 
         if existing is not None:
-            live = existing.released_at is None and existing.expires_at > now
+            live = existing.released_at is None and self._as_utc(existing.expires_at) > now
             if live and existing.worker_id != worker_id:
                 raise LeaseConflict(
                     f"Task {task.task_id} is leased by worker '{existing.worker_id}' "

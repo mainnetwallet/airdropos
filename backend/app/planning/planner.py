@@ -109,6 +109,11 @@ class ReplanTrigger(str, Enum):
     # for a channel join, a page listed another task. This is progress, not a failure, so
     # it is budgeted separately and must never consume the retry allowance.
     DISCOVERY = "DISCOVERY"
+    # The plan ran to the end but the objective is not proven: an unverified step, a blocked
+    # step, or a requirement discovered while executing that nothing satisfied. This is the
+    # planner being asked "how do we PROVE this, or what is still missing?" rather than
+    # "how do we recover from a failure?", so it is a recovery replan with a different cause.
+    EVIDENCE_GAP = "EVIDENCE_GAP"
 
 
 # Task fields that describe the run itself. A plan step must never be gated on them: the

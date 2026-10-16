@@ -63,6 +63,33 @@ class Task(Base):
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_verification_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ------------------------------------------------------------------
+    # Execution telemetry.
+    #
+    # Cumulative for the whole lifetime of the task, not the latest run. Every counter is
+    # ADDED to as execution proceeds, so a task that spans several execution windows or
+    # several worker restarts keeps its real totals instead of having them overwritten by
+    # whatever the most recent model response happened to report.
+    #
+    # Token columns are nullable on purpose. `None` means the provider did not report the
+    # figure and it is therefore UNKNOWN; `0` means the provider reported zero. Collapsing
+    # those two would understate spend on exactly the router endpoints that omit usage.
+    # ------------------------------------------------------------------
+    execution_windows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_requests: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    llm_input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    llm_output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    llm_calls_without_usage: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    served_model_mismatches: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tool_calls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tool_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    replans_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    recovery_replans_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    discovery_replans_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unproductive_windows: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_served_model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    last_blocker: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     goal: Mapped[Optional["Goal"]] = relationship("Goal", back_populates="tasks")
     project: Mapped[Optional["Project"]] = relationship("Project", back_populates="tasks")
     parent_task: Mapped[Optional["Task"]] = relationship("Task", remote_side="Task.id", backref="subtasks")
