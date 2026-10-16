@@ -470,14 +470,19 @@ def _format_telegram_accounts() -> str:
     rows = []
     for a in accounts:
         who = a.get("profile_name") or ""
-        rows.append(f"  - {a['label']}" + (f" ({who})" if who else "") + (" [default]" if a.get("is_default") else ""))
+        handle = f"@{a['username']}" if a.get("username") else ""
+        shown = " ".join(x for x in (who, handle) if x)
+        rows.append(f"  - {a['label']}" + (f" ({shown})" if shown else "") + (" [default]" if a.get("is_default") else ""))
     return (
         "LOGGED-IN TELEGRAM ACCOUNTS (labels only):\n"
         + "\n".join(rows)
         + "\n  A task is bound to ONE of these for its whole life, and several tasks can run at the\n"
-        "  same time on the same or on different accounts. When the operator says which Telegram\n"
-        "  account a task should use, put that exact label in create_task.telegram_account. If they\n"
-        "  name none, leave it null (the default account is used). Never invent a label."
+        "  same time on the same or on different accounts. The operator chooses the account in the\n"
+        "  chat (there is no account picker in the UI), by its label, its display name or its\n"
+        "  @username. Map what they said to the exact label above and put that label in\n"
+        "  create_task.telegram_account. If they name none, leave it null (the default account is\n"
+        "  used). If they name one that is not listed, or the name fits more than one account, say\n"
+        "  so and ask which one instead of guessing. Never invent a label."
     )
 
 
