@@ -817,6 +817,9 @@ export default function AgentChat() {
     setAttachments([])
     setAttachError(null)
     setEditingId(null)
+    // A prompt handed over by another page lives in the router's history state and would
+    // otherwise come back on reload.
+    if (location.state) navigate(location.pathname, { replace: true, state: null })
   }
   const closeHistoryOnMobile = () => {
     if (!window.matchMedia('(min-width: 1024px)').matches) setHistoryOpen(false)
@@ -835,17 +838,6 @@ export default function AgentChat() {
     if (!window.confirm('Delete this conversation?')) return
     agentChatStore.deleteConversation(id)
     resetComposer()
-  }
-
-  const clearChat = () => {
-    if (!window.confirm('Clear this conversation?')) return
-    agentChatStore.clear()
-    // Also drop the draft in the box and any prompt handed over by another page (it lives in the
-    // router's history state and would otherwise come back on reload).
-    setInput('')
-    setAttachments([])
-    setAttachError(null)
-    if (location.state) navigate(location.pathname, { replace: true, state: null })
   }
 
   const fillPrompt = (prompt: string) => {
@@ -924,12 +916,6 @@ export default function AgentChat() {
           >
             <Info className="h-5 w-5" />
           </button>
-          {messages.length > 0 && (
-            <button type="button" className="btn-ghost" onClick={clearChat}>
-              <Trash2 className="h-4 w-4" />
-              <span className="hidden sm:inline">Clear chat</span>
-            </button>
-          )}
         </div>
       </header>
 
