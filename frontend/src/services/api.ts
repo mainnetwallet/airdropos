@@ -206,6 +206,7 @@ async function agentChatStream(
   onEvent: (event: AgentStreamEvent) => void,
   signal?: AbortSignal,
   telegramAccount?: string,
+  images?: string[],
 ): Promise<AgentChatResponse> {
   const path = '/agent/chat/stream'
   const token = getToken()
@@ -217,13 +218,23 @@ async function agentChatStream(
       Accept: 'text/event-stream',
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ message, history, telegram_account: telegramAccount || undefined }),
+    body: JSON.stringify({
+      message,
+      history,
+      telegram_account: telegramAccount || undefined,
+      images: images?.length ? images : undefined,
+    }),
   })
 
   if (response.status === 404 || response.status === 405) {
     return request<AgentChatResponse>('/agent/chat', {
       method: 'POST',
-      body: JSON.stringify({ message, history, telegram_account: telegramAccount || undefined }),
+      body: JSON.stringify({
+        message,
+        history,
+        telegram_account: telegramAccount || undefined,
+        images: images?.length ? images : undefined,
+      }),
       signal,
     })
   }
@@ -361,14 +372,17 @@ export const api = {
     message: string,
     history: Array<{ role: 'user' | 'assistant'; content: string }> = [],
     telegramAccount?: string,
+    images?: string[],
   ) =>
-    request<AgentChatResponse>(
-      '/agent/chat',
-      {
-        method: 'POST',
-        body: JSON.stringify({ message, history, telegram_account: telegramAccount || undefined }),
-      },
-    ),
+    request<AgentChatResponse>('/agent/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        message,
+        history,
+        telegram_account: telegramAccount || undefined,
+        images: images?.length ? images : undefined,
+      }),
+    }),
   /** Same turn as `agentChat`, with live progress. See `agentChatStream`. */
   agentChatStream,
 

@@ -17,6 +17,10 @@ export interface ChatMessage {
   id: string
   role: 'user' | 'agent'
   content: string
+  /** What the operator typed, when `content` also carries attached-file text. */
+  display?: string
+  /** Files and photos attached to this message. Thumbnails are not persisted. */
+  attachments?: Array<{ name: string; kind: 'image' | 'file'; thumb?: string }>
   at: string
   taskId?: string
   taskStatus?: string
@@ -73,10 +77,12 @@ const MAX_MESSAGES = 200
  * is re-fetchable from the backend if it is ever needed.
  */
 function slim(message: ChatMessage): ChatMessage {
-  if (!message.toolCalls) return message
+  const attachments = message.attachments?.map(({ thumb: _thumb, ...rest }) => rest)
+  const base = attachments ? { ...message, attachments } : message
+  if (!base.toolCalls) return base
   return {
-    ...message,
-    toolCalls: message.toolCalls.map((call) => ({
+    ...base,
+    toolCalls: base.toolCalls.map((call) => ({
       ...call,
       data: {},
     })),
@@ -139,6 +145,14 @@ export const agentChatStore = {
       at: new Date().toISOString(),
     }
     commit({ ...state, messages: [...state.messages, full].slice(-MAX_MESSAGES) })
+  },
+  /** Remove the newest message (used by "regenerate" to replace the last reply). */
+  removeLast(): void {
+    commit({ ...state, messages: state.messages.slice(0, -1) })
+  },
+  /** Stop the turn in flight; the backend ends it at its next safe boundary. */
+  stop(): void {
+    abortStream?.()
   },
   setPending(pending: boolean): void {
     // Pending is intentionally not persisted: it only describes this session. The live

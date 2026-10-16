@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -165,6 +166,10 @@ class ChatTurn(BaseModel):
     content: str
 
 
+_IMAGE_DATA_URL = re.compile(r"^data:image/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$")
+_MAX_IMAGE_CHARS = 8_000_000  # base64 text, about 6 MB of image
+
+
 class ChatRequest(BaseModel):
     # No bound on the operator's own message: the user must never be refused the
     # ability to submit a longer message because of a number chosen here.
@@ -185,6 +190,20 @@ class ChatRequest(BaseModel):
     # Telegram account a task created by this message must use (a label from
     # /telegram/accounts). Empty: whatever the message says, else the default account.
     telegram_account: Optional[str] = Field(default=None, max_length=40)
+    # Photos attached to THIS message only, as base64 image data URLs. They are not part
+    # of the stored history (the browser keeps just a text note), so a long conversation
+    # does not re-upload them on every turn.
+    images: List[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("images")
+    @classmethod
+    def _check_images(cls, value: List[str]) -> List[str]:
+        for url in value:
+            if not _IMAGE_DATA_URL.match(url):
+                raise ValueError("images must be base64 data URLs (png, jpeg, webp or gif)")
+            if len(url) > _MAX_IMAGE_CHARS:
+                raise ValueError("an attached image is too large (limit about 6 MB)")
+        return value
 
 
 def _trim_history(history: List["ChatTurn"]) -> List["ChatTurn"]:
@@ -299,7 +318,9 @@ async def agent_chat(
         )
 
     try:
-        turn = await loop.run(db=db, message=message, history=history, create_task=create_task)
+        turn = await loop.run(
+            db=db, message=message, history=history, create_task=create_task, images=payload.images
+        )
     except Exception as exc:  # the loop is defensive; never silently lose a turn
         logger.exception("Agent chat turn failed")
         raise HTTPException(
@@ -383,6 +404,7 @@ async def agent_chat_stream(
                     create_task=create_task,
                     on_event=queue.put_nowait,
                     should_stop=lambda: client_gone,
+                    images=payload.images,
                 )
             queue.put_nowait(
                 {

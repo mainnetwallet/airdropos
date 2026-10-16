@@ -79,7 +79,7 @@ class LLMPolicyError(Exception):
 class Message:
     """A single chat message. Deliberately simple to keep provider payloads explicit."""
 
-    __slots__ = ("role", "content", "name", "tool_call_id")
+    __slots__ = ("role", "content", "name", "tool_call_id", "images")
 
     def __init__(
         self,
@@ -87,6 +87,7 @@ class Message:
         content: str,
         name: Optional[str] = None,
         tool_call_id: Optional[str] = None,
+        images: Optional[List[str]] = None,
     ):
         if role not in ("system", "user", "assistant", "tool"):
             raise ValueError(f"Invalid role: {role}")
@@ -94,9 +95,17 @@ class Message:
         self.content = content
         self.name = name
         self.tool_call_id = tool_call_id
+        # Image data URLs attached to this message. Kept apart from `content` so token
+        # estimation and compaction, which work on text, are untouched.
+        self.images = list(images) if images else []
 
     def to_payload(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.images and self.role == "user":
+            # OpenAI-compatible multimodal content parts.
+            payload["content"] = [{"type": "text", "text": self.content}] + [
+                {"type": "image_url", "image_url": {"url": url}} for url in self.images
+            ]
         if self.name:
             payload["name"] = self.name
         if self.tool_call_id:

@@ -197,6 +197,7 @@ class ChatToolLoop:
         create_task: Optional[Any] = None,
         on_event: Optional[EventCallback] = None,
         should_stop: Optional[Callable[[], bool]] = None,
+        images: Optional[List[str]] = None,
     ) -> ChatTurnResult:
         """Execute one turn. `create_task` persists a task the model asked for.
 
@@ -219,7 +220,7 @@ class ChatToolLoop:
         messages: List[Message] = [Message("system", system)]
         for turn in history:
             messages.append(Message(turn.role, turn.content))
-        messages.append(Message("user", message))
+        messages.append(Message("user", message, images=images))
 
         # Appended so the final answer is produced with the tool results in context.
         transcript: List[str] = []

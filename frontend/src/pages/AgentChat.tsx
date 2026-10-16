@@ -7,20 +7,33 @@ import {
   Activity,
   AlertTriangle,
   ArrowUp,
+  FileText,
+  Plus,
+  RefreshCw,
+  Square,
+  X,
   Check,
   Copy,
   Info,
   ListChecks,
   Search,
-  Send,
   ShieldAlert,
   Trash2,
   Wallet,
   XCircle,
 } from 'lucide-react'
 import clsx from 'clsx'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { api } from '@/services/api'
 import { agentChatStore, type ChatMessage, type LiveTool, type LiveTurn } from '@/services/agentChatStore'
+import {
+  MAX_FILES,
+  MAX_IMAGES,
+  composeMessage,
+  readAttachment,
+  type PendingAttachment,
+} from '@/services/chatAttachments'
 import { Alert } from '@/components/ui'
 import type { AgentToolCall, AutonomousRule, AutonomyPolicy } from '@/types'
 
@@ -362,10 +375,10 @@ function LiveReply({ live }: { live: LiveTurn | null }) {
           ))}
         </ul>
       )}
-      <div className="whitespace-pre-wrap break-words text-[15px] leading-7 text-slate-100">
+      <div className="break-words text-[15px] leading-7 text-slate-100">
         {hasText ? (
           <>
-            {live!.text}
+            <Markdown text={live!.text} />
             <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-300" aria-hidden />
           </>
         ) : (
@@ -374,6 +387,68 @@ function LiveReply({ live }: { live: LiveTurn | null }) {
           </span>
         )}
       </div>
+    </div>
+  )
+}
+
+/** Agent text as Markdown (lists, code, tables, links). Raw HTML is never rendered. */
+function Markdown({ text }: { text: string }) {
+  return (
+    <div
+      className={clsx(
+        'break-words [&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
+        '[&_p]:my-2 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_li]:my-0.5',
+        '[&_h1]:mb-2 [&_h1]:mt-4 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:mb-2 [&_h2]:mt-4 [&_h2]:text-lg [&_h2]:font-semibold [&_h3]:mb-1 [&_h3]:mt-3 [&_h3]:font-semibold',
+        '[&_a]:text-sky-400 [&_a]:underline [&_blockquote]:my-2 [&_blockquote]:border-l-2 [&_blockquote]:border-surface-300 [&_blockquote]:pl-3 [&_blockquote]:text-slate-300',
+        '[&_pre]:my-3 [&_pre]:overflow-x-auto [&_pre]:rounded-xl [&_pre]:bg-slate-950/70 [&_pre]:p-3 [&_pre]:text-[13px]',
+        '[&_:not(pre)>code]:rounded [&_:not(pre)>code]:bg-surface-300/70 [&_:not(pre)>code]:px-1 [&_:not(pre)>code]:py-0.5 [&_:not(pre)>code]:font-mono [&_:not(pre)>code]:text-[13px]',
+        '[&_table]:my-3 [&_table]:block [&_table]:overflow-x-auto [&_td]:border [&_td]:border-surface-300 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-surface-300 [&_th]:px-2 [&_th]:py-1 [&_th]:text-left',
+      )}
+    >
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+/** Thumbnail (photo) or name chip (file) for an attachment. `onRemove` only in the composer. */
+function AttachmentChip({
+  name,
+  kind,
+  thumb,
+  onRemove,
+}: {
+  name: string
+  kind: 'image' | 'file'
+  thumb?: string
+  onRemove?: () => void
+}) {
+  return (
+    <div className="relative flex items-center gap-2 rounded-xl border border-surface-300 bg-surface-100/60 p-1.5 pr-3 text-xs text-slate-200">
+      {kind === 'image' && thumb ? (
+        <img src={thumb} alt={name} className="h-12 w-12 rounded-lg object-cover" />
+      ) : (
+        <span className="flex h-12 w-12 items-center justify-center rounded-lg bg-surface-300/70 text-slate-300">
+          <FileText className="h-5 w-5" />
+        </span>
+      )}
+      <span className="max-w-[10rem] truncate">{name}</span>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          aria-label={`Remove ${name}`}
+          className="absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-slate-200 text-slate-900 hover:bg-white"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      )}
     </div>
   )
 }
@@ -414,6 +489,10 @@ export default function AgentChat() {
   // Other screens can hand over a draft (e.g. "define a goal"); it is never auto-sent.
   const [input, setInput] = useState(() => (location.state as { prompt?: string } | null)?.prompt ?? '')
   const [showInfo, setShowInfo] = useState(false)
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([])
+  const [attachError, setAttachError] = useState<string | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -444,9 +523,11 @@ export default function AgentChat() {
     mutationFn: ({
       message,
       history,
+      images,
     }: {
       message: string
       history: Array<{ role: 'user' | 'assistant'; content: string }>
+      images?: string[]
     }) => {
       // The turn streams: reply text and tool progress arrive live and are shown as a
       // preview. What is kept is the final result this resolves with, i.e. exactly what the
@@ -460,6 +541,8 @@ export default function AgentChat() {
           history,
           (event) => agentChatStore.applyStreamEvent(event, epoch),
           controller.signal,
+          undefined,
+          images,
         )
         .finally(() => agentChatStore.setAbort(null))
     },
@@ -487,6 +570,10 @@ export default function AgentChat() {
     },
     onError: (error: Error, _vars, context) => {
       if (context && context.epoch !== agentChatStore.getEpoch()) return
+      if (error.name === 'AbortError') {
+        agentChatStore.add({ role: 'agent', content: 'Stopped.', error: true })
+        return
+      }
       agentChatStore.add({
         role: 'agent',
         content: `Request failed: ${error.message}`,
@@ -496,24 +583,71 @@ export default function AgentChat() {
     onSettled: () => agentChatStore.setPending(false),
   })
 
+  const historyBefore = (dropLastUser = false) => {
+    const kept = agentChatStore.getSnapshot().messages.filter((m) => !m.error)
+    const list = dropLastUser ? kept.slice(0, kept.map((m) => m.role).lastIndexOf('user')) : kept
+    return list.map((m) => ({
+      role: m.role === 'user' ? ('user' as const) : ('assistant' as const),
+      content: m.content,
+    }))
+  }
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    const text = input.trim()
-    if (!text || pending) return
+    if (pending) return
+    const { content, display, images } = composeMessage(input, attachments)
+    if (!content.trim()) return
 
     // Everything said so far (before this message) is sent along so the agent
     // remembers the conversation. Failed requests are not part of it.
-    const history = agentChatStore
-      .getSnapshot()
-      .messages.filter((m) => !m.error)
-      .map((m) => ({
-        role: m.role === 'user' ? ('user' as const) : ('assistant' as const),
-        content: m.content,
-      }))
+    const history = historyBefore()
 
-    agentChatStore.add({ role: 'user', content: text })
+    agentChatStore.add({
+      role: 'user',
+      content,
+      display: attachments.length ? display : undefined,
+      attachments: attachments.length
+        ? attachments.map((a) => ({ name: a.name, kind: a.kind, thumb: a.dataUrl }))
+        : undefined,
+    })
     setInput('')
-    send.mutate({ message: text, history })
+    setAttachments([])
+    setAttachError(null)
+    send.mutate({ message: content, history, images })
+  }
+
+  /** Replace the last reply with a fresh one for the same question. */
+  const regenerate = () => {
+    if (pending) return
+    const all = agentChatStore.getSnapshot().messages
+    const last = all[all.length - 1]
+    const lastUser = [...all].reverse().find((m) => m.role === 'user')
+    if (!last || last.role !== 'agent' || !lastUser) return
+    const history = historyBefore(true)
+    agentChatStore.removeLast()
+    send.mutate({ message: lastUser.content, history })
+  }
+
+  const addFiles = async (files: FileList | File[]) => {
+    setAttachError(null)
+    const next = [...attachments]
+    const problems: string[] = []
+    for (const file of Array.from(files)) {
+      const result = await readAttachment(file)
+      if (result.error || !result.attachment) {
+        problems.push(result.error ?? 'Could not read that file.')
+        continue
+      }
+      const isImg = result.attachment.kind === 'image'
+      const count = next.filter((a) => (a.kind === 'image') === isImg).length
+      if (count >= (isImg ? MAX_IMAGES : MAX_FILES)) {
+        problems.push(isImg ? `At most ${MAX_IMAGES} photos per message.` : `At most ${MAX_FILES} files per message.`)
+        continue
+      }
+      next.push(result.attachment)
+    }
+    setAttachments(next)
+    if (problems.length) setAttachError(problems.join(' '))
   }
 
   const clearChat = () => {
@@ -522,6 +656,8 @@ export default function AgentChat() {
     // Also drop the draft in the box and any prompt handed over by another page (it lives in the
     // router's history state and would otherwise come back on reload).
     setInput('')
+    setAttachments([])
+    setAttachError(null)
     if (location.state) navigate(location.pathname, { replace: true, state: null })
   }
 
@@ -531,7 +667,29 @@ export default function AgentChat() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div
+      className="relative flex h-full min-h-0 flex-col"
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes('Files')) {
+          e.preventDefault()
+          setDragging(true)
+        }
+      }}
+      onDragLeave={(e) => {
+        if (e.currentTarget === e.target) setDragging(false)
+      }}
+      onDrop={(e) => {
+        if (!e.dataTransfer.files.length) return
+        e.preventDefault()
+        setDragging(false)
+        void addFiles(e.dataTransfer.files)
+      }}
+    >
+      {dragging && (
+        <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-accent bg-slate-950/70 text-lg font-medium text-slate-100">
+          Drop photos or text files to attach
+        </div>
+      )}
       {/* Header */}
       <header className="flex items-center justify-between gap-3 px-4 pb-2 pt-1 lg:px-0">
         <div className="min-w-0">
@@ -603,10 +761,19 @@ export default function AgentChat() {
             const mine = m.role === 'user'
             if (mine) {
               return (
-                <div key={m.id} className="flex justify-end">
-                  <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-3xl bg-surface-300 px-5 py-2.5 text-[15px] leading-7 text-slate-100 sm:max-w-[75%]">
-                    {m.content}
-                  </div>
+                <div key={m.id} className="flex flex-col items-end gap-1.5">
+                  {m.attachments && m.attachments.length > 0 && (
+                    <div className="flex max-w-[85%] flex-wrap justify-end gap-2 sm:max-w-[75%]">
+                      {m.attachments.map((a, i) => (
+                        <AttachmentChip key={`${a.name}-${i}`} name={a.name} kind={a.kind} thumb={a.thumb} />
+                      ))}
+                    </div>
+                  )}
+                  {(m.attachments?.length ? m.display : m.content) && (
+                    <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-3xl bg-surface-300 px-5 py-2.5 text-[15px] leading-7 text-slate-100 sm:max-w-[75%]">
+                      {m.attachments?.length ? m.display : m.content}
+                    </div>
+                  )}
                 </div>
               )
             }
@@ -614,11 +781,11 @@ export default function AgentChat() {
               <div key={m.id} className="group flex flex-col items-start">
                 <div
                   className={clsx(
-                    'w-full whitespace-pre-wrap break-words text-[15px] leading-7 text-slate-100',
-                    m.error && 'rounded-2xl border border-status-error/40 bg-status-error/10 px-4 py-3',
+                    'w-full break-words text-[15px] leading-7 text-slate-100',
+                    m.error && 'whitespace-pre-wrap rounded-2xl border border-status-error/40 bg-status-error/10 px-4 py-3',
                   )}
                 >
-                  {m.content}
+                  {m.error ? m.content : <Markdown text={m.content} />}
                   {m.taskId && (
                     <div className="mt-2 inline-flex flex-wrap items-center gap-1.5 rounded-md bg-emerald-500/15 px-2 py-1 font-mono text-xs text-emerald-300">
                       {m.taskId}
@@ -629,6 +796,16 @@ export default function AgentChat() {
                 </div>
                 <div className="mt-1 flex items-center gap-1 text-[11px] text-slate-500">
                   {!m.error && <CopyReply text={m.content} />}
+                  {!pending && m.id === messages[messages.length - 1]?.id && !m.error && (
+                    <button
+                      type="button"
+                      onClick={regenerate}
+                      aria-label="Regenerate reply"
+                      className="rounded-lg p-1.5 text-slate-500 transition hover:bg-surface-300/70 hover:text-slate-200"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                    </button>
+                  )}
                   <span className="px-1">{clock(m.at)}</span>
                 </div>
               </div>
@@ -640,40 +817,100 @@ export default function AgentChat() {
         </div>
       </div>
 
-      {/* Composer: rounded pill, centred */}
+      {/* Composer: rounded box, centred */}
       <div className="px-4 pb-2 pt-1 lg:px-0">
         <form
           onSubmit={handleSubmit}
-          className="mx-auto flex w-full max-w-3xl items-end gap-2 rounded-[28px] border border-surface-300 bg-surface-200 py-2 pl-5 pr-2 shadow-lg shadow-black/20 focus-within:border-slate-500"
+          className="mx-auto w-full max-w-3xl rounded-[28px] border border-surface-300 bg-surface-200 py-2 pl-2 pr-2 shadow-lg shadow-black/20 focus-within:border-slate-500"
         >
-          <textarea
-            ref={inputRef}
-            rows={1}
-            className="max-h-[200px] min-h-[2.5rem] min-w-0 flex-1 resize-none self-center border-0 bg-transparent py-2 text-base text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-0 lg:text-[15px]"
-            placeholder="Ask anything"
-            aria-label="Message to the agent"
-            enterKeyHint="send"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              // Enter sends; Shift+Enter is a newline, so a multi-line address or
-              // amount can still be pasted in one piece.
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault()
-                handleSubmit(e as unknown as React.FormEvent)
-              }
-            }}
-            disabled={pending}
-          />
-          <button
-            type="submit"
-            aria-label="Send"
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
-            disabled={!input.trim() || pending}
-          >
-            <ArrowUp className="h-5 w-5" />
-          </button>
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pb-2 pt-2">
+              {attachments.map((a) => (
+                <AttachmentChip
+                  key={a.id}
+                  name={a.name}
+                  kind={a.kind}
+                  thumb={a.dataUrl}
+                  onRemove={() => setAttachments((list) => list.filter((x) => x.id !== a.id))}
+                />
+              ))}
+            </div>
+          )}
+          <div className="flex items-end gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              hidden
+              accept="image/*,.txt,.md,.csv,.tsv,.json,.jsonl,.yaml,.yml,.toml,.ini,.env,.log,.xml,.html,.css,.js,.jsx,.ts,.tsx,.py,.sol,.rs,.go,.java,.c,.cpp,.h,.sh,.sql,text/*"
+              onChange={(e) => {
+                if (e.target.files) void addFiles(e.target.files)
+                e.target.value = ''
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={pending}
+              aria-label="Attach photos or files"
+              title="Attach photos or text files"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-300 transition hover:bg-surface-300/70 disabled:opacity-40"
+            >
+              <Plus className="h-5 w-5" />
+            </button>
+            <textarea
+              ref={inputRef}
+              rows={1}
+              className="max-h-[200px] min-h-[2.5rem] min-w-0 flex-1 resize-none self-center border-0 bg-transparent py-2 text-base text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-0 lg:text-[15px]"
+              placeholder="Ask anything"
+              aria-label="Message to the agent"
+              enterKeyHint="send"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onPaste={(e) => {
+                const files = Array.from(e.clipboardData.files)
+                if (files.length) {
+                  e.preventDefault()
+                  void addFiles(files)
+                }
+              }}
+              onKeyDown={(e) => {
+                // Enter sends; Shift+Enter is a newline, so a multi-line address or
+                // amount can still be pasted in one piece.
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  handleSubmit(e as unknown as React.FormEvent)
+                }
+              }}
+              disabled={pending}
+            />
+            {pending ? (
+              <button
+                type="button"
+                onClick={() => agentChatStore.stop()}
+                aria-label="Stop"
+                title="Stop"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-slate-200 text-slate-900 transition hover:bg-white"
+              >
+                <Square className="h-4 w-4 fill-current" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                aria-label="Send"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={!input.trim() && attachments.length === 0}
+              >
+                <ArrowUp className="h-5 w-5" />
+              </button>
+            )}
+          </div>
         </form>
+        {attachError && (
+          <p role="alert" className="mx-auto mt-2 max-w-3xl text-center text-xs text-amber-300">
+            {attachError}
+          </p>
+        )}
         <p className="mx-auto mt-2 max-w-3xl text-center text-[11px] text-slate-500">
           The agent can make mistakes. Check important info.
         </p>
