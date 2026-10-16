@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type RefObject } fro
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, fetchFrame, liveApi as api, releaseControlOnUnload } from '@/services/api'
 import { useLiveEvents } from '@/hooks'
+import { isLiveConnected } from '@/services/liveSocket'
 import type { WsEvent } from '@/types'
 import type { InputEvent, LiveEvent, LiveSession } from '@/types/live'
 
@@ -39,6 +40,13 @@ export function useInView<T extends Element>(): [RefObject<T>, boolean] {
 const MAX_EVENTS = 200
 
 /**
+ * While the shared WebSocket is up, `live.event` pushes drive the refreshes and polling is only a
+ * safety net, so it can be slower. If the socket drops the next poll falls back to `fastMs`.
+ * The overview's `slowMs` must stay under the 15 s gate in `useStale`, or controls get disabled.
+ */
+const pollMs = (fastMs: number, slowMs: number) => () => (isLiveConnected() ? slowMs : fastMs)
+
+/**
  * Overview polling + activity events. Events arrive over the existing authenticated
  * WebSocket (`live.event`); polling is the fallback so the page still works if the
  * socket drops.
@@ -54,13 +62,13 @@ export function useLiveFeed(opts: { session?: string } = {}) {
   const overview = useQuery({
     queryKey: ['live', 'overview'],
     queryFn: api.liveOverview,
-    refetchInterval: 3000,
+    refetchInterval: pollMs(3000, 8000),
     retry: 1,
   })
   const tail = useQuery({
     queryKey: ['live', 'events', opts.session ?? 'all'],
     queryFn: () => api.liveEvents({ session: opts.session, limit: 100 }),
-    refetchInterval: 8000,
+    refetchInterval: pollMs(8000, 20000),
   })
 
   const { connected } = useLiveEvents(
