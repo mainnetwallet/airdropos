@@ -5,7 +5,7 @@
  * Both share the emergency-stop banner and the same routed content.
  */
 
-import { useCallback, useState } from 'react'
+import { Suspense, useCallback, useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { LogOut, ShieldAlert } from 'lucide-react'
 import clsx from 'clsx'
@@ -33,7 +33,7 @@ export default function DashboardLayout() {
   const { data: worker } = useQuery({
     queryKey: ['worker-status-mini'],
     queryFn: api.workerStatus,
-    refetchInterval: 5000,
+    refetchInterval: 10000,
     retry: false,
   })
   const workerAlive = worker?.alive === true
@@ -192,7 +192,9 @@ export default function DashboardLayout() {
               !fullBleed && 'max-w-3xl',
             )}
           >
-            <Outlet />
+            <Suspense fallback={<div className="flex min-h-[40vh] items-center justify-center text-sm text-slate-500">Loading...</div>}>
+              <Outlet />
+            </Suspense>
           </div>
         </main>
 

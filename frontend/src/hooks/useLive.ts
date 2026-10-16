@@ -46,6 +46,10 @@ const MAX_EVENTS = 200
 export function useLiveFeed(opts: { session?: string } = {}) {
   const qc = useQueryClient()
   const [pushed, setPushed] = useState<LiveEvent[]>([])
+  const invalidateTimer = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (invalidateTimer.current !== null) window.clearTimeout(invalidateTimer.current)
+  }, [])
 
   const overview = useQuery({
     queryKey: ['live', 'overview'],
@@ -66,7 +70,13 @@ export function useLiveFeed(opts: { session?: string } = {}) {
         const event = ev.payload as unknown as LiveEvent
         if (opts.session && event.session_id !== opts.session) return
         setPushed((prev) => [...prev.slice(-MAX_EVENTS), event])
-        void qc.invalidateQueries({ queryKey: ['live', 'overview'] })
+        // Coalesce a burst of events into one overview refetch (at most one per second).
+        if (invalidateTimer.current === null) {
+          invalidateTimer.current = window.setTimeout(() => {
+            invalidateTimer.current = null
+            void qc.invalidateQueries({ queryKey: ['live', 'overview'] })
+          }, 1000)
+        }
       },
       [opts.session, qc],
     ),

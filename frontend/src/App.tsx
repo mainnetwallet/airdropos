@@ -1,34 +1,37 @@
-import { useCallback, useEffect, useState } from 'react'
+import { lazy, useCallback, useEffect, useState } from 'react'
 import { createBrowserRouter, RouterProvider } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import DashboardLayout from '@/layouts/DashboardLayout'
-import Overview from '@/pages/Overview'
-import AgentChat from '@/pages/AgentChat'
-import AgentInbox from '@/pages/AgentInbox'
-import TaskManagerPage from '@/pages/TaskManager'
-import ToolsPage from '@/pages/ToolsPage'
-import WorkerLive from '@/pages/WorkerLive'
-import Wallets from '@/pages/Wallets'
-import SecuritySettings from '@/pages/SecuritySettings'
-import Telegram from '@/pages/Telegram'
-import BrowserAutomation from '@/pages/BrowserAutomation'
-import BrowserProfiles from '@/pages/BrowserProfiles'
-import LiveBroadcast from '@/pages/LiveBroadcast'
-import LiveSessionPage from '@/pages/LiveSession'
 import Login from '@/pages/Login'
 import { ErrorState } from '@/components/ui'
 import { api, ApiError, hasSession, setAuthRequired, UNAUTHORIZED_EVENT } from '@/services/api'
-import {
-  Airdrops,
-  Automation,
-  Diagnostics,
-  Evidence,
-  Goals,
-  Improvements,
-  Memory,
-  Social,
-  Transactions,
-} from '@/pages'
+
+// Every page is its own chunk. Before this, the whole dashboard (recharts, react-markdown and
+// all 20 pages) was one ~730 KB script that had to be downloaded and parsed before the login
+// screen could even appear.
+const Overview = lazy(() => import('@/pages/Overview'))
+const AgentChat = lazy(() => import('@/pages/AgentChat'))
+const AgentInbox = lazy(() => import('@/pages/AgentInbox'))
+const TaskManagerPage = lazy(() => import('@/pages/TaskManager'))
+const ToolsPage = lazy(() => import('@/pages/ToolsPage'))
+const WorkerLive = lazy(() => import('@/pages/WorkerLive'))
+const Wallets = lazy(() => import('@/pages/Wallets'))
+const SecuritySettings = lazy(() => import('@/pages/SecuritySettings'))
+const Telegram = lazy(() => import('@/pages/Telegram'))
+const BrowserAutomation = lazy(() => import('@/pages/BrowserAutomation'))
+const BrowserProfiles = lazy(() => import('@/pages/BrowserProfiles'))
+const LiveBroadcast = lazy(() => import('@/pages/LiveBroadcast'))
+const LiveSessionPage = lazy(() => import('@/pages/LiveSession'))
+const named = (pick: string) => lazy(() => import('@/pages').then((m) => ({ default: (m as any)[pick] })))
+const Airdrops = named('Airdrops')
+const Automation = named('Automation')
+const Diagnostics = named('Diagnostics')
+const Evidence = named('Evidence')
+const Goals = named('Goals')
+const Improvements = named('Improvements')
+const Memory = named('Memory')
+const Social = named('Social')
+const Transactions = named('Transactions')
 
 const queryClient = new QueryClient({
   defaultOptions: {

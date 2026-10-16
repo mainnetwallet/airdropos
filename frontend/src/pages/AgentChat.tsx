@@ -1,6 +1,6 @@
 /** AI Agent Console: natural-language chat with the central agent (dark "Agent Chat" screen on mobile). */
 
-import { useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { memo, useEffect, useLayoutEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -440,8 +440,13 @@ function LiveReply({ live }: { live: LiveTurn | null }) {
   )
 }
 
+const REMARK_PLUGINS = [remarkGfm]
+const MD_COMPONENTS = {
+  a: ({ node: _node, ...props }: any) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+}
+
 /** Agent text as Markdown (lists, code, tables, links). Raw HTML is never rendered. */
-function Markdown({ text }: { text: string }) {
+const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div
       className={clsx(
@@ -455,16 +460,14 @@ function Markdown({ text }: { text: string }) {
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ node: _node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
-        }}
+        remarkPlugins={REMARK_PLUGINS}
+        components={MD_COMPONENTS}
       >
         {text}
       </ReactMarkdown>
     </div>
   )
-}
+})
 
 /** Thumbnail (photo) or name chip (file) for an attachment. `onRemove` only in the composer. */
 function AttachmentChip({

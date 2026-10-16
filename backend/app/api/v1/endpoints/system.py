@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 
@@ -932,12 +933,20 @@ async def overview(
             stmt = stmt.where(condition)
         return int(await db.scalar(stmt) or 0)
 
-    active = await count(Task, Task.status.in_([s.value for s in (
-        TaskStatus.IN_PROGRESS, TaskStatus.RETRYING, TaskStatus.READY, TaskStatus.PLANNING
-    )]))
-    completed = await count(Task, Task.status == TaskStatus.COMPLETED.value)
-    failed = await count(Task, Task.status == TaskStatus.FAILED.value)
-    needs_action = await count(Task, Task.status == TaskStatus.NEEDS_USER_ACTION.value)
+    # One grouped query instead of four COUNTs: the dashboard polls this every few seconds.
+    status_counts = {
+        str(name): int(total)
+        for name, total in (
+            await db.execute(select(Task.status, func.count(Task.id)).group_by(Task.status))
+        ).all()
+    }
+    active = sum(
+        status_counts.get(s.value, 0)
+        for s in (TaskStatus.IN_PROGRESS, TaskStatus.RETRYING, TaskStatus.READY, TaskStatus.PLANNING)
+    )
+    completed = status_counts.get(TaskStatus.COMPLETED.value, 0)
+    failed = status_counts.get(TaskStatus.FAILED.value, 0)
+    needs_action = status_counts.get(TaskStatus.NEEDS_USER_ACTION.value, 0)
 
     upcoming = list(
         (
@@ -1340,6 +1349,22 @@ def _telegram_readiness() -> Dict[str, Any]:
     return {**checks, "ready": hint is None, "hint": hint}
 
 
+_TELEGRAM_READINESS_TTL_SECONDS = 5.0
+_telegram_readiness_memo: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _telegram_readiness_cached() -> Dict[str, Any]:
+    """`_telegram_readiness()` reads the account registry and stats session files from disk, and the
+    dashboard asks for it every few seconds. Reuse the answer briefly instead of blocking the event
+    loop on file IO for every poll."""
+    now = time.monotonic()
+    memo = _telegram_readiness_memo
+    if memo["value"] is None or now - float(memo["at"]) > _TELEGRAM_READINESS_TTL_SECONDS:
+        memo["value"] = _telegram_readiness()
+        memo["at"] = now
+    return dict(memo["value"])
+
+
 @router.get("/telegram/accounts", tags=["system"])
 async def telegram_accounts_list(
     request: Request,
@@ -1558,7 +1583,7 @@ async def worker_status(
             oldest = oldest.replace(tzinfo=timezone.utc)
         oldest_waiting_seconds = int((datetime.now(timezone.utc) - oldest).total_seconds())
 
-    telegram = _telegram_readiness()
+    telegram = _telegram_readiness_cached()
     stop = emergency_stop.status()
 
     problems: List[str] = []
