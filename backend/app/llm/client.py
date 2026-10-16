@@ -127,7 +127,15 @@ class LLMResponse:
     the two would make a routing endpoint indistinguishable from a compliant one.
     """
 
-    __slots__ = ("content", "model", "requested_model", "usage", "finish_reason", "raw")
+    __slots__ = (
+        "content",
+        "model",
+        "requested_model",
+        "usage",
+        "finish_reason",
+        "raw",
+        "incomplete",
+    )
 
     def __init__(
         self,
@@ -137,6 +145,7 @@ class LLMResponse:
         finish_reason: Optional[str],
         raw: Dict[str, Any],
         requested_model: Optional[str] = None,
+        incomplete: bool = False,
     ):
         self.content = content
         self.model = model
@@ -144,6 +153,11 @@ class LLMResponse:
         self.usage = usage
         self.finish_reason = finish_reason
         self.raw = raw
+        # True when the stream ended before the model finished. The content is real and
+        # was paid for, but it is NOT a complete answer, and a caller that treats it as
+        # one will act on a truncated reply. Defaults to False so every existing
+        # construction is a complete response.
+        self.incomplete = incomplete
 
     @property
     def token_count(self) -> int:
@@ -157,6 +171,25 @@ class LLMResponse:
         return self.model == self.requested_model or self.model.startswith(
             f"{self.requested_model}-"
         )
+
+
+# The vocabulary of "the endpoint answered" that AirdropOS itself emits and accepts.
+# `health_check` writes "HEALTHY"; other subsystems historically wrote "ok". Consumers
+# compared against one literal and reported the other as a failure, which made a
+# perfectly healthy model show up as degraded on the readiness probe and the watchdog.
+# Membership is decided here, once, rather than restated as a string literal per caller.
+LLM_HEALTHY_STATUSES = frozenset({"HEALTHY", "OK", "ok", "healthy"})
+
+
+def is_health_status_healthy(status: Any) -> bool:
+    """True only for a status that positively asserts the endpoint answered.
+
+    Deliberately strict in the other direction: an absent, empty, unrecognised or
+    non-string value is NOT healthy. A probe that cannot state its result must not be
+    allowed to satisfy readiness by default, or a malformed response would read as
+    health.
+    """
+    return isinstance(status, str) and status.strip() in LLM_HEALTHY_STATUSES
 
 
 class FixedLLMClient:
@@ -175,9 +208,32 @@ class FixedLLMClient:
         # None means "no application-imposed output limit": the parameter is then omitted
         # from every request and the provider's own limit applies.
         self._max_tokens: Optional[int] = settings.LLM_MAX_TOKENS
-        # No application-imposed request timeout: a slow model is waited for, never cut off.
-        # httpx treats None as "no timeout" for connect, read, write and pool alike.
-        self._timeout: Optional[float] = None
+        # Network timeouts are FINITE and phase-separated. `httpx.Timeout(None)` means
+        # "wait forever", which turns one hung socket into a worker that never returns,
+        # reports nothing and is never retried. `LLM_TOTAL_TIMEOUT=None` is the only way
+        # to remove the end-to-end ceiling, and the connect/read/write/pool phases stay
+        # bounded even then.
+        self._http_timeouts = httpx.Timeout(
+            connect=settings.LLM_CONNECT_TIMEOUT,
+            read=settings.LLM_READ_TIMEOUT,
+            write=settings.LLM_WRITE_TIMEOUT,
+            pool=settings.LLM_POOL_TIMEOUT,
+        )
+        # A stream is idle between tokens by nature, so the non-streamed read inactivity
+        # would fire during an ordinary pause and destroy a healthy long answer.
+        self._stream_http_timeouts = httpx.Timeout(
+            connect=settings.LLM_CONNECT_TIMEOUT,
+            read=settings.LLM_STREAM_READ_TIMEOUT or settings.LLM_READ_TIMEOUT,
+            write=settings.LLM_WRITE_TIMEOUT,
+            pool=settings.LLM_POOL_TIMEOUT,
+        )
+        # The OVERALL deadline for one attempt. httpx has no such timeout -- it bounds the
+        # four phases and nothing else -- so passing it as `timeout=` would have been a
+        # silent no-op that still looked configured in `describe()`. It is enforced here,
+        # around the request, with `asyncio.timeout`. `None` means no overall deadline,
+        # which still leaves the four phases finite: a request cannot then hang for ever,
+        # it can only be slow in total rather than idle.
+        self._total_timeout = settings.LLM_TOTAL_TIMEOUT
         # Retries AFTER the first attempt, hard-capped at one: a failed call (timeout, connection,
         # 429, 5xx) is tried once more, and if that also fails the error is raised at once. An
         # older .env with LLM_MAX_RETRIES=3 therefore cannot bring back long retry chains.
@@ -189,6 +245,14 @@ class FixedLLMClient:
         # Set once this endpoint rejects `stream_options`. Per-process, like the served
         # model set, because it is a property of the endpoint rather than of a request.
         self._stream_usage_rejected: bool = False
+
+    def _http_timeout(self) -> httpx.Timeout:
+        """Timeout policy for one non-streamed attempt."""
+        return self._http_timeouts
+
+    def _stream_http_timeout(self) -> httpx.Timeout:
+        """Timeout policy for one streamed attempt."""
+        return self._stream_http_timeouts
 
     # ------------------------------------------------------------------
     # Fixed-model integrity
@@ -256,7 +320,18 @@ class FixedLLMClient:
             "model_id": self._model_id,
             "temperature": self._temperature,
             "max_tokens": self._max_tokens,
-            "timeout_seconds": self._timeout,
+            "timeout_seconds": {
+                "connect": self._http_timeouts.connect,
+                "read": self._http_timeouts.read,
+                "write": self._http_timeouts.write,
+                "pool": self._http_timeouts.pool,
+            },
+            "stream_timeout_seconds": {
+                "connect": self._stream_http_timeouts.connect,
+                "read": self._stream_http_timeouts.read,
+                "write": self._stream_http_timeouts.write,
+                "pool": self._stream_http_timeouts.pool,
+            },
             "max_retries": self._max_retries,
             "api_key_configured": bool(self.api_key) and "placeholder" not in self.api_key,
             "api_key_masked": self._mask_key(),
@@ -379,6 +454,11 @@ class FixedLLMClient:
                 )
                 return None
             self._record_served_model(response.model)
+            # A compaction round is a real request against the configured model and is
+            # billed like any other. `_post` returns before recording on success, so this
+            # is the only place it can be counted; omitting it made every context overflow
+            # invisible in per-task request telemetry.
+            self._record_task_usage(raw.get("usage"), response.model)
             return response.content
         finally:
             _in_compaction_call.reset(token)
@@ -749,10 +829,14 @@ class FixedLLMClient:
             if not send_usage_option:
                 body.pop("stream_options", None)
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with httpx.AsyncClient(timeout=self._stream_http_timeout()) as client:
                     async with client.stream("POST", url, json=body, headers=headers) as response:
                         if response.status_code != 200:
                             text = (await response.aread()).decode("utf-8", "replace")
+                            # A non-200 is a physical request that was answered and rejected.
+                            # Counted once here, before any branch below decides whether to
+                            # retry, so the compatibility fallback below cannot hide it.
+                            self._record_task_usage(None, None)
                             if (
                                 attempt == 1
                                 and send_usage_option
@@ -857,37 +941,84 @@ class FixedLLMClient:
         usage: Dict[str, Any] = {}
         finish_reason: Optional[str] = None
 
-        async for chunk in self._iter_stream(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            json_mode=json_mode,
-            stop=stop,
-        ):
-            model = chunk.get("model") or model
-            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
-                usage = chunk["usage"]
-            for choice in chunk.get("choices") or []:
-                delta = choice.get("delta") or {}
-                token = delta.get("content")
-                if token:
-                    parts.append(token)
-                    if on_token is not None:
-                        try:
-                            on_token(token)
-                        except Exception:  # a display hook must never fail the call
-                            logger.exception("llm.stream on_token callback failed")
-                if choice.get("finish_reason"):
-                    finish_reason = choice["finish_reason"]
+        async def _consume() -> None:
+            nonlocal model, usage, finish_reason
+            async for chunk in self._iter_stream(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                stop=stop,
+            ):
+                model = chunk.get("model") or model
+                if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    token = delta.get("content")
+                    if token:
+                        parts.append(token)
+                        if on_token is not None:
+                            try:
+                                on_token(token)
+                            except Exception:  # a display hook must never fail the call
+                                logger.exception("llm.stream on_token callback failed")
+                    if choice.get("finish_reason"):
+                        finish_reason = choice["finish_reason"]
+
+        try:
+            # The overall deadline for the whole streamed attempt. Wrapping the consume
+            # loop (rather than each socket read) is what makes it bound the attempt.
+            async with asyncio.timeout(self._total_timeout):
+                await _consume()
+        except (asyncio.TimeoutError, LLMError) as exc:
+            partial = "".join(parts)
+            if not partial:
+                # Nothing was received, so there is nothing to salvage and the usual
+                # error stands. `_iter_stream` already counted the attempt it made.
+                raise
+            # Tokens WERE received and billed for. Discarding them would throw away real
+            # output the caller has already been shown through `on_token`, and would
+            # report a cut-off answer as though the model had never begun. The partial
+            # answer is returned, explicitly labelled, with the failure attached so the
+            # caller can present it as incomplete rather than as a finished reply.
+            logger.warning(
+                "LLM stream ended after %s character(s) with an unfinished answer (%s); "
+                "returning the partial text rather than discarding it.",
+                len(partial), type(exc).__name__,
+            )
+            self._record_served_model(model)
+            # No usage block arrives on a broken stream, so this is recorded without one:
+            # the request happened and was paid for, and its token count is unknown.
+            self._record_task_usage(usage or None, model)
+            return LLMResponse(
+                content=partial,
+                model=model or None,
+                requested_model=self._model_id,
+                usage=usage,
+                finish_reason=finish_reason,
+                incomplete=True,
+                raw={
+                    "streamed": True,
+                    "model": model,
+                    "usage": usage,
+                    "incomplete_reason": f"{type(exc).__name__}: {exc}",
+                },
+            )
 
         content = "".join(parts)
+        # These two raise BEFORE the success record below, but the provider still answered
+        # and was still paid for. An exception thrown after the response is not a request
+        # that never happened, so each is counted exactly once here.
         if not content:
+            self._record_task_usage(None, None)
             raise LLMError(
                 "The streamed response contained no content.",
                 category="EMPTY_CONTENT",
                 retryable=False,
             )
         if detect_billing_refusal_in_content(content):
+            self._record_task_usage(None, None)
             raise LLMError(
                 "The LLM endpoint refused the request for lack of credit; it is not a "
                 "model answer and not a context problem.",
@@ -954,17 +1085,23 @@ class FixedLLMClient:
 
         for attempt in range(1, self._max_attempts + 1):
             try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    response = await client.post(url, json=payload, headers=headers)
+                # The overall deadline wraps the request, not just the socket. httpx
+                # bounds the four phases; this bounds the attempt. An `asyncio.timeout`
+                # fires as `TimeoutError`, which is caught and counted exactly like any
+                # other transport timeout, so it cannot become an uncounted dead path.
+                async with asyncio.timeout(self._total_timeout):
+                    async with httpx.AsyncClient(timeout=self._http_timeout()) as client:
+                        response = await client.post(url, json=payload, headers=headers)
 
                 if response.status_code == 200:
                     return response.json()
 
-                body_snippet = response.text[:400]
-
-                # Every error response below leaves the loop by raising rather than by
-                # exhausting retries, so they are counted here instead of at the bottom.
+                # Exactly one physical attempt happened and failed. Counted HERE, once,
+                # for every non-200 outcome -- and at no other site in this function.
+                # Counting some failures here and others at the bottom of the loop is how
+                # a 429 came to be reported as two requests.
                 self._record_task_usage(None, None)
+                body_snippet = response.text[:400]
 
                 # A genuine context-window refusal is the one 4xx that is worth
                 # acting on rather than merely reporting, because the caller can
@@ -1018,26 +1155,29 @@ class FixedLLMClient:
                         category="BAD_REQUEST",
                         retryable=False,
                     )
-                # 429 and 5xx fall through to the retry below instead of raising, so the
-                # attempt is counted here rather than at the bottom of the loop -- counting
-                # in both places reported three rejected attempts as six.
-                self._record_task_usage(None, None)
+                # 429 and 5xx fall through to the retry below instead of raising. They are
+                # NOT counted again here: they were already counted once, above, at the
+                # single site that owns non-200 attempts. Counting in both places reported
+                # three rejected attempts as six.
 
             except httpx.TimeoutException as exc:
+                # One attempt reached the wire and got no response. Still one request.
+                self._record_task_usage(None, None)
                 last_error = LLMError(f"LLM request timed out: {exc}", category="TIMEOUT", retryable=True)
             except httpx.ConnectError as exc:
+                self._record_task_usage(None, None)
                 last_error = LLMError(
                     f"Cannot reach LLM endpoint {self.base_url}: {exc}",
                     category="CONNECTION_ERROR",
                     retryable=True,
                 )
             except httpx.HTTPError as exc:
-                last_error = LLMError(f"LLM transport error: {exc}", category="TRANSPORT_ERROR", retryable=True)
                 # A transport-level attempt still cost a round trip against the configured
                 # model. Recorded so the per-task request count reflects real spend, and
                 # recorded WITHOUT usage because no response carried any -- which is
                 # "unknown", not "zero".
                 self._record_task_usage(None, None)
+                last_error = LLMError(f"LLM transport error: {exc}", category="TRANSPORT_ERROR", retryable=True)
 
             if attempt < self._max_attempts:
                 backoff = min(2 ** (attempt - 1), 8)

@@ -334,7 +334,9 @@ class AgentController:
         # cycle boundary (`begin_planning_cycle`), which is exactly where a context write
         # may have happened, so a second planner call in the same cycle does not re-read
         # the same rows and a context that has moved on is never served stale.
-        self._planning_context_cache: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = {}
+        self._planning_context_cache: Dict[
+            str, Tuple[int, Dict[str, Any], Optional[Dict[str, Any]]]
+        ] = {}
 
         # Snapshot of the four things that count as progress, taken when an execution
         # window opens so `_window_made_no_progress` can judge it at the end. Without a
@@ -353,6 +355,12 @@ class AgentController:
         # Tools whose permission this execution window has already seen refused. Cleared per
         # window (one controller per run) so an operator granting a permission takes effect.
         self._refusals_in_this_window: Dict[str, str] = {}
+        # The window's iteration budget and start time. Held on the controller rather than
+        # threaded through every call because the tool dispatcher needs them from deep
+        # inside `_run_iteration`, which has no window arguments. One controller runs one
+        # window, so there is no ambiguity about whose window this is.
+        self._window_iteration_budget: int = 0
+        self._window_started_at: float = 0.0
         # Tool names the PERSISTED authorization record says were refused. Read once per
         # window, and never used to skip a call -- only to know that a later success has
         # to go and correct the record.
@@ -415,6 +423,8 @@ class AgentController:
             # order checkpoints and executions), so an absolute cap would leave a resumed task
             # with no iterations left and it could never get past a budget exhaustion.
             await self._rearm_policy_refused_steps(task, plan_spec)
+            self._window_iteration_budget = budget
+            self._window_started_at = started
             await self._mark_window_start(task, plan_spec, iteration)
             with task_context(task.task_id):
                 return await self._run_window(
@@ -672,7 +682,6 @@ class AgentController:
                 return
 
         await self._checkpoint(task, iteration, "budget_exhausted")
-        task.execution_windows = (task.execution_windows or 0) + 1
         await self._flush_telemetry(task)
 
         if task.status != TaskStatus.IN_PROGRESS.value:
@@ -863,6 +872,13 @@ class AgentController:
             plan = await self.planner.current_plan(task)
             self._window_start_revision = plan.revision if plan else None
             self._window_start_iteration = iteration
+            # Counted ONCE, here, as the window OPENS rather than on any of the ways it
+            # can end. The window reaches this point after the lease is held and the plan
+            # resolved, so it is a real execution window; how it then finishes (completed,
+            # failed, parked for the operator, or yielded for more) cannot change the count.
+            # Incrementing only on the yield path meant a task that completed on its first
+            # window reported ZERO windows, and one that failed reported zero as well.
+            task.execution_windows = (task.execution_windows or 0) + 1
             self._window_start_confirmed = len(
                 [
                     o for o in await self.context.observations(task, limit=None)
@@ -887,24 +903,47 @@ class AgentController:
         Nothing here is a secret -- counts, token figures and model identifiers only.
         """
         usage = task_usage_registry.take(task.task_id)
+        if not (usage.llm_requests or usage.calls_without_usage or usage.mismatches):
+            task_usage_registry.restore(task.task_id, usage)
+            return
         try:
-            if usage.llm_requests:
-                task.llm_requests = (task.llm_requests or 0) + usage.llm_requests
-            if usage.input_tokens is not None:
-                task.llm_input_tokens = (task.llm_input_tokens or 0) + usage.input_tokens
-            if usage.output_tokens is not None:
-                task.llm_output_tokens = (task.llm_output_tokens or 0) + usage.output_tokens
-            task.llm_calls_without_usage = (task.llm_calls_without_usage or 0) + usage.calls_without_usage
-            task.served_model_mismatches = (task.served_model_mismatches or 0) + usage.mismatches
-            if usage.last_served_model:
-                task.last_served_model = usage.last_served_model
-            await self.db.flush()
+            # A SAVEPOINT, not the bare outer transaction. On PostgreSQL a failed statement
+            # leaves the whole transaction ABORTED: every later statement fails with
+            # "current transaction is aborted" until rollback. Catching the exception
+            # without one therefore does NOT save the worker -- its own commit() raises and
+            # the entire execution window is rolled back, so a telemetry problem destroys
+            # the task's work. Rolling back to this savepoint is the one thing that puts
+            # the session back in a usable state, and it discards only the telemetry write.
+            async with self.db.begin_nested():
+                if usage.llm_requests:
+                    task.llm_requests = (task.llm_requests or 0) + usage.llm_requests
+                if usage.input_tokens is not None:
+                    task.llm_input_tokens = (task.llm_input_tokens or 0) + usage.input_tokens
+                if usage.output_tokens is not None:
+                    task.llm_output_tokens = (task.llm_output_tokens or 0) + usage.output_tokens
+                task.llm_calls_without_usage = (
+                    (task.llm_calls_without_usage or 0) + usage.calls_without_usage
+                )
+                # The per-direction silence counts. Persisted because the token columns
+                # are only honest as a floor if a reader can see how much is missing;
+                # without them the dashboard presents a subtotal as a total.
+                task.llm_calls_missing_input_tokens = (
+                    (task.llm_calls_missing_input_tokens or 0) + usage.unknown_input_calls
+                )
+                task.llm_calls_missing_output_tokens = (
+                    (task.llm_calls_missing_output_tokens or 0) + usage.unknown_output_calls
+                )
+                task.served_model_mismatches = (
+                    (task.served_model_mismatches or 0) + usage.mismatches
+                )
+                if usage.last_served_model:
+                    task.last_served_model = usage.last_served_model
         except Exception as exc:
-            # Put the counts back. Dropping them would under-report spend; and on
-            # PostgreSQL a failed statement leaves the transaction aborted, so the
-            # exception MUST leave this function -- otherwise the worker's commit raises
-            # and the whole execution window is rolled back, which is the opposite of
-            # telemetry being best-effort.
+            # Put the counts back. Dropping them would under-report spend. Note that this
+            # is genuinely best-effort: a savepoint repairs a transaction that was healthy
+            # when the savepoint was taken, and nothing repairs one that was already
+            # aborted before this call. The worker's own commit is what proves which case
+            # this was, and a task that still completes has demonstrably been recovered.
             task_usage_registry.restore(task.task_id, usage)
             logger.warning("Could not flush telemetry for %s: %s", task.task_id, exc)
 
@@ -1031,15 +1070,20 @@ class AgentController:
         campaign-wide snapshot - never account- or wallet-specific state, and never a
         fact learned by a different task.
 
-        Resolution happens once per planning cycle, so two planner calls in the same cycle
-        do not read the same rows twice.
+        Resolution is memoised on `(task, context revision)`. The revision is read on every
+        call, so a memoised payload is served only while the context is genuinely
+        unchanged; any write -- an observation, a discovered requirement, recorded
+        operator guidance -- bumps it and forces a re-read on the next call. Keying on the
+        task alone relied on every call site remembering to call `begin_planning_cycle`
+        first, which made a stale payload one forgotten call away.
         """
         from backend.app.airdrops.campaign_context import CampaignContextService
 
-        key = str(task.id)
-        cached = self._planning_context_cache.get(key)
-        if cached is not None:
-            return cached
+        revision = await self._context_revision(task)
+        key = f"{task.id}:{revision}"
+        cached = self._planning_context_cache.get(str(task.id))
+        if cached is not None and cached[0] == revision:
+            return cached[1], cached[2]
 
         resolved = await self.context.resolve(task)
         context_payload = resolved.to_prompt_dict()
@@ -1054,18 +1098,69 @@ class AgentController:
                     await CampaignContextService(self.db).snapshot(campaign)
                 ).to_dict()
 
-        self._planning_context_cache[key] = (context_payload, campaign_payload)
+        self._planning_context_cache[str(task.id)] = (revision, context_payload, campaign_payload)
         return context_payload, campaign_payload
+
+    async def _context_revision(self, task: Task) -> int:
+        """Current write-counter for this task's context. One cheap scalar read.
+
+        Used as the memo key for the resolved planning context, so "has anything been
+        written since I resolved this" is answered by the persisted row rather than by
+        remembering to invalidate a cache.
+        """
+        from sqlalchemy import func, select
+
+        from backend.app.models import TaskContext
+
+        await self.db.flush()
+        value = await self.db.scalar(
+            select(func.coalesce(func.max(TaskContext.revision), 0)).where(
+                TaskContext.task_id == task.id
+            )
+        )
+        return int(value or 0)
 
     def begin_planning_cycle(self, task: Task) -> None:
         """Start a new planning cycle for this task.
 
-        Called at each point where planning begins, because that is where an intervening
-        context write (an observation, a discovered requirement, a recorded failure) may
-        have made the previously resolved payload stale. Anything already resolved in this
-        cycle stays reusable without another read.
+        Kept as an explicit, cheap way to drop a memo, but it is no longer what makes the cache
+        correct: `_resolved_planning_context` keys on the persisted context revision, so a
+        payload is served only while the context is provably unchanged. This remains useful
+        to release memory between cycles.
         """
         self._planning_context_cache.pop(str(task.id), None)
+
+    def _remaining_window_seconds(self, iteration: int) -> Optional[float]:
+        """How much wall-clock the REST of THIS execution window could plausibly take.
+
+        The window is bounded by iterations, not by a clock, so there is no configured
+        "window deadline" to divide up. What can be measured is how fast this task is
+        actually iterating: elapsed time over the iterations completed *in this window*
+        gives a per-iteration cost, and the iterations still available in this window
+        bound what is left. A tool is then never allowed to run longer than everything
+        that could follow it.
+
+        Everything here is WINDOW-LOCAL, which matters. `iteration` is an absolute
+        counter that keeps climbing across windows (`_resume_iteration` continues it), so
+        comparing it against the per-window budget made the cap silently inert for every
+        resumed task -- exactly the checkpointed tasks this exists to serve -- and made
+        the last iteration of a first window the one iteration with no cap at all.
+
+        Returns None (no cap) while there is nothing measured to extrapolate from: a cap
+        invented from no data would be worse than no cap. Only ever shortens a timeout.
+        """
+        done_here = iteration - self._window_start_iteration if self._window_start_iteration is not None else 0
+        if done_here < 1 or self._window_iteration_budget <= 0:
+            return None
+        left_here = self._window_iteration_budget - done_here
+        if left_here <= 0:
+            return None
+        # Measured from when THIS window opened, not from the start of the whole run:
+        # planning happens before the window and is not an iteration.
+        elapsed = time.perf_counter() - self._window_started_at
+        if elapsed <= 0:
+            return None
+        return left_here * (elapsed / done_here)
 
     async def _record_progress(
         self,
@@ -1545,7 +1640,19 @@ class AgentController:
         # and heartbeat writers time out with "database is locked".
         await self._release_write_lock()
         tool_result = await self.registry.invoke(
-            step.tool, step.parameters, policy=self.policy, task_id=task.task_id
+            step.tool,
+            step.parameters,
+            policy=self.policy,
+            task_id=task.task_id,
+            # The orchestrator may ask for more room on a step it knows to be slow (a page
+            # that has to render, a bot that has to be polled). It is a REQUEST: the
+            # dispatcher clamps it to the tool class ceiling and the hard ceiling, and it
+            # is a parameter of the dispatcher rather than of the tool arguments, so the
+            # model can never supply one.
+            timeout_seconds=step.timeout_seconds,
+            # A tool must not outlive the window it is running in. This is a cap only, so
+            # a task near the end of its budget gets shorter waits, never longer ones.
+            remaining_budget=self._remaining_window_seconds(iteration),
         )
         if tool_result.status is ToolResultStatus.SUCCESS:
             logger.info(
@@ -2328,6 +2435,10 @@ class AgentController:
             blocked_steps=_named({"blocked"}),
             skipped_steps=_named({"skipped"}),
             missing=tuple(r.text[:200] for r in outstanding),
+            # The revision actually verified above. Stamped so `TaskManager` can refuse a
+            # proof that outlived its plan: a completion argued from revision N says
+            # nothing about the steps revision N+1 added.
+            plan_revision=getattr(plan, "revision", None),
         )
 
     async def _finalize_plan(

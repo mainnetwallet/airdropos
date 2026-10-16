@@ -1000,13 +1000,20 @@ class FillFormTool(BaseTool):
             return _no_browser(params)
 
         strategy = str(params.get("by") or "name")
-        strategy = {"name": "css", "id": "css", "selector": "css"}.get(strategy, strategy)
+        # `id` is deliberately NOT collapsed into `css`. It used to be mapped here, which
+        # made the branch below unreachable and silently resolved every field as
+        # `[name="..."]` -- so `by="id"` filled by name and reported success. `name` is the
+        # one alias that maps to `css`, because the `css` branch here builds exactly the
+        # `[name="..."]` lookup that `by="name"` means.
+        strategy = {"name": "css"}.get(strategy, strategy)
         filled, missing, failed = [], [], []
         for field, value in (params.get("fields") or {}).items():
+            # `css` reaches the locator as `[name="..."]`; every other strategy (label,
+            # placeholder, test_id, id) passes the field through as the value to look up
+            # by that strategy. `id` is handled inside the locator builder, which builds
+            # the `#` selector from a properly escaped identifier.
             if strategy == "css":
                 locator_value = f'[name="{field}"]'
-            elif strategy == "id":
-                locator_value = f"#{field}"
             else:
                 locator_value = str(field)
             try:

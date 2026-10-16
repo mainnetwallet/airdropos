@@ -206,6 +206,13 @@ class CompletionProof:
     # and evidence belonging to some *other* step must not stand in for it.
     skipped_steps: Tuple[str, ...] = ()
     missing: Tuple[str, ...] = ()
+    # The plan revision this proof was assembled against. Without it a proof stays valid
+    # for ever: a task verifies every step of revision 3, replans to revision 4 which adds
+    # two mandatory steps, and the revision-3 proof would still authorize COMPLETED over a
+    # plan whose new requirements were never attempted. `TaskManager` compares this with
+    # the persisted current revision and refuses the transition on any mismatch, so a
+    # stale proof cannot authorize a completion it was not built to justify.
+    plan_revision: Optional[int] = None
 
     @property
     def is_sufficient(self) -> bool:

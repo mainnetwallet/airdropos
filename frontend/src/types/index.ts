@@ -282,7 +282,29 @@ export interface AgentChatResponse {
   blockers: string[]
   needs_user_action: string[]
   verified: Array<{ tool: string; evidence: Record<string, unknown> }>
-  usage: Record<string, number>
+  /**
+   * Token usage for the WHOLE turn, summed over every LLM round it took.
+   *
+   * Each token count is `number | null`. `null` means no round reported that figure --
+   * "unknown", which is deliberately different from 0. `partial: true` marks an
+   * aggregate with at least one silent round, so the totals are a floor rather than a
+   * total, and the `blocks_missing_*` counts say how many rounds were silent.
+   */
+  usage: {
+    requests: number
+    prompt_tokens: number | null
+    completion_tokens: number | null
+    partial?: boolean
+    blocks_missing_input_tokens?: number
+    blocks_missing_completion_tokens?: number
+  }
+  /**
+   * Tool EXECUTIONS, not distinct tool names. Repeating one tool is repeated work and
+   * consumes repeated budget, which is why this and `distinct_tools_used` are both
+   * reported rather than being conflated into one figure.
+   */
+  tool_invocation_count?: number
+  distinct_tools_used?: number
   model?: string
   truncated: boolean
   note?: string

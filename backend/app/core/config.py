@@ -148,6 +148,67 @@ class Settings(BaseSettings):
     LLM_MAX_RETRIES: int = Field(default=1)
 
     # ------------------------------------------------------------------
+    # LLM NETWORK TIMEOUTS (finite, phase-separated)
+    # ------------------------------------------------------------------
+    # These bound a single HTTP attempt against the configured endpoint. They are
+    # NOT the lifetime of a task: a task may span many attempts, many execution
+    # windows and many restarts. An unbounded timeout here means one hung socket
+    # pins a worker indefinitely with no error, no telemetry and no retry, so
+    # every phase below is finite. They are separated because the phases fail for
+    # genuinely different reasons: a slow connect is usually a dead endpoint,
+    # whereas a slow read may just be a long reasoning turn.
+    LLM_CONNECT_TIMEOUT: float = Field(
+        default=10.0,
+        gt=0,
+        le=120,
+        description=(
+            "Seconds allowed to establish the TCP/TLS connection. Short by design: an "
+            "endpoint that cannot be reached quickly is usually unreachable."
+        ),
+    )
+    LLM_READ_TIMEOUT: float = Field(
+        default=180.0,
+        gt=0,
+        le=1800,
+        description=(
+            "Seconds allowed between response bytes (read inactivity). Generous because a "
+            "reasoning model can pause mid-turn; this is inactivity, not total call time."
+        ),
+    )
+    LLM_WRITE_TIMEOUT: float = Field(
+        default=30.0,
+        gt=0,
+        le=300,
+        description="Seconds allowed to send the request body.",
+    )
+    LLM_POOL_TIMEOUT: float = Field(
+        default=10.0,
+        gt=0,
+        le=120,
+        description="Seconds allowed waiting for a free connection from the pool.",
+    )
+    LLM_TOTAL_TIMEOUT: Optional[float] = Field(
+        default=600.0,
+        description=(
+            "Ceiling on one whole attempt, end to end, or None/blank to remove it. "
+            "Implemented by the client as an overall deadline around the request, NOT by "
+            "httpx, which has no such timeout -- httpx bounds the phases only. Set well "
+            "above LLM_STREAM_READ_TIMEOUT so that a legitimately long turn, which keeps "
+            "producing bytes, is never cut off mid-answer."
+        ),
+    )
+    LLM_STREAM_READ_TIMEOUT: Optional[float] = Field(
+        default=300.0,
+        gt=0,
+        le=3600,
+        description=(
+            "Read inactivity allowed on a STREAMED attempt. Longer than the non-streamed "
+            "value because a stream is idle between tokens by nature, and a timeout that "
+            "fired during a normal pause would destroy a healthy long answer."
+        ),
+    )
+
+    # ------------------------------------------------------------------
     # INPUT CONTEXT BUDGET (never an output limit)
     # ------------------------------------------------------------------
     # These govern INPUT size only. They have nothing to do with LLM_MAX_TOKENS
@@ -653,6 +714,21 @@ class Settings(BaseSettings):
     MONITORING_INTERVAL_MINUTES: int = 15
     CLAIM_CHECK_INTERVAL_MINUTES: int = 30
     DAILY_REPORT_HOUR_UTC: int = 8
+
+    @field_validator("LLM_TOTAL_TIMEOUT", mode="before")
+    @classmethod
+    def _blank_total_timeout_means_unset(cls, value: Any) -> Any:
+        """`LLM_TOTAL_TIMEOUT=` (blank) or `none` means no overall deadline.
+
+        Without this, writing a blank line to disable the knob -- the single most common
+        way an operator neutralises an optional setting, and the way this file's own
+        comments are written -- raised a pydantic ValidationError at import time and took
+        the entire application down. An operator disabling a timeout must not be able to
+        prevent the process from starting.
+        """
+        if isinstance(value, str) and value.strip().lower() in ("", "none", "null"):
+            return None
+        return value
 
     @field_validator("MAX_PROSE_EXTRACTIONS_PER_RUN", mode="before")
     @classmethod

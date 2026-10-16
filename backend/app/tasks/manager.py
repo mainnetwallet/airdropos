@@ -22,7 +22,10 @@ from backend.app.models import (
     TaskEvidence,
     TaskExecution,
 )
-from backend.app.models.context import OUTCOME_CONFIRMED
+from backend.app.models.context import (
+    OUTCOME_CONFIRMED,
+    REQUIREMENT_DISCOVERED,
+)
 from backend.app.tasks.id_generator import reserve_task_id
 from backend.app.tasks.state_machine import (
     VALID_TRANSITIONS,
@@ -247,6 +250,74 @@ class TaskManager:
                 "%s exist in this task's history; using the persisted count.",
                 task.task_id, proof.authoritative_confirmations, observations,
             )
+
+        if proof is not None:
+            await self._assert_proof_is_current(task, proof)
+
+    async def _assert_proof_is_current(self, task: Task, proof: CompletionProof) -> None:
+        """Refuse COMPLETED when the proof was built against a superseded plan.
+
+        Two independent ways a proof goes stale, both checked against persisted rows
+        rather than against the caller's account of itself:
+
+        1. The plan moved on. A proof from revision N says nothing about revision N+1, so
+           a task that verified revision N and then replanned can never complete on the
+           old proof -- it must re-verify against the plan that is actually current.
+        2. A requirement was discovered after the proof was assembled. A proof that
+           counted zero outstanding requirements is not evidence about a requirement that
+           did not exist yet, so the count is re-read and must still be zero.
+
+        The revision comparison FAILS CLOSED. If the proof names a revision and the
+        current one cannot be read, the transition is refused: a staleness guard that
+        quietly passes when it cannot tell is not a guard. (A proof with no revision at
+        all is a caller using the older, weaker contract, and is judged on the evidence
+        alone exactly as before.)
+        """
+        from backend.app.models import ExecutionPlan, TaskRequirement
+
+        if proof.plan_revision is not None:
+            await self.db.flush()
+            current_revision = await self.db.scalar(
+                select(ExecutionPlan.revision)
+                .where(ExecutionPlan.task_id == task.id, ExecutionPlan.is_current.is_(True))
+                .order_by(ExecutionPlan.revision.desc())
+                .limit(1)
+            )
+            if current_revision is None:
+                logger.warning(
+                    "Refusing COMPLETED for %s: the proof names plan revision %s but this "
+                    "task has no current plan to compare it against.",
+                    task.task_id, proof.plan_revision,
+                )
+                raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
+            if int(proof.plan_revision) != int(current_revision):
+                logger.warning(
+                    "Refusing COMPLETED for %s: the completion proof was built against plan "
+                    "revision %s but the current plan is revision %s.",
+                    task.task_id, proof.plan_revision, current_revision,
+                )
+                raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
+
+        await self.db.flush()
+        outstanding = int(
+            await self.db.scalar(
+                select(func.count(TaskRequirement.id)).where(
+                    TaskRequirement.task_id == task.id,
+                    # `waived` and `unverifiable` are dispositions the existing policy
+                    # already recognises as closed, so they are not gaps. Only a
+                    # requirement still `discovered` blocks completion.
+                    TaskRequirement.status == REQUIREMENT_DISCOVERED,
+                )
+            )
+            or 0
+        )
+        if outstanding > 0:
+            logger.warning(
+                "Refusing COMPLETED for %s: the proof reported no outstanding requirements, "
+                "but %s requirement(s) in this task's persisted record are still unsatisfied.",
+                task.task_id, outstanding,
+            )
+            raise InvalidTransition(TaskStatus.COMPLETED, TaskStatus.UNVERIFIED)
 
     # ------------------------------------------------------------------
     # Progress recording
@@ -478,9 +549,17 @@ class TaskManager:
         same compare-and-set `claim_next_task` uses to keep two workers off one task, so there
         is only one pattern for "act only if nobody got there first".
 
-        Deliberately narrow: it does not run the COMPLETED verification guard, so
-        `transition` remains the entry point for anything that must be proven.
+        COMPLETED is refused outright. This method takes no `verified`, no
+        `evidence_count` and no `CompletionProof`, so it has nothing to verify with --
+        which used to make it the cheapest way to mark any task complete, skipping
+        `assert_completion_verified` and the independent re-read of this task's
+        observations entirely. A caller that has actually proven completion calls
+        `transition`, which does both.
         """
+        if new_status is TaskStatus.COMPLETED or new_status == TaskStatus.COMPLETED.value:
+            # An `InvalidTransition`, not a bare ValueError, so a caller that trips this
+            # gets a domain error it can handle rather than an unhandled 500.
+            raise InvalidTransition(TaskStatus(task.status), TaskStatus.COMPLETED)
         current = TaskStatus(task.status)
         if new_status not in VALID_TRANSITIONS.get(current, set()):
             return False
@@ -702,6 +781,15 @@ class TaskManager:
             # How many requests reported no usage block at all: the number whose token
             # cost is genuinely unknown.
             "llm_calls_without_usage": task.llm_calls_without_usage or 0,
+            # ...and how many reported only ONE side of the pair. A non-zero value here
+            # means the token subtotals above are a floor: at least that many requests
+            # contributed an amount the provider declined to name.
+            "llm_calls_missing_input_tokens": task.llm_calls_missing_input_tokens or 0,
+            "llm_calls_missing_output_tokens": task.llm_calls_missing_output_tokens or 0,
+            "llm_token_totals_are_exact": (
+                not (task.llm_calls_missing_input_tokens or 0)
+                and not (task.llm_calls_missing_output_tokens or 0)
+            ),
             "last_served_model": task.last_served_model,
             "served_model_mismatches": task.served_model_mismatches or 0,
             "tool_calls": task.tool_calls or 0,

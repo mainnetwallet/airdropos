@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +38,29 @@ class TaskUsage:
     # None means "the provider did not report this", which is not the same as zero.
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None
+    # A provider that reports input tokens but omits output tokens has NOT reported zero
+    # output tokens. Adding the missing side as 0 turns an unknown into a fabricated
+    # figure and understates cost with no trace. These counters make the subtotals above
+    # readable as a FLOOR rather than a total: if a counter is non-zero, at least that
+    # many calls contributed an amount nobody can name.
+    unknown_input_calls: int = 0
+    unknown_output_calls: int = 0
     calls_without_usage: int = 0
     served_models: set = field(default_factory=set)
     mismatches: int = 0
     last_served_model: Optional[str] = None
 
+    @property
+    def totals_are_exact(self) -> bool:
+        """True only when every recorded call reported both token counts."""
+        return self.unknown_input_calls == 0 and self.unknown_output_calls == 0
+
     def merge_usage(self, usage: Optional[Dict[str, Any]]) -> None:
         """Fold one provider usage block in, keeping "unknown" distinct from zero."""
         if not isinstance(usage, dict) or not usage:
             self.calls_without_usage += 1
+            self.unknown_input_calls += 1
+            self.unknown_output_calls += 1
             return
 
         def _read(*keys: str) -> Optional[int]:
@@ -65,11 +79,22 @@ class TaskUsage:
 
         if prompt is None and completion is None:
             self.calls_without_usage += 1
+            self.unknown_input_calls += 1
+            self.unknown_output_calls += 1
             return
 
-        # A figure first seen as None becomes known; a figure already known is added to.
-        self.input_tokens = (self.input_tokens or 0) + (prompt or 0)
-        self.output_tokens = (self.output_tokens or 0) + (completion or 0)
+        # Each side is folded independently. A missing side is counted as unknown and
+        # contributes NOTHING to the subtotal, so the subtotal never claims to be more
+        # complete than the provider's reporting actually was.
+        if prompt is None:
+            self.unknown_input_calls += 1
+        else:
+            self.input_tokens = (self.input_tokens or 0) + prompt
+
+        if completion is None:
+            self.unknown_output_calls += 1
+        else:
+            self.output_tokens = (self.output_tokens or 0) + completion
 
     def merge_model(self, *, requested_model: str, served_model: Optional[str]) -> None:
         """Record what the provider said it served, beside what was asked for."""
@@ -85,6 +110,36 @@ class TaskUsage:
             ):
                 # A dated variant of the same model is normal; a different model is not.
                 self.mismatches += 1
+
+
+def aggregate_usage_blocks(
+    blocks: Sequence[Optional[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Sum several provider usage blocks into one, per token direction.
+
+    Each direction is summed only over the blocks that actually reported it. A block that
+    omits `completion_tokens` says nothing about output cost, and subtracting or zeroing
+    it would both overstate precision and misreport a partial answer as a free one. Where
+    any block was silent the aggregate carries an explicit `_partial` marker plus the
+    number of silent blocks, so a consumer can tell "the model generated nothing" from
+    "the provider declined to say".
+
+    Retries are never folded in twice: the caller decides which blocks correspond to
+    distinct physical requests, and this function only adds.
+    """
+    total = TaskUsage()
+    for block in blocks:
+        total.merge_usage(block)
+
+    result: Dict[str, Any] = {"requests": len(blocks)}
+    # `None` here means "nobody reported it at all", which is different from 0.
+    result["prompt_tokens"] = total.input_tokens
+    result["completion_tokens"] = total.output_tokens
+    if not total.totals_are_exact:
+        result["partial"] = True
+        result["blocks_missing_input_tokens"] = total.unknown_input_calls
+        result["blocks_missing_completion_tokens"] = total.unknown_output_calls
+    return result
 
 
 class _TaskRegistry:
@@ -141,6 +196,8 @@ class _TaskRegistry:
             existing = self._by_task.setdefault(key, TaskUsage())
             existing.llm_requests += usage.llm_requests
             existing.calls_without_usage += usage.calls_without_usage
+            existing.unknown_input_calls += usage.unknown_input_calls
+            existing.unknown_output_calls += usage.unknown_output_calls
             existing.mismatches += usage.mismatches
             if usage.input_tokens is not None:
                 existing.input_tokens = (existing.input_tokens or 0) + usage.input_tokens

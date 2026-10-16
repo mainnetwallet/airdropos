@@ -21,6 +21,8 @@ from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
 from backend.app.security.emergency_stop import StopPolicy, emergency_stop
 from backend.app.tools.context import task_context
+from backend.app.tools.timeouts import history as latency_history
+from backend.app.tools.timeouts import resolve_timeout
 from backend.app.tools.base import (
     BaseTool,
     SideEffect,
@@ -303,8 +305,17 @@ class ToolRegistry:
         params: Optional[Dict[str, Any]] = None,
         policy: Optional[AuthorizationPolicy] = None,
         task_id: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+        remaining_budget: Optional[float] = None,
     ) -> ToolResult:
-        """Execute a registered tool with full validation, authorization, and timing."""
+        """Execute a registered tool with full validation, authorization, and timing.
+
+        `timeout_seconds` is the orchestrator's justified request for a longer window on a
+        slow operation. It is a REQUEST, not a setting: `resolve_timeout` clamps it to the
+        tool class's ceiling and the hard ceiling, so neither the model nor a caller can
+        turn this into an unbounded wait. It is a parameter of the dispatcher and not of
+        the tool arguments, which is what keeps it out of the schema the model can fill in.
+        """
         started = time.perf_counter()
 
         tool = self._tools.get(name)
@@ -400,16 +411,36 @@ class ToolRegistry:
         current = self._inflight.get(name, 0)
         self._inflight[name] = current + 1
         try:
+            # Adaptive, bounded, and always the backend's decision: the tool's declared
+            # default adjusted by class policy and observed latency, then capped by the
+            # caller's remaining window budget. The number actually enforced is this one,
+            # not `tool.timeout_seconds`.
+            #
+            # Computed INSIDE the try so that a raise here still releases `_inflight` in
+            # the finally below. Outside the try, a policy failure left the in-flight
+            # counter permanently incremented for the life of the process.
+            effective_timeout, why = resolve_timeout(
+                tool, requested=timeout_seconds, remaining_budget=remaining_budget
+            )
             # Publish the task id BEFORE wait_for: it wraps the coroutine in a task that
             # copies the current context, so tools see the task they are running for.
             with task_context(task_id):
-                result = await asyncio.wait_for(tool.execute(validated), timeout=tool.timeout_seconds)
+                result = await asyncio.wait_for(
+                    tool.execute(validated), timeout=effective_timeout
+                )
         except asyncio.TimeoutError:
+            # A timeout does NOT prove the external operation failed, and must never be
+            # reported as though it had. Stated explicitly in the result so the caller
+            # inspects the actual state of the far side before retrying something whose
+            # outcome is unknown.
             logger.warning(
-                "TOOL timeout name=%s task=%s limit_s=%s", name, task_id, tool.timeout_seconds
+                "TOOL timeout name=%s task=%s limit_s=%s reason=%s",
+                name, task_id, effective_timeout, why,
             )
             result = ToolResult.failure(
-                f"Tool '{name}' exceeded its {tool.timeout_seconds}s timeout.",
+                f"Tool '{name}' exceeded its {effective_timeout:g}s timeout ({why}). The "
+                f"outcome of this operation is UNKNOWN: it may still have completed on the "
+                f"other side. Inspect the actual state before retrying.",
                 category="TIMEOUT",
                 retryable=True,
             )
@@ -424,6 +455,10 @@ class ToolRegistry:
             )
         finally:
             self._inflight[name] = max(0, self._inflight.get(name, 1) - 1)
+            # Observed for the NEXT invocation of this tool. Timeouts are recorded too:
+            # they are real information about how long the tool takes, and excluding them
+            # would bias every slow tool's estimate downwards.
+            latency_history.observe(name, time.perf_counter() - started)
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         result.duration_ms = duration_ms

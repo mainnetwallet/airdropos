@@ -12,10 +12,12 @@ What each column is for:
 * `execution_windows` / `unproductive_windows` — how many times this task has been handed
   to a worker, and how many of those achieved nothing. These are what make a long
   objective resumable *and* what stop it being resumed forever.
-* `llm_requests`, `llm_input_tokens`, `llm_output_tokens`, `llm_calls_without_usage` —
+* `llm_requests`, `llm_input_tokens`, `llm_output_tokens`, `llm_calls_without_usage`,
+  `llm_calls_missing_input_tokens`, `llm_calls_missing_output_tokens` —
   cumulative AI cost. The token columns are nullable on purpose: NULL means the provider
   never reported the figure (UNKNOWN), 0 means it reported zero. Collapsing those two would
-  understate spend on exactly the router endpoints that omit usage.
+  understate spend on exactly the router endpoints that omit usage. The two `missing_*`
+  counters say how much of the token subtotals is a floor rather than a total.
 * `served_model_mismatches` / `last_served_model` — what the provider said it served
   beside what was requested, so a router is visible rather than assumed away.
 * `tool_calls` / `tool_failures` — execution volume and reliability.
@@ -45,6 +47,11 @@ _COUNT_COLUMNS = (
     ("execution_windows", sa.Integer(), "0"),
     ("llm_requests", sa.Integer(), "0"),
     ("llm_calls_without_usage", sa.Integer(), "0"),
+    # Per-direction silence. `llm_calls_without_usage` counts calls that reported
+    # NOTHING; these count the calls that reported one side of the pair and omitted the
+    # other, which is the case that made a partial usage block read as a complete one.
+    ("llm_calls_missing_input_tokens", sa.Integer(), "0"),
+    ("llm_calls_missing_output_tokens", sa.Integer(), "0"),
     ("served_model_mismatches", sa.Integer(), "0"),
     ("tool_calls", sa.Integer(), "0"),
     ("tool_failures", sa.Integer(), "0"),

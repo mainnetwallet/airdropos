@@ -24,6 +24,7 @@ from backend.app.planning.planner import (
     StepKind,
 )
 from backend.app.tools.base import SideEffect, ToolResult, ToolResultStatus
+from backend.app.tools.timeouts import resolve_timeout
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
 
@@ -214,6 +215,9 @@ class StubRegistry:
     def __init__(self, script: Optional[Dict[str, Any]] = None) -> None:
         self.script = script or {}
         self.calls: List[str] = []
+        # What the orchestrator asked for on each invocation, so a test can assert the
+        # request without this harness reimplementing the dispatcher's clamp.
+        self.timeouts: List[Dict[str, Any]] = []
         self.policy = None
         self._cursors: Dict[str, int] = {}
 
@@ -227,8 +231,39 @@ class StubRegistry:
     def disable(self, name, reason):
         pass
 
-    async def invoke(self, name, parameters, policy=None, task_id=None):
+    async def invoke(
+        self,
+        name,
+        parameters,
+        policy=None,
+        task_id=None,
+        timeout_seconds=None,
+        remaining_budget=None,
+    ):
+        # Mirrors `ToolRegistry.invoke`. The timeout parameters are accepted and recorded
+        # rather than enforced, so a test can assert what the orchestrator ASKED for
+        # without this harness having to reimplement the clamp.
         self.calls.append(name)
+        # Run the REAL policy, not a copy of it. Recording the raw arguments alone left
+        # every arithmetic defect in `resolve_timeout` structurally invisible to CI:
+        # nothing in the suite ever asked the policy what it decided.
+        try:
+            effective, why = resolve_timeout(
+                self.get(name),
+                requested=timeout_seconds,
+                remaining_budget=remaining_budget,
+            )
+        except Exception as exc:  # a policy failure must surface, not be swallowed
+            effective, why = None, f"POLICY RAISED {type(exc).__name__}: {exc}"
+        self.timeouts.append(
+            {
+                "tool": name,
+                "requested": timeout_seconds,
+                "remaining_budget": remaining_budget,
+                "effective": effective,
+                "why": why,
+            }
+        )
         entry = self.script.get(name)
         if entry is None:
             return ToolResult.success(data={"ok": True})

@@ -162,6 +162,13 @@ class PlanStep:
     retry_limit: int = 2
     retryable: bool = True
 
+    # An optional, JUSTIFIED request for more room on this step: a page that has to
+    # render, a bot that has to be polled, an export that is known to be slow. It is a
+    # request and not a setting -- the dispatcher clamps it to the tool class ceiling and
+    # the hard ceiling, so neither a model nor a caller can turn it into an unbounded
+    # wait. Omitted (the default) means "use the tool's own policy for this operation".
+    timeout_seconds: Optional[int] = None
+
     # Populated as the plan executes.
     status: str = "pending"   # pending | running | completed | failed | skipped | blocked
     result: Optional[Dict[str, Any]] = None
@@ -190,6 +197,7 @@ class PlanStep:
             "estimated_duration_minutes": self.estimated_duration_minutes,
             "retry_limit": self.retry_limit,
             "retryable": self.retryable,
+            "timeout_seconds": self.timeout_seconds,
             "status": self.status,
             "failure_reason": self.failure_reason,
             "is_irreversible": self.kind.is_irreversible,
@@ -222,6 +230,11 @@ class ExecutionPlanSpec:
     llm_reasoning: str = ""
     estimated_cost_usd: float = 0.0
     estimated_duration_minutes: int = 0
+    # Which persisted plan revision this spec IS. Load-bearing, not informational: the
+    # completion proof is stamped with it so `TaskManager` can refuse a proof that
+    # outlived its plan. Without this field the stamp was always None, the staleness
+    # check never fired, and the guard was dead code that looked like protection.
+    revision: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not self.estimated_cost_usd:
@@ -333,6 +346,27 @@ def _as_int(value: Any, default: int) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+# A step may ask for more time than the tool's default, but never an unbounded wait and
+# never less than the floor: anything outside this band is dropped at the boundary rather
+# than carried forward for the dispatcher to clamp. The dispatcher enforces the same band
+# again, because this function is a boundary check and not the enforcement point.
+MIN_REQUESTED_STEP_TIMEOUT = 5
+MAX_REQUESTED_STEP_TIMEOUT = 600
+
+
+def _optional_timeout(value: Any) -> Optional[int]:
+    """A planner-supplied timeout request, bounded, or None if there is not a usable one."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        seconds = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if seconds < MIN_REQUESTED_STEP_TIMEOUT or seconds > MAX_REQUESTED_STEP_TIMEOUT:
+        return None
+    return seconds
 
 
 class PlanningError(Exception):
@@ -534,8 +568,15 @@ Hard rules:
     verification, may EDIT its instruction message in place, and may replace its buttons --
     so never assume the next task is the next numbered item, and never press a button whose
     label you have not just read from the current state.
-13. Prefer one real tool call per step. A step that changes the world and a step
+14. Prefer one real tool call per step. A step that changes the world and a step
     that verifies it should be SEPARATE steps, so verification cannot be skipped.
+15. "timeout_seconds" is OPTIONAL and usually null: leave it null unless you genuinely know
+    this step is slower than usual -- a page that has to render a lot, a bot that has to be
+    polled back, a large export. It is a REQUEST for more room, not a limit you are
+    imposing: the system clamps it to what the tool's own policy allows and may still cut
+    the call short if the task is running out of execution window. Never set it on every
+    step, never set it to a huge number to make something "safe", and never use it to
+    wait longer on a step that has already failed.
 """
 
 
@@ -560,6 +601,9 @@ Hard rules:
    Never use page_observation or post_action_observation for a Telegram send or click.
    "prerequisites" must be an empty list in almost every step. Never reference retry_count,
    max_retries, status or any retry/attempt counter, and never use plain English.
+   "timeout_seconds" is OPTIONAL and usually null: set it only for a step you genuinely know is
+   slow. It is a request for more room that the system clamps, not a limit you impose, and it must
+   never be used to keep waiting on a step that has already failed.
 8a. Telegram bots: never plan a fresh /start. telegram_open_bot already resumes an existing chat
    (resumed=true) and starts only an empty one. Continue from the bot's latest messages and buttons.
 8. To press a bot button use telegram_click_button with the chat and the exact button_text.
@@ -649,7 +693,8 @@ Produce EXACTLY this JSON shape:
       "expected_evidence": "<what the evidence must contain>",
       "estimated_cost_usd": 0.0,
       "estimated_duration_minutes": 5,
-      "retryable": true
+      "retryable": true,
+      "timeout_seconds": <seconds to allow for this step, or null>
     }}
   ]
 }}
@@ -760,6 +805,10 @@ Produce EXACTLY this JSON shape:
                     estimated_duration_minutes=_as_int(raw.get("estimated_duration_minutes"), 5),
                     retryable=bool(raw.get("retryable", True)),
                     retry_limit=_as_int(raw.get("retry_limit"), 2),
+                    # Bounded HERE as well as at the dispatcher. A planner is an LLM and
+                    # its output is untrusted input; a nonsensical value is dropped at
+                    # the boundary rather than carried forward to be clamped later.
+                    timeout_seconds=_optional_timeout(raw.get("timeout_seconds")),
                 )
             )
         return steps
@@ -946,6 +995,7 @@ Produce EXACTLY this JSON shape:
                     retryable=bool(raw.get("retryable", True)),
                     status=raw.get("status", "pending"),
                     failure_reason=raw.get("failure_reason"),
+                    timeout_seconds=_optional_timeout(raw.get("timeout_seconds")),
                 )
             )
 
@@ -953,7 +1003,10 @@ Produce EXACTLY this JSON shape:
             objective=plan.objective,
             steps=steps,
             constraints=plan.constraints or {},
+            # Carried so anything derived from this spec can name the revision it was
+            # derived from, rather than guessing.
             rationale=plan.rationale or "",
+            revision=plan.revision,
         )
 
     async def update_step_status(
@@ -1079,7 +1132,8 @@ Produce EXACTLY this JSON shape:
       "expected_evidence": "",
       "estimated_cost_usd": 0.0,
       "estimated_duration_minutes": 5,
-      "retryable": true
+      "retryable": true,
+      "timeout_seconds": <seconds to allow for this step, or null>
     }}
   ]
 }}

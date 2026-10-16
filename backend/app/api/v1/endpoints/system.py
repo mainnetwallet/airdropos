@@ -26,7 +26,7 @@ from backend.app.integrations import telegram_accounts, telegram_leases
 from backend.app.integrations import telegram_login
 from backend.app.integrations.telegram import telegram_bot
 from backend.app.learning.engine import LearningEngine
-from backend.app.llm.client import llm
+from backend.app.llm.client import is_health_status_healthy, llm
 from backend.app.models import (
     AirdropCampaign,
     BlockchainTransaction,
@@ -126,6 +126,14 @@ async def health_detail(
     }
 
 
+# Statuses a subsystem may report that mean "this one is fine". The LLM's own probe
+# speaks the shared vocabulary in `llm.client`; the database probe and the browser /
+# telegram health calls use this list. Kept as one named set so readiness does not
+# restate a health string literal that can drift from the one its writer emits --
+# which is exactly how a working LLM came to be reported as not ready.
+READY_OK_STATUSES = frozenset({"ok", "OK", "HEALTHY", "healthy"})
+
+
 @router.get("/readiness", tags=["system"])
 async def readiness(
     request: Request,
@@ -141,9 +149,21 @@ async def readiness(
         checks.append({"name": "database", "status": "error", "detail": str(exc)})
 
     llm_health = await llm.health_check()
-    checks.append({"name": "llm", "status": llm_health["status"], "detail": llm_health.get("detail")})
+    # `.get`, not `[...]`: a probe that returns no status at all must surface as an
+    # explicit UNKNOWN that fails readiness, rather than raising KeyError and taking the
+    # whole readiness report down with it.
+    checks.append(
+        {
+            "name": "llm",
+            "status": llm_health.get("status", "UNKNOWN"),
+            "detail": llm_health.get("detail"),
+        }
+    )
 
-    ready = all(c["status"] in ("ok", "HEALTHY") for c in checks) and not emergency_stop.is_stopped
+    ready = all(
+        is_health_status_healthy(c["status"]) or c["status"] in READY_OK_STATUSES
+        for c in checks
+    ) and not emergency_stop.is_stopped
     return {"ready": ready, "checks": checks}
 
 

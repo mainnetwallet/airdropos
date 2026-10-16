@@ -80,6 +80,18 @@ class Task(Base):
     llm_input_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     llm_output_tokens: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     llm_calls_without_usage: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # How many recorded calls reported NO usage at all, and how many reported only one
+    # side of the pair. These are what make the token columns above readable as a FLOOR
+    # rather than a total: a non-zero counter means at least that many calls contributed
+    # an amount nobody can name. `llm_calls_without_usage` alone cannot express this,
+    # because a provider that reports input tokens and omits output tokens reported
+    # something -- it just did not report everything.
+    llm_calls_missing_input_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
+    llm_calls_missing_output_tokens: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False
+    )
     served_model_mismatches: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tool_calls: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tool_failures: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

@@ -35,6 +35,7 @@ STRATEGIES = (
     "title",
     "test_id",
     "value",
+    "id",
     "css",
     "xpath",
 )
@@ -81,6 +82,35 @@ def frames_in_scope(page) -> List[Any]:
     return frames
 
 
+def _escape_identifier(value: str) -> str:
+    """Make a string safe to interpolate into a CSS identifier selector.
+
+    An HTML id may legally contain characters that are CSS syntax (`.`, `:`, `[`, a
+    leading digit). Interpolating one raw into `#...` would either select the wrong
+    element or make the whole selector invalid, so anything that is not a plain ASCII
+    identifier character is escaped as a CSS hex escape.
+
+    ASCII-explicit throughout: Python's `str.isdigit()` is true for Arabic-Indic and
+    other non-ASCII digits, and `isalnum()` for characters such as SUPERSCRIPT TWO.
+    Those are not CSS ident characters, and treating them as one produced garbage
+    selectors -- `isdigit()` on '٣' emitted `\\3٣`, where `\\3` parses as U+0003 and
+    the rest leaks out as a separate token.
+    """
+    out = []
+    for index, char in enumerate(str(value)):
+        if ("a" <= char <= "z") or ("A" <= char <= "Z") or char in "-_" or (
+            "0" <= char <= "9"
+        ):
+            # A CSS identifier may not start with a digit.
+            if index == 0 and "0" <= char <= "9":
+                out.append(f"\\3{char} ")
+            else:
+                out.append(char)
+        else:
+            out.append("\\" + "".join(f"{ord(c):x}" for c in char) + " ")
+    return "".join(out)
+
+
 def _build(frame, strategy: str, value: str, exact: bool):
     if strategy == "role":
         role, _, name = value.partition(":")
@@ -99,6 +129,13 @@ def _build(frame, strategy: str, value: str, exact: bool):
         return frame.get_by_test_id(value)
     if strategy == "value":
         return frame.locator(f'[value="{value}"]')
+    if strategy == "id":
+        # A real, distinct strategy. `id` used to be silently rewritten to a `[name="..."]`
+        # CSS lookup by `browser_fill_form`, so asking for a field by its id filled a
+        # DIFFERENT field -- or nothing -- while reporting which fields it had filled.
+        # The id is an HTML id, so it is escaped: a bare `#` interpolation would let a
+        # caller-supplied id break out of the selector entirely.
+        return frame.locator("#" + _escape_identifier(value))
     if strategy == "css":
         return frame.locator(value)
     if strategy == "xpath":

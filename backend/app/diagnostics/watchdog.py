@@ -137,10 +137,13 @@ async def probe_database(db: AsyncSession) -> Dict[str, Any]:
 
 
 async def probe_llm() -> Dict[str, Any]:
-    from backend.app.llm.client import llm
+    from backend.app.llm.client import is_health_status_healthy, llm
 
     result = await llm.health_check()
-    healthy = bool(result.get("ok", result.get("status") == "ok"))
+    # Interpreted by the shared vocabulary, not by a literal. This probe used to test
+    # `status == "ok"` while `health_check` writes "HEALTHY", so a working model was
+    # reported DEGRADED on every watchdog run and every alert built on it.
+    healthy = is_health_status_healthy(result.get("status"))
     detail = {k: v for k, v in result.items() if k != "api_key"}
     detail["_status"] = HEALTHY if healthy else DEGRADED
     return detail
