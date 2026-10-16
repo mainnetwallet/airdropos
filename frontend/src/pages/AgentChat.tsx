@@ -935,6 +935,16 @@ export default function AgentChat() {
         <div className="flex items-center gap-2">
           <button
             type="button"
+            onClick={newConversation}
+            aria-label="New chat"
+            title="New chat"
+            className="flex h-10 items-center justify-center gap-2 rounded-xl border border-surface-300 px-3 text-sm font-medium text-slate-100 transition hover:bg-surface-200"
+          >
+            <Plus className="h-5 w-5" />
+            <span className="hidden sm:inline">New chat</span>
+          </button>
+          <button
+            type="button"
             onClick={() => setShowInfo((v) => !v)}
             aria-pressed={showInfo}
             aria-label="Model and autonomy information"
