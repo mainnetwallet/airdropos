@@ -6,16 +6,14 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Activity,
   AlertTriangle,
-  Bot,
+  ArrowUp,
   Check,
   Copy,
   Info,
   ListChecks,
-  Plus,
   Search,
   Send,
   ShieldAlert,
-  ShieldCheck,
   Trash2,
   Wallet,
   XCircle,
@@ -23,7 +21,7 @@ import {
 import clsx from 'clsx'
 import { api } from '@/services/api'
 import { agentChatStore, type ChatMessage, type LiveTool, type LiveTurn } from '@/services/agentChatStore'
-import { Alert, Card } from '@/components/ui'
+import { Alert } from '@/components/ui'
 import type { AgentToolCall, AutonomousRule, AutonomyPolicy } from '@/types'
 
 /** Quick actions only fill the composer; nothing is sent until the operator presses send. */
@@ -41,14 +39,6 @@ function clock(iso: string): string {
   return Number.isNaN(date.getTime())
     ? ''
     : date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-}
-
-function AgentAvatar() {
-  return (
-    <span className="mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gradient-to-b from-sky-400 to-accent-hover text-white ring-2 ring-sky-300/30 lg:hidden">
-      <Bot className="h-5 w-5" />
-    </span>
-  )
 }
 
 /**
@@ -351,43 +341,64 @@ function LiveReply({ live }: { live: LiveTurn | null }) {
   const hasTools = !!live && live.tools.length > 0
 
   return (
-    <div className="flex items-start gap-2">
-      <AgentAvatar />
-      <div className="flex max-w-[82%] flex-col gap-2 lg:max-w-[80%]">
-        {hasTools && (
-          <ul className="space-y-1 rounded-2xl border border-surface-300 bg-surface-200/60 px-3 py-2 text-xs lg:border-0">
-            {live!.tools.map((t) => (
-              <li key={t.id} className="flex items-center gap-2 text-slate-300">
-                <span
-                  className={clsx(
-                    'h-1.5 w-1.5 shrink-0 rounded-full',
-                    t.status === 'running'
-                      ? 'animate-pulse bg-sky-400'
-                      : t.status === 'success'
-                        ? 'bg-emerald-400'
-                        : 'bg-amber-400',
-                  )}
-                />
-                <span className="font-mono">{t.tool}</span>
-                <span className="text-slate-500">{toolLabel(t)}</span>
-              </li>
-            ))}
-          </ul>
+    <div className="flex flex-col gap-2">
+      {hasTools && (
+        <ul className="space-y-1 rounded-2xl border border-surface-300 bg-surface-200/60 px-3 py-2 text-xs">
+          {live!.tools.map((t) => (
+            <li key={t.id} className="flex items-center gap-2 text-slate-300">
+              <span
+                className={clsx(
+                  'h-1.5 w-1.5 shrink-0 rounded-full',
+                  t.status === 'running'
+                    ? 'animate-pulse bg-sky-400'
+                    : t.status === 'success'
+                      ? 'bg-emerald-400'
+                      : 'bg-amber-400',
+                )}
+              />
+              <span className="font-mono">{t.tool}</span>
+              <span className="text-slate-500">{toolLabel(t)}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="whitespace-pre-wrap break-words text-[15px] leading-7 text-slate-100">
+        {hasText ? (
+          <>
+            {live!.text}
+            <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-300" aria-hidden />
+          </>
+        ) : (
+          <span className="animate-pulse text-sm text-slate-400">
+            {hasTools ? 'Working…' : 'Thinking…'}
+          </span>
         )}
-        <div className="whitespace-pre-wrap break-words rounded-2xl rounded-tl-md border border-surface-300 bg-surface-200 px-4 py-2.5 text-[15px] leading-relaxed text-slate-100 lg:border-0 lg:text-sm lg:text-slate-200">
-          {hasText ? (
-            <>
-              {live!.text}
-              <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-sky-400/80" aria-hidden />
-            </>
-          ) : (
-            <span className="animate-pulse text-sm text-slate-400">
-              {hasTools ? 'Working…' : 'Thinking…'}
-            </span>
-          )}
-        </div>
       </div>
     </div>
+  )
+}
+
+/** Small "copy reply" action under an assistant message (ChatGPT-style). */
+function CopyReply({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch {
+      setCopied(false)
+    }
+  }
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      aria-label="Copy reply"
+      className="rounded-lg p-1.5 text-slate-500 transition hover:bg-surface-300/70 hover:text-slate-200"
+    >
+      {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+    </button>
   )
 }
 
@@ -520,126 +531,105 @@ export default function AgentChat() {
   }
 
   return (
-    <div className="flex h-full flex-col gap-3 px-4 pb-2 pt-1 lg:gap-4 lg:p-0">
-      {/* Header: phone */}
-      <header className="flex items-center justify-between gap-3 lg:hidden">
+    <div className="flex h-full min-h-0 flex-col">
+      {/* Header */}
+      <header className="flex items-center justify-between gap-3 px-4 pb-2 pt-1 lg:px-0">
         <div className="min-w-0">
-          <h1 className="text-2xl font-bold text-slate-100">Agent Chat</h1>
-          <span
-            className={clsx(
-              'mt-1 inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-semibold',
-              info ? 'bg-emerald-500/15 text-emerald-400' : 'bg-slate-500/20 text-slate-400',
-            )}
-          >
-            <span className={clsx('h-1.5 w-1.5 rounded-full', info ? 'bg-emerald-400' : 'bg-slate-400')} />
+          <h1 className="text-xl font-semibold text-slate-100 lg:text-2xl">AI Agent Console</h1>
+          <p className="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
+            <span className={clsx('h-1.5 w-1.5 rounded-full', info ? 'bg-emerald-400' : 'bg-slate-500')} />
             {info ? 'Online' : 'Connecting'}
-          </span>
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={() => setShowInfo((v) => !v)}
             aria-pressed={showInfo}
-            aria-label="Model information"
+            aria-label="Model and autonomy information"
             className={clsx(
-              'flex h-11 w-11 items-center justify-center rounded-xl border border-surface-300 bg-surface-200 text-slate-200',
+              'flex h-10 w-10 items-center justify-center rounded-xl border border-surface-300 text-slate-300 hover:bg-surface-200',
               showInfo && 'border-accent text-accent',
             )}
           >
             <Info className="h-5 w-5" />
           </button>
-          <button
-            type="button"
-            onClick={clearChat}
-            aria-label="Start a new conversation"
-            className="flex h-11 w-11 items-center justify-center rounded-xl bg-accent text-white shadow-[0_6px_16px_rgba(37,99,235,0.45)]"
-          >
-            <Plus className="h-6 w-6" />
-          </button>
+          {messages.length > 0 && (
+            <button type="button" className="btn-ghost" onClick={clearChat}>
+              <Trash2 className="h-4 w-4" />
+              <span className="hidden sm:inline">Clear chat</span>
+            </button>
+          )}
         </div>
       </header>
 
-      {/* Header: desktop */}
-      <header className="hidden items-end justify-between gap-4 lg:flex">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-100">AI Agent Console</h1>
-          <p className="mt-1 text-sm text-slate-400">
-            Natural-language control of the central autonomous agent
-          </p>
-        </div>
-        {messages.length > 0 && (
-          <button type="button" className="btn-ghost" onClick={clearChat}>
-            <Trash2 className="h-4 w-4" />
-            Clear chat
-          </button>
-        )}
-      </header>
-
-      {info && (
-        <div className={clsx(!showInfo && 'hidden lg:block')}>
-          <Alert kind="info" title="Single fixed model">
-            All reasoning runs on <span className="font-mono">{info.model_id}</span> at{' '}
-            <span className="font-mono">{info.base_url}</span>. There is no model switching, fallback,
-            or routing. API key is configured but never returned to the browser.
-          </Alert>
+      {/* Model + autonomy details, tucked away so the conversation stays clean */}
+      {showInfo && (
+        <div className="mx-auto w-full max-w-3xl space-y-2 px-4 pb-2 lg:px-0">
+          {info && (
+            <Alert kind="info" title="Single fixed model">
+              All reasoning runs on <span className="font-mono">{info.model_id}</span> at{' '}
+              <span className="font-mono">{info.base_url}</span>. There is no model switching,
+              fallback, or routing. API key is configured but never returned to the browser.
+            </Alert>
+          )}
+          {autonomy && <AutonomyPanel policy={autonomy} />}
         </div>
       )}
 
-      {autonomy && (
-        <div className={clsx(!showInfo && 'hidden lg:block')}>
-          <AutonomyPanel policy={autonomy} />
-        </div>
-      )}
-
-      <Card className="flex min-h-0 flex-1 flex-col max-lg:border-0 max-lg:bg-transparent max-lg:p-0 max-lg:shadow-none">
-        <div className="flex-1 space-y-4 overflow-y-auto pb-3 lg:space-y-3 lg:pb-4">
-          {messages.length === 0 && (
-            <>
-              {/* Phone: the same greeting the reference opens with (interface text, not stored or sent). */}
-              <div className="flex items-start gap-2 lg:hidden">
-                <AgentAvatar />
-                <div className="max-w-[82%] rounded-2xl rounded-tl-md border border-surface-300 bg-surface-200 px-4 py-3 text-[15px] leading-relaxed text-slate-100">
-                  Hello! I’m your AirdropOS agent. I can help you discover airdrops, manage tasks, and
-                  automate repetitive work. What would you like me to do?
-                </div>
+      {/* Conversation: one centred column, like ChatGPT */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col gap-6 px-4 py-4 lg:px-0">
+          {messages.length === 0 && !pending && (
+            <div className="flex flex-1 flex-col items-center justify-center gap-6 py-10 text-center">
+              <h2 className="text-2xl font-semibold text-slate-100 sm:text-3xl">What can I help with?</h2>
+              <div className="flex max-w-xl flex-wrap justify-center gap-2">
+                {QUICK_ACTIONS.map(({ label, icon: Icon, prompt }) => (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => fillPrompt(prompt)}
+                    className="flex items-center gap-2 rounded-full border border-surface-300 bg-surface-200/60 px-4 py-2 text-sm text-slate-200 transition hover:bg-surface-200"
+                  >
+                    <Icon className="h-4 w-4 text-slate-400" />
+                    {label}
+                  </button>
+                ))}
               </div>
-              <div className="hidden h-full flex-col items-center justify-center gap-2 text-center lg:flex">
-                <ShieldCheck className="h-10 w-10 text-slate-600" />
-                <p className="font-medium text-slate-300">Ask the agent to do something</p>
-                <p className="max-w-md text-sm text-slate-500">
-                  e.g. “Discover legitimate airdrops and research eligibility for my configured
-                  wallets”, “Show me the status of AIR-2026-10-15-483920”, or “Report today's activity”.
-                </p>
-              </div>
-            </>
+            </div>
           )}
 
           {messages.map((m) => {
             const mine = m.role === 'user'
-            return (
-              <div key={m.id} className={clsx('flex items-start gap-2', mine ? 'justify-end' : 'justify-start')}>
-                {!mine && <AgentAvatar />}
-                <div className={clsx('flex max-w-[82%] flex-col lg:max-w-[80%]', mine ? 'items-end' : 'items-start')}>
-                  <div
-                    className={clsx(
-                      'whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed lg:text-sm',
-                      mine
-                        ? 'rounded-tr-md bg-accent text-white lg:rounded-tr-2xl'
-                        : m.error
-                          ? 'rounded-tl-md border border-status-error/40 bg-status-error/10 text-slate-100 lg:rounded-tl-2xl'
-                          : 'rounded-tl-md border border-surface-300 bg-surface-200 text-slate-100 lg:rounded-tl-2xl lg:border-0 lg:text-slate-200',
-                    )}
-                  >
+            if (mine) {
+              return (
+                <div key={m.id} className="flex justify-end">
+                  <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-3xl bg-surface-300 px-5 py-2.5 text-[15px] leading-7 text-slate-100 sm:max-w-[75%]">
                     {m.content}
-                    {m.taskId && (
-                      <div className="mt-2 inline-flex flex-wrap items-center gap-1.5 rounded-md bg-emerald-500/15 px-2 py-1 font-mono text-xs text-emerald-300">
-                        {m.taskId}
-                        {m.taskStatus && <span className="font-sans text-[11px] opacity-80">{m.taskStatus}</span>}
-                      </div>
-                    )}
-                    <MessageDetail message={m} />
                   </div>
-                  <span className="mt-1 px-1 text-[11px] text-slate-500 lg:hidden">{clock(m.at)}</span>
+                </div>
+              )
+            }
+            return (
+              <div key={m.id} className="group flex flex-col items-start">
+                <div
+                  className={clsx(
+                    'w-full whitespace-pre-wrap break-words text-[15px] leading-7 text-slate-100',
+                    m.error && 'rounded-2xl border border-status-error/40 bg-status-error/10 px-4 py-3',
+                  )}
+                >
+                  {m.content}
+                  {m.taskId && (
+                    <div className="mt-2 inline-flex flex-wrap items-center gap-1.5 rounded-md bg-emerald-500/15 px-2 py-1 font-mono text-xs text-emerald-300">
+                      {m.taskId}
+                      {m.taskStatus && <span className="font-sans text-[11px] opacity-80">{m.taskStatus}</span>}
+                    </div>
+                  )}
+                  <MessageDetail message={m} />
+                </div>
+                <div className="mt-1 flex items-center gap-1 text-[11px] text-slate-500">
+                  {!m.error && <CopyReply text={m.content} />}
+                  <span className="px-1">{clock(m.at)}</span>
                 </div>
               </div>
             )
@@ -648,31 +638,19 @@ export default function AgentChat() {
           {pending && <LiveReply live={live} />}
           <div ref={bottomRef} />
         </div>
+      </div>
 
-        {/* Quick actions (phone) */}
-        <div className="no-scrollbar -mx-4 flex gap-2 overflow-x-auto px-4 pb-2 lg:hidden">
-          {QUICK_ACTIONS.map(({ label, icon: Icon, prompt }) => (
-            <button
-              key={label}
-              type="button"
-              onClick={() => fillPrompt(prompt)}
-              className="flex shrink-0 items-center gap-2 rounded-xl border border-accent/40 bg-accent/10 px-3 py-2 text-[13px] font-medium text-sky-300"
-            >
-              <Icon className="h-4 w-4" />
-              {label}
-            </button>
-          ))}
-        </div>
-
+      {/* Composer: rounded pill, centred */}
+      <div className="px-4 pb-2 pt-1 lg:px-0">
         <form
           onSubmit={handleSubmit}
-          className="flex items-end gap-2 lg:border-t lg:border-surface-300 lg:pt-3"
+          className="mx-auto flex w-full max-w-3xl items-end gap-2 rounded-[28px] border border-surface-300 bg-surface-200 py-2 pl-5 pr-2 shadow-lg shadow-black/20 focus-within:border-slate-500"
         >
           <textarea
             ref={inputRef}
             rows={1}
-            className="max-h-[200px] min-h-[2.75rem] min-w-0 flex-1 resize-none rounded-3xl border border-surface-300 bg-surface-200 px-4 py-3 text-base text-slate-100 placeholder-slate-500 focus:border-accent focus:outline-none lg:rounded-lg lg:py-2 lg:text-sm"
-            placeholder="Type a message…"
+            className="max-h-[200px] min-h-[2.5rem] min-w-0 flex-1 resize-none self-center border-0 bg-transparent py-2 text-base text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-0 lg:text-[15px]"
+            placeholder="Ask anything"
             aria-label="Message to the agent"
             enterKeyHint="send"
             value={input}
@@ -690,14 +668,16 @@ export default function AgentChat() {
           <button
             type="submit"
             aria-label="Send"
-            className="btn-primary h-12 w-12 shrink-0 justify-center rounded-full p-0 shadow-[0_6px_16px_rgba(37,99,235,0.45)] lg:h-auto lg:w-auto lg:rounded-lg lg:px-4 lg:py-2 lg:shadow-none"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-accent text-white transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-40"
             disabled={!input.trim() || pending}
           >
-            <Send className="h-5 w-5 lg:h-4 lg:w-4" />
-            <span className="hidden lg:inline">Send</span>
+            <ArrowUp className="h-5 w-5" />
           </button>
         </form>
-      </Card>
+        <p className="mx-auto mt-2 max-w-3xl text-center text-[11px] text-slate-500">
+          The agent can make mistakes. Check important info.
+        </p>
+      </div>
     </div>
   )
 }
