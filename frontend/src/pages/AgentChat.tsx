@@ -622,9 +622,8 @@ export default function AgentChat() {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
   const [attachError, setAttachError] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
-  const [historyOpen, setHistoryOpen] = useState(
-    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches,
-  )
+  // The history sidebar starts closed on every screen size; the header button opens it.
+  const [historyOpen, setHistoryOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [toDelete, setToDelete] = useState<ConversationSummary | null>(null)
   const [editText, setEditText] = useState('')
