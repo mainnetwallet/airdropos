@@ -333,6 +333,10 @@ def build_app() -> FastAPI:
         except Exception as exc:
             raise _guard(exc)
 
+    @app.delete("/events", dependencies=deps)
+    async def clear_events() -> Dict[str, Any]:
+        return {"cleared": hub.events.clear()}
+
     @app.get("/events", dependencies=deps)
     async def events(        after: Optional[int] = None,
         epoch: Optional[str] = None,

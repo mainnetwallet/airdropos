@@ -155,6 +155,22 @@ async def events(
     return await _gateway(client.get_json("/events", params))
 
 
+@router.delete("/events")
+async def clear_events(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    principal: Principal = Depends(require_task_write),
+) -> Dict[str, Any]:
+    """Clear the Live Activity Log on the worker, so it stays cleared after a refresh and for everyone."""
+    enforce_rate_limit(request, "write")
+    resp = await _gateway(client.request("DELETE", "/events"))
+    result = resp.json()
+    await write_audit(db, principal, "LIVE_EVENTS_CLEAR", "live_events", "all",
+                      after_state={"cleared": result.get("cleared")})
+    await db.commit()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Start / pause / resume / stop
 # ---------------------------------------------------------------------------

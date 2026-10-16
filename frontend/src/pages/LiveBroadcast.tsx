@@ -1,6 +1,7 @@
 /** Live Broadcast: every real running automation session on one screen (desktop grid + phone layout). */
 
 import { useMemo, useState } from 'react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { LayoutGrid, List, Plus, Radio, Trash2 } from 'lucide-react'
 import clsx from 'clsx'
@@ -10,6 +11,7 @@ import ActivityList from '@/components/live/ActivityList'
 import NewSessionModal from '@/components/live/NewSessionModal'
 import { IntegrationBadge, STATUS_DOT, STATUS_LABEL, STATUS_TILE } from '@/components/live/meta'
 import { useLiveFeed, useStale } from '@/hooks/useLive'
+import { liveApi } from '@/services/api'
 import type { LiveResources, LiveSession, SessionStatus } from '@/types/live'
 
 const STATUS_ORDER: SessionStatus[] = ['running', 'waiting_for_user', 'paused', 'failed', 'stopped']
@@ -41,7 +43,31 @@ export default function LiveBroadcast() {
   const { stale, ageSeconds } = useStale(overview)
   const [layout, setLayout] = useState<'grid' | 'list'>('grid')
   const [showNew, setShowNew] = useState(false)
-  const [logCleared, setLogCleared] = useState(0)
+  // Cleared on the worker (so it stays cleared after a refresh). The time is also remembered here, which keeps the
+  // log clear for a read-only login that is not allowed to clear it on the server, and hides anything already fetched.
+  const [logCleared, setLogCleared] = useState(() => {
+    try {
+      return Number(localStorage.getItem('live-log-cleared')) || 0
+    } catch {
+      return 0
+    }
+  })
+  const qc = useQueryClient()
+  const clearLog = useMutation({
+    mutationFn: () => liveApi.liveClearEvents(),
+    onSettled: () => void qc.invalidateQueries({ queryKey: ['live', 'events'] }),
+  })
+  const clearEvents = () => {
+    // Use the newest event's own timestamp (the server's clock), not this browser's, so clock drift cannot hide new events.
+    const newest = events.length ? new Date(events[0].at).getTime() : Date.now()
+    setLogCleared(newest)
+    try {
+      localStorage.setItem('live-log-cleared', String(newest))
+    } catch {
+      /* ignore */
+    }
+    clearLog.mutate()
+  }
 
   const data = overview.data
   const sessions = data?.sessions ?? []
@@ -210,7 +236,8 @@ export default function LiveBroadcast() {
             action={
               <button
                 type="button"
-                onClick={() => setLogCleared(Date.now())}
+                onClick={clearEvents}
+                disabled={clearLog.isPending}
                 className="inline-flex items-center gap-1 rounded-lg bg-surface-200 px-2 py-1 text-xs text-slate-400 hover:text-slate-200"
               >
                 <Trash2 className="h-3 w-3" /> Clear

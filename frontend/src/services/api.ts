@@ -618,6 +618,7 @@ export function releaseControlOnUnload(integration: string, key: string, token: 
 
 Object.assign(api, {
   liveOverview: () => request<LiveOverview>('/live/overview'),
+  liveClearEvents: () => request<{ cleared: number }>('/live/events', { method: 'DELETE' }),
   liveEvents: (params: { session?: string; limit?: number } = {}) => {
     const q = new URLSearchParams()
     if (params.session) q.set('session', params.session)
@@ -750,6 +751,7 @@ Object.assign(api, {
 /** Typed view of the methods attached above (keeps the main `api` literal untouched). */
 export type LiveApi = {
   liveOverview: () => Promise<LiveOverview>
+  liveClearEvents: () => Promise<{ cleared: number }>
   liveEvents: (p?: { session?: string; limit?: number }) => Promise<LiveEventsResponse>
   liveCreateSession: (profileId: string, url?: string) => Promise<{ session: LiveSession }>
   livePause: (i: string, k: string) => Promise<Record<string, unknown>>
