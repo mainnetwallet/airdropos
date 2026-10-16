@@ -7,6 +7,10 @@ import {
   Activity,
   AlertTriangle,
   ArrowUp,
+  ChevronRight,
+  MessageSquare,
+  PanelLeft,
+  Pencil,
   FileText,
   Plus,
   RefreshCw,
@@ -26,7 +30,13 @@ import clsx from 'clsx'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { api } from '@/services/api'
-import { agentChatStore, type ChatMessage, type LiveTool, type LiveTurn } from '@/services/agentChatStore'
+import {
+  agentChatStore,
+  type ChatMessage,
+  type ConversationSummary,
+  type LiveTool,
+  type LiveTurn,
+} from '@/services/agentChatStore'
 import {
   MAX_FILES,
   MAX_IMAGES,
@@ -144,43 +154,81 @@ const TOOL_STATUS_STYLE: Record<AgentToolCall['status'], string> = {
   unavailable: 'text-slate-400',
 }
 
+/** One tool call, with its real outcome. */
+function ToolCallRow({ call }: { call: AgentToolCall }) {
+  return (
+    <div className="rounded-lg border border-surface-300 bg-slate-900/40 px-2.5 py-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-mono text-xs text-slate-300">{call.tool}</span>
+        <span className={clsx('shrink-0 font-mono text-[11px]', TOOL_STATUS_STYLE[call.status])}>
+          {call.status}
+        </span>
+      </div>
+      {call.error && <p className="mt-1 break-words text-xs text-slate-400">{call.error}</p>}
+      {call.evidence?.kind && call.status === 'success' && (
+        <p className="mt-1 text-[11px] text-slate-500">evidence: {call.evidence.kind}</p>
+      )}
+      {typeof call.data?.tx_hash === 'string' && call.status === 'success' && (
+        // The hash the backend actually returned. Copyable like an address, and
+        // never derived in the browser.
+        <CopyableAddress address={call.data.tx_hash} label="Copy transaction hash" />
+      )}
+      {typeof call.data?.status === 'string' && call.status === 'success' && (
+        <p className="mt-1 text-[11px] text-slate-400">{call.data.status}</p>
+      )}
+      {call.status === 'success' && addressOf(call.data) && (
+        <CopyableAddress address={addressOf(call.data) as string} />
+      )}
+    </div>
+  )
+}
+
 /**
  * The tools the agent actually ran, with their real outcomes.
  *
- * A failure, a refusal and an "unavailable" are rendered as themselves. The component
- * has no branch that turns any non-success into a tick.
+ * The list is folded to one summary line so a long run does not bury the answer. Two things are
+ * never folded away: if any call did not succeed the list opens by itself (a failure, a refusal
+ * and an "unavailable" are shown as themselves, never as a tick), and the addresses and
+ * transaction hashes the backend returned stay visible and copyable.
  */
 function ToolCallList({ calls }: { calls: AgentToolCall[] }) {
+  const problems = calls.filter((c) => c.status !== 'success').length
+  const [open, setOpen] = useState(problems > 0)
   if (calls.length === 0) return null
+
+  const highlights: string[] = []
+  for (const call of calls) {
+    if (call.status !== 'success') continue
+    if (typeof call.data?.tx_hash === 'string') highlights.push(call.data.tx_hash)
+    const address = addressOf(call.data)
+    if (address) highlights.push(address)
+  }
+
   return (
-    <div className="mt-2 space-y-1.5">
-      {calls.map((call, i) => (
-        <div key={`${call.tool}-${i}`} className="rounded-lg border border-surface-300 bg-slate-900/40 px-2.5 py-1.5">
-          <div className="flex items-center justify-between gap-2">
-            <span className="truncate font-mono text-xs text-slate-300">{call.tool}</span>
-            <span className={clsx('shrink-0 font-mono text-[11px]', TOOL_STATUS_STYLE[call.status])}>
-              {call.status}
-            </span>
-          </div>
-          {call.error && (
-            <p className="mt-1 break-words text-xs text-slate-400">{call.error}</p>
-          )}
-          {call.evidence?.kind && call.status === 'success' && (
-            <p className="mt-1 text-[11px] text-slate-500">evidence: {call.evidence.kind}</p>
-          )}
-          {typeof call.data?.tx_hash === 'string' && call.status === 'success' && (
-            // The hash the backend actually returned. Copyable like an address, and
-            // never derived in the browser.
-            <CopyableAddress address={call.data.tx_hash} label="Copy transaction hash" />
-          )}
-          {typeof call.data?.status === 'string' && call.status === 'success' && (
-            <p className="mt-1 text-[11px] text-slate-400">{call.data.status}</p>
-          )}
-          {call.status === 'success' && addressOf(call.data) && (
-            <CopyableAddress address={addressOf(call.data) as string} />
-          )}
+    <div className="mt-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 rounded-lg border border-surface-300 bg-slate-900/40 px-2.5 py-1.5 text-left text-xs text-slate-300 transition hover:bg-slate-900/70"
+      >
+        <ChevronRight className={clsx('h-3.5 w-3.5 shrink-0 transition-transform', open && 'rotate-90')} />
+        <span>
+          {calls.length} tool{calls.length === 1 ? '' : 's'} used
+        </span>
+        <span className={clsx('ml-auto font-mono text-[11px]', problems ? 'text-amber-300' : 'text-emerald-300')}>
+          {problems ? `${problems} did not succeed` : 'all succeeded'}
+        </span>
+      </button>
+      {open ? (
+        <div className="mt-1.5 space-y-1.5">
+          {calls.map((call, i) => (
+            <ToolCallRow key={`${call.tool}-${i}`} call={call} />
+          ))}
         </div>
-      ))}
+      ) : (
+        highlights.map((value, i) => <CopyableAddress key={`${value}-${i}`} address={value} />)
+      )}
     </div>
   )
 }
@@ -453,6 +501,87 @@ function AttachmentChip({
   )
 }
 
+function dayLabel(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ''
+  const days = Math.round((new Date().setHours(0, 0, 0, 0) - new Date(date).setHours(0, 0, 0, 0)) / 86_400_000)
+  if (days <= 0) return 'Today'
+  if (days === 1) return 'Yesterday'
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+}
+
+/** Saved conversations: open one, start a new one, or delete one. */
+function HistorySidebar({
+  open,
+  conversations,
+  activeId,
+  onNew,
+  onOpen,
+  onDelete,
+  onClose,
+}: {
+  open: boolean
+  conversations: ConversationSummary[]
+  activeId: string
+  onNew: () => void
+  onOpen: (id: string) => void
+  onDelete: (id: string) => void
+  onClose: () => void
+}) {
+  if (!open) return null
+  return (
+    <>
+      <div className="fixed inset-0 z-30 bg-black/60 lg:hidden" onClick={onClose} aria-hidden />
+      <aside
+        aria-label="Conversation history"
+        className="fixed inset-y-0 left-0 z-40 flex w-72 flex-col gap-2 border-r border-surface-300 bg-surface-100 p-3 lg:static lg:z-auto lg:mr-4 lg:w-64 lg:shrink-0 lg:rounded-xl lg:border"
+      >
+        <button
+          type="button"
+          onClick={onNew}
+          className="flex items-center gap-2 rounded-xl border border-surface-300 px-3 py-2 text-sm font-medium text-slate-100 transition hover:bg-surface-200"
+        >
+          <Plus className="h-4 w-4" />
+          New chat
+        </button>
+        <p className="px-1 pt-1 text-[11px] font-semibold uppercase tracking-wide text-slate-500">History</p>
+        <ul className="min-h-0 flex-1 space-y-0.5 overflow-y-auto">
+          {conversations.length === 0 && (
+            <li className="px-2 py-3 text-xs text-slate-500">Your conversations will be saved here.</li>
+          )}
+          {conversations.map((c) => (
+            <li key={c.id} className="group relative">
+              <button
+                type="button"
+                onClick={() => onOpen(c.id)}
+                aria-current={c.id === activeId ? 'true' : undefined}
+                className={clsx(
+                  'flex w-full items-start gap-2 rounded-lg px-2 py-2 pr-9 text-left transition',
+                  c.id === activeId ? 'bg-surface-300 text-slate-100' : 'text-slate-300 hover:bg-surface-200',
+                )}
+              >
+                <MessageSquare className="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />
+                <span className="min-w-0">
+                  <span className="block truncate text-sm">{c.title}</span>
+                  <span className="block text-[11px] text-slate-500">{dayLabel(c.updatedAt)}</span>
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onDelete(c.id)}
+                aria-label={`Delete conversation ${c.title}`}
+                className="absolute right-1.5 top-2 rounded-md p-1 text-slate-500 opacity-100 transition hover:bg-surface-100 hover:text-status-error lg:opacity-0 lg:group-hover:opacity-100 lg:focus:opacity-100"
+              >
+                <Trash2 className="h-4 w-4" />
+              </button>
+            </li>
+          ))}
+        </ul>
+      </aside>
+    </>
+  )
+}
+
 /** Small "copy reply" action under an assistant message (ChatGPT-style). */
 function CopyReply({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
@@ -480,7 +609,7 @@ function CopyReply({ text }: { text: string }) {
 export default function AgentChat() {
   // Conversation lives in a persistent external store, not component state, so
   // it survives navigating to another page and back.
-  const { messages, pending, live } = useSyncExternalStore(
+  const { messages, pending, busy, live, activeId, conversations } = useSyncExternalStore(
     agentChatStore.subscribe,
     agentChatStore.getSnapshot,
   )
@@ -492,6 +621,11 @@ export default function AgentChat() {
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
   const [attachError, setAttachError] = useState<string | null>(null)
   const [dragging, setDragging] = useState(false)
+  const [historyOpen, setHistoryOpen] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches,
+  )
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editText, setEditText] = useState('')
   const fileInputRef = useRef<HTMLInputElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -507,7 +641,7 @@ export default function AgentChat() {
   const liveSize = live ? live.text.length + live.tools.length : 0
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: liveSize > 0 ? 'auto' : 'smooth' })
-  }, [messages.length, pending, liveSize])
+  }, [messages.length, pending, liveSize, activeId])
 
   // ChatGPT-style composer: the box grows with the text up to a cap, then scrolls.
   useLayoutEffect(() => {
@@ -547,38 +681,46 @@ export default function AgentChat() {
         .finally(() => agentChatStore.setAbort(null))
     },
     onMutate: () => {
-      agentChatStore.setPending(true)
-      // Remember which conversation this request belongs to.
-      return { epoch: agentChatStore.getEpoch() }
+      // Remember which conversation this request belongs to: the reply lands there even if the
+      // operator opens another conversation while the agent works.
+      const conversationId = agentChatStore.getSnapshot().activeId
+      agentChatStore.setPending(true, conversationId)
+      return { epoch: agentChatStore.getEpoch(), conversationId }
     },
     onSuccess: (response, _vars, context) => {
       // The chat was cleared while the agent was still working: drop the late reply.
       if (context && context.epoch !== agentChatStore.getEpoch()) return
       // Everything rendered below comes from this response, which came from real
       // tool invocations. The UI does not infer success from the prose.
-      agentChatStore.add({
-        role: 'agent',
-        content: response.reply,
-        taskId: response.task?.task_id,
-        taskStatus: response.task?.status,
-        toolCalls: response.tool_calls,
-        approvals: response.approvals_required,
-        blockers: response.blockers,
-        needsUserAction: response.needs_user_action,
-        truncated: response.truncated,
-      })
+      agentChatStore.add(
+        {
+          role: 'agent',
+          content: response.reply,
+          taskId: response.task?.task_id,
+          taskStatus: response.task?.status,
+          toolCalls: response.tool_calls,
+          approvals: response.approvals_required,
+          blockers: response.blockers,
+          needsUserAction: response.needs_user_action,
+          truncated: response.truncated,
+        },
+        context?.conversationId,
+      )
     },
     onError: (error: Error, _vars, context) => {
       if (context && context.epoch !== agentChatStore.getEpoch()) return
       if (error.name === 'AbortError') {
-        agentChatStore.add({ role: 'agent', content: 'Stopped.', error: true })
+        agentChatStore.add({ role: 'agent', content: 'Stopped.', error: true }, context?.conversationId)
         return
       }
-      agentChatStore.add({
-        role: 'agent',
-        content: `Request failed: ${error.message}`,
-        error: true,
-      })
+      agentChatStore.add(
+        {
+          role: 'agent',
+          content: `Request failed: ${error.message}`,
+          error: true,
+        },
+        context?.conversationId,
+      )
     },
     onSettled: () => agentChatStore.setPending(false),
   })
@@ -594,7 +736,7 @@ export default function AgentChat() {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (pending) return
+    if (busy) return
     const { content, display, images } = composeMessage(input, attachments)
     if (!content.trim()) return
 
@@ -618,7 +760,7 @@ export default function AgentChat() {
 
   /** Replace the last reply with a fresh one for the same question. */
   const regenerate = () => {
-    if (pending) return
+    if (busy) return
     const all = agentChatStore.getSnapshot().messages
     const last = all[all.length - 1]
     const lastUser = [...all].reverse().find((m) => m.role === 'user')
@@ -650,6 +792,51 @@ export default function AgentChat() {
     if (problems.length) setAttachError(problems.join(' '))
   }
 
+  /** Replace an earlier message with an edited one: it and everything after it is dropped. */
+  const resendEdited = (messageId: string) => {
+    const text = editText.trim()
+    if (!text || busy) return
+    const all = agentChatStore.getSnapshot().messages
+    const index = all.findIndex((m) => m.id === messageId)
+    if (index < 0) return
+    const history = all
+      .slice(0, index)
+      .filter((m) => !m.error)
+      .map((m) => ({
+        role: m.role === 'user' ? ('user' as const) : ('assistant' as const),
+        content: m.content,
+      }))
+    agentChatStore.truncateFrom(messageId)
+    agentChatStore.add({ role: 'user', content: text })
+    setEditingId(null)
+    send.mutate({ message: text, history })
+  }
+
+  const resetComposer = () => {
+    setInput('')
+    setAttachments([])
+    setAttachError(null)
+    setEditingId(null)
+  }
+  const closeHistoryOnMobile = () => {
+    if (!window.matchMedia('(min-width: 1024px)').matches) setHistoryOpen(false)
+  }
+  const openConversation = (id: string) => {
+    agentChatStore.switchTo(id)
+    resetComposer()
+    closeHistoryOnMobile()
+  }
+  const newConversation = () => {
+    agentChatStore.newConversation()
+    resetComposer()
+    closeHistoryOnMobile()
+  }
+  const deleteConversation = (id: string) => {
+    if (!window.confirm('Delete this conversation?')) return
+    agentChatStore.deleteConversation(id)
+    resetComposer()
+  }
+
   const clearChat = () => {
     if (!window.confirm('Clear this conversation?')) return
     agentChatStore.clear()
@@ -668,7 +855,7 @@ export default function AgentChat() {
 
   return (
     <div
-      className="relative flex h-full min-h-0 flex-col"
+      className="relative flex h-full min-h-0"
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes('Files')) {
           e.preventDefault()
@@ -690,14 +877,39 @@ export default function AgentChat() {
           Drop photos or text files to attach
         </div>
       )}
+      <HistorySidebar
+        open={historyOpen}
+        conversations={conversations}
+        activeId={activeId}
+        onNew={newConversation}
+        onOpen={openConversation}
+        onDelete={deleteConversation}
+        onClose={() => setHistoryOpen(false)}
+      />
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       {/* Header */}
       <header className="flex items-center justify-between gap-3 px-4 pb-2 pt-1 lg:px-0">
-        <div className="min-w-0">
-          <h1 className="text-xl font-semibold text-slate-100 lg:text-2xl">AI Agent Console</h1>
-          <p className="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
-            <span className={clsx('h-1.5 w-1.5 rounded-full', info ? 'bg-emerald-400' : 'bg-slate-500')} />
-            {info ? 'Online' : 'Connecting'}
-          </p>
+        <div className="flex min-w-0 items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setHistoryOpen((v) => !v)}
+            aria-pressed={historyOpen}
+            aria-label="Conversation history"
+            title="Conversation history"
+            className={clsx(
+              'flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-surface-300 text-slate-300 hover:bg-surface-200',
+              historyOpen && 'border-accent text-accent',
+            )}
+          >
+            <PanelLeft className="h-5 w-5" />
+          </button>
+          <div className="min-w-0">
+            <h1 className="text-xl font-semibold text-slate-100 lg:text-2xl">AI Agent Console</h1>
+            <p className="mt-0.5 flex items-center gap-2 text-xs text-slate-400">
+              <span className={clsx('h-1.5 w-1.5 rounded-full', info ? 'bg-emerald-400' : 'bg-slate-500')} />
+              {info ? 'Online' : 'Connecting'}
+            </p>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -760,8 +972,48 @@ export default function AgentChat() {
           {messages.map((m) => {
             const mine = m.role === 'user'
             if (mine) {
+              const canEdit = !busy && !m.attachments?.length
+              if (editingId === m.id) {
+                return (
+                  <div key={m.id} className="flex justify-end">
+                    <div className="w-full max-w-[85%] rounded-3xl border border-surface-300 bg-surface-200 p-3 sm:max-w-[75%]">
+                      <textarea
+                        autoFocus
+                        rows={3}
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault()
+                            resendEdited(m.id)
+                          }
+                          if (e.key === 'Escape') setEditingId(null)
+                        }}
+                        aria-label="Edit your message"
+                        className="w-full resize-y border-0 bg-transparent px-1 text-[15px] leading-7 text-slate-100 focus:outline-none focus:ring-0"
+                      />
+                      <p className="px-1 text-[11px] text-slate-500">
+                        Replies after this message will be replaced by a new one.
+                      </p>
+                      <div className="mt-2 flex justify-end gap-2">
+                        <button type="button" className="btn-ghost" onClick={() => setEditingId(null)}>
+                          Cancel
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-primary"
+                          disabled={!editText.trim() || busy}
+                          onClick={() => resendEdited(m.id)}
+                        >
+                          Send
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )
+              }
               return (
-                <div key={m.id} className="flex flex-col items-end gap-1.5">
+                <div key={m.id} className="group flex flex-col items-end gap-1.5">
                   {m.attachments && m.attachments.length > 0 && (
                     <div className="flex max-w-[85%] flex-wrap justify-end gap-2 sm:max-w-[75%]">
                       {m.attachments.map((a, i) => (
@@ -773,6 +1025,20 @@ export default function AgentChat() {
                     <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-3xl bg-surface-300 px-5 py-2.5 text-[15px] leading-7 text-slate-100 sm:max-w-[75%]">
                       {m.attachments?.length ? m.display : m.content}
                     </div>
+                  )}
+                  {canEdit && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditingId(m.id)
+                        setEditText(m.content)
+                      }}
+                      aria-label="Edit message"
+                      title="Edit and resend"
+                      className="rounded-lg p-1.5 text-slate-500 transition hover:bg-surface-300/70 hover:text-slate-200 lg:opacity-0 lg:group-hover:opacity-100 lg:focus:opacity-100"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </button>
                   )}
                 </div>
               )
@@ -796,7 +1062,7 @@ export default function AgentChat() {
                 </div>
                 <div className="mt-1 flex items-center gap-1 text-[11px] text-slate-500">
                   {!m.error && <CopyReply text={m.content} />}
-                  {!pending && m.id === messages[messages.length - 1]?.id && !m.error && (
+                  {!busy && m.id === messages[messages.length - 1]?.id && !m.error && (
                     <button
                       type="button"
                       onClick={regenerate}
@@ -851,7 +1117,7 @@ export default function AgentChat() {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={pending}
+              disabled={busy}
               aria-label="Attach photos or files"
               title="Attach photos or text files"
               className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-slate-300 transition hover:bg-surface-300/70 disabled:opacity-40"
@@ -862,7 +1128,7 @@ export default function AgentChat() {
               ref={inputRef}
               rows={1}
               className="max-h-[200px] min-h-[2.5rem] min-w-0 flex-1 resize-none self-center border-0 bg-transparent py-2 text-base text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-0 lg:text-[15px]"
-              placeholder="Ask anything"
+              placeholder={busy && !pending ? 'Another conversation is still working…' : 'Ask anything'}
               aria-label="Message to the agent"
               enterKeyHint="send"
               value={input}
@@ -882,9 +1148,9 @@ export default function AgentChat() {
                   handleSubmit(e as unknown as React.FormEvent)
                 }
               }}
-              disabled={pending}
+              disabled={busy}
             />
-            {pending ? (
+            {busy ? (
               <button
                 type="button"
                 onClick={() => agentChatStore.stop()}
@@ -914,6 +1180,7 @@ export default function AgentChat() {
         <p className="mx-auto mt-2 max-w-3xl text-center text-[11px] text-slate-500">
           The agent can make mistakes. Check important info.
         </p>
+      </div>
       </div>
     </div>
   )

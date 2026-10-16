@@ -1,9 +1,10 @@
 /**
- * Persistent store for the AI Agent Console conversation.
+ * Persistent store for the AI Agent Console conversations.
  *
- * Lives outside React so the chat survives navigating to another page (the
+ * Lives outside React so the chats survive navigating to another page (the
  * page component unmounts) and a browser reload (localStorage). A reply that
- * arrives while the operator is on another page is still saved.
+ * arrives while the operator is on another page, or has opened a different
+ * conversation, is still saved into the conversation it belongs to.
  *
  * Each agent message keeps the backend's structured report - the tools that ran,
  * the approvals now outstanding, the blockers - alongside the prose. The UI renders
@@ -59,14 +60,41 @@ export interface LiveTurn {
   tools: LiveTool[]
 }
 
-interface ChatState {
+/** One saved conversation. Its title is derived from its first message, never stored. */
+export interface Conversation {
+  id: string
+  createdAt: string
+  updatedAt: string
   messages: ChatMessage[]
-  pending: boolean
-  live: LiveTurn | null
 }
 
+/** What the history sidebar needs to list a conversation. */
+export interface ConversationSummary {
+  id: string
+  title: string
+  updatedAt: string
+  messageCount: number
+}
+
+interface ChatState {
+  /** Messages of the conversation that is open. */
+  messages: ChatMessage[]
+  /** A turn is running in the OPEN conversation. */
+  pending: boolean
+  /** A turn is running in some conversation (only one at a time is allowed). */
+  busy: boolean
+  live: LiveTurn | null
+  activeId: string
+  /** Conversations that have at least one message, newest first. */
+  conversations: ConversationSummary[]
+}
+
+/** The old single-conversation key. Read once to migrate, then removed. */
 export const CHAT_STORAGE_KEY = 'airdropos.agentChat.v1'
+export const CHATS_STORAGE_KEY = 'airdropos.agentChat.v2'
 const MAX_MESSAGES = 200
+const MAX_CONVERSATIONS = 40
+const TITLE_CHARS = 48
 
 /**
  * Drop the bulky parts before persisting.
@@ -74,7 +102,7 @@ const MAX_MESSAGES = 200
  * A `web_fetch` result carries a page of text, and keeping 200 of those in
  * localStorage would blow the quota and start throwing on every message. The
  * tool name, status and error are what the operator needs on reload; the payload
- * is re-fetchable from the backend if it is ever needed.
+ * is re-fetchable from the backend if it is ever needed. Photo thumbnails go too.
  */
 function slim(message: ChatMessage): ChatMessage {
   const attachments = message.attachments?.map(({ thumb: _thumb, ...rest }) => rest)
@@ -89,45 +117,176 @@ function slim(message: ChatMessage): ChatMessage {
   }
 }
 
-function load(): ChatMessage[] {
+function byNewest(a: Conversation, b: Conversation): number {
+  return b.updatedAt.localeCompare(a.updatedAt)
+}
+
+function blank(): Conversation {
+  const now = new Date().toISOString()
+  return { id: crypto.randomUUID(), createdAt: now, updatedAt: now, messages: [] }
+}
+
+function titleOf(messages: ChatMessage[]): string {
+  const first = messages.find((m) => m.role === 'user')
+  const text = (first?.display ?? first?.content ?? '').replace(/\s+/g, ' ').trim()
+  if (!text) return 'New chat'
+  return text.length > TITLE_CHARS ? `${text.slice(0, TITLE_CHARS - 1)}…` : text
+}
+
+function isConversation(value: unknown): value is Conversation {
+  const c = value as Conversation | null
+  return !!c && typeof c.id === 'string' && Array.isArray(c.messages)
+}
+
+function loadAll(): { conversations: Conversation[]; activeId: string } {
+  let conversations: Conversation[] = []
+  let activeId: string | null = null
   try {
-    const raw = localStorage.getItem(CHAT_STORAGE_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    return Array.isArray(parsed) ? (parsed as ChatMessage[]).slice(-MAX_MESSAGES) : []
+    const raw = localStorage.getItem(CHATS_STORAGE_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      if (parsed && Array.isArray(parsed.conversations)) {
+        conversations = (parsed.conversations as unknown[]).filter(isConversation).map((c) => ({
+          ...c,
+          messages: c.messages.slice(-MAX_MESSAGES),
+        }))
+        activeId = typeof parsed.activeId === 'string' ? parsed.activeId : null
+      }
+    } else {
+      // Migrate the single conversation older versions kept.
+      const legacy = localStorage.getItem(CHAT_STORAGE_KEY)
+      const parsed = legacy ? JSON.parse(legacy) : null
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        const messages = (parsed as ChatMessage[]).slice(-MAX_MESSAGES)
+        const last = messages[messages.length - 1]
+        conversations = [
+          {
+            id: crypto.randomUUID(),
+            createdAt: messages[0]?.at ?? new Date().toISOString(),
+            updatedAt: last?.at ?? new Date().toISOString(),
+            messages,
+          },
+        ]
+      }
+    }
   } catch {
-    return []
+    conversations = []
+  }
+  if (!activeId || !conversations.some((c) => c.id === activeId)) {
+    // Reopen the most recent conversation (this is also how a migrated chat comes back); only an
+    // operator with nothing saved starts on a blank one.
+    const newest = [...conversations].sort(byNewest)[0]
+    if (newest) {
+      activeId = newest.id
+    } else {
+      const fresh = blank()
+      conversations = [fresh]
+      activeId = fresh.id
+    }
+  }
+  return { conversations, activeId }
+}
+
+const initial = loadAll()
+let convs: Conversation[] = initial.conversations
+let activeId: string = initial.activeId
+// The conversation a turn is running in, so its reply lands there even if the operator has
+// opened another one meanwhile.
+let pendingId: string | null = null
+let rawLive: LiveTurn | null = null
+let state: ChatState
+const listeners = new Set<() => void>()
+// Bumped every time a conversation that has a turn in flight is cleared or deleted. A request that
+// was already in flight remembers the value it started with, so its late reply can be recognised
+// as belonging to a conversation that no longer exists.
+let epoch = 0
+// Stops the stream in flight (if any). Called when its conversation is cleared or deleted, or the
+// operator logs out, so the backend can end the turn at its next safe boundary instead of finishing
+// a conversation nobody can see any more.
+let abortStream: (() => void) | null = null
+
+function rebuild(): void {
+  const open = convs.find((c) => c.id === activeId) as Conversation
+  const here = pendingId !== null && pendingId === activeId
+  state = {
+    messages: open.messages,
+    pending: here,
+    busy: pendingId !== null,
+    live: here ? rawLive : null,
+    activeId,
+    conversations: convs
+      .filter((c) => c.messages.length > 0)
+      .sort(byNewest)
+      .map((c) => ({
+        id: c.id,
+        title: titleOf(c.messages),
+        updatedAt: c.updatedAt,
+        messageCount: c.messages.length,
+      })),
   }
 }
 
-let state: ChatState = { messages: load(), pending: false, live: null }
-const listeners = new Set<() => void>()
-// Bumped every time the conversation is cleared. A request that was already in flight remembers
-// the value it started with, so its late reply can be recognised as belonging to a cleared chat.
-let epoch = 0
-// Stops the stream in flight (if any). Called when the chat is cleared or the operator logs
-// out, so the backend can end the turn at its next safe boundary instead of finishing a
-// conversation nobody can see any more.
-let abortStream: (() => void) | null = null
+function persist(): void {
+  try {
+    const keep = convs.filter((c) => c.messages.length > 0).sort(byNewest).slice(0, MAX_CONVERSATIONS)
+    if (keep.length === 0) {
+      // Remove the keys outright rather than storing an empty list, so nothing of the chats stays behind.
+      localStorage.removeItem(CHATS_STORAGE_KEY)
+      localStorage.removeItem(CHAT_STORAGE_KEY)
+      return
+    }
+    let list = keep
+    for (;;) {
+      try {
+        const slimmed = list.map((c) => ({ ...c, messages: c.messages.map(slim) }))
+        localStorage.setItem(CHATS_STORAGE_KEY, JSON.stringify({ v: 2, activeId, conversations: slimmed }))
+        localStorage.removeItem(CHAT_STORAGE_KEY)
+        return
+      } catch {
+        // Storage full: save fewer (the oldest are dropped from the saved copy only).
+        if (list.length <= 1) return
+        list = list.slice(0, -1)
+      }
+    }
+  } catch {
+    // Storage blocked: keep working in memory.
+  }
+}
 
-// The same conversation can be open in several tabs. Without this, a tab that was not the one
+function notify(): void {
+  rebuild()
+  listeners.forEach((listener) => listener())
+}
+
+function commit(): void {
+  persist()
+  notify()
+}
+
+/** Forget empty conversations other than the open one, so "New chat" does not pile up blanks. */
+function prune(): void {
+  convs = convs.filter((c) => c.messages.length > 0 || c.id === activeId)
+}
+
+function setOpenMessages(messages: ChatMessage[]): void {
+  convs = convs.map((c) =>
+    c.id === activeId ? { ...c, messages, updatedAt: new Date().toISOString() } : c,
+  )
+  commit()
+}
+
+rebuild()
+
+// The same conversations can be open in several tabs. Without this, a tab that was not the one
 // clearing keeps showing (and re-saving) the old messages, which brings the chat back.
 if (typeof window !== 'undefined') {
   window.addEventListener('storage', (event) => {
-    if (event.key !== null && event.key !== CHAT_STORAGE_KEY) return
-    state = { ...state, messages: load() }
-    listeners.forEach((listener) => listener())
+    if (event.key !== null && event.key !== CHATS_STORAGE_KEY && event.key !== CHAT_STORAGE_KEY) return
+    const loaded = loadAll()
+    convs = loaded.conversations
+    if (!convs.some((c) => c.id === activeId)) activeId = loaded.activeId
+    notify()
   })
-}
-
-function commit(next: ChatState): void {
-  state = next
-  try {
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(state.messages.map(slim)))
-  } catch {
-    // Storage full or blocked: keep working in memory.
-  }
-  listeners.forEach((listener) => listener())
 }
 
 export const agentChatStore = {
@@ -138,27 +297,80 @@ export const agentChatStore = {
   getSnapshot(): ChatState {
     return state
   },
-  add(message: Omit<ChatMessage, 'id' | 'at'>): void {
+  /** Append a message. `conversationId` is where a turn started; omitted, the open conversation. */
+  add(message: Omit<ChatMessage, 'id' | 'at'>, conversationId?: string): void {
+    const target = conversationId ?? activeId
+    if (!convs.some((c) => c.id === target)) return // that conversation was deleted meanwhile
     const full: ChatMessage = {
       ...message,
       id: crypto.randomUUID(),
       at: new Date().toISOString(),
     }
-    commit({ ...state, messages: [...state.messages, full].slice(-MAX_MESSAGES) })
+    convs = convs.map((c) =>
+      c.id === target
+        ? { ...c, updatedAt: full.at, messages: [...c.messages, full].slice(-MAX_MESSAGES) }
+        : c,
+    )
+    commit()
   },
   /** Remove the newest message (used by "regenerate" to replace the last reply). */
   removeLast(): void {
-    commit({ ...state, messages: state.messages.slice(0, -1) })
+    setOpenMessages(state.messages.slice(0, -1))
+  },
+  /** Remove a message and everything after it (used by "edit and resend"). */
+  truncateFrom(messageId: string): void {
+    const index = state.messages.findIndex((m) => m.id === messageId)
+    if (index < 0) return
+    setOpenMessages(state.messages.slice(0, index))
   },
   /** Stop the turn in flight; the backend ends it at its next safe boundary. */
   stop(): void {
     abortStream?.()
   },
-  setPending(pending: boolean): void {
+  /** Start a fresh conversation. Does nothing if the open one is already empty. */
+  newConversation(): void {
+    if (state.messages.length === 0) return
+    const fresh = blank()
+    convs = [...convs, fresh]
+    activeId = fresh.id
+    prune()
+    commit()
+  },
+  /** Open a saved conversation. */
+  switchTo(id: string): void {
+    if (id === activeId || !convs.some((c) => c.id === id)) return
+    activeId = id
+    prune()
+    commit()
+  },
+  deleteConversation(id: string): void {
+    if (!convs.some((c) => c.id === id)) return
+    if (id === pendingId) {
+      epoch += 1
+      abortStream?.()
+      pendingId = null
+      rawLive = null
+    }
+    convs = convs.filter((c) => c.id !== id)
+    if (id === activeId) {
+      const next = [...convs].filter((c) => c.messages.length > 0).sort(byNewest)[0]
+      if (next) {
+        activeId = next.id
+      } else {
+        const fresh = blank()
+        convs = [fresh]
+        activeId = fresh.id
+      }
+    }
+    prune()
+    commit()
+  },
+  setPending(pending: boolean, conversationId?: string): void {
     // Pending is intentionally not persisted: it only describes this session. The live
     // preview belongs to the turn, so it ends with it.
-    state = { ...state, pending, live: pending ? state.live : null }
-    listeners.forEach((listener) => listener())
+    pendingId = pending ? (conversationId ?? activeId) : null
+    if (!pending) rawLive = null
+    notify()
   },
   /** Register how to abort the stream in flight; pass null once it has ended. */
   setAbort(abort: (() => void) | null): void {
@@ -170,7 +382,7 @@ export const agentChatStore = {
    */
   applyStreamEvent(event: AgentStreamEvent, forEpoch: number): void {
     if (forEpoch !== epoch) return
-    const live: LiveTurn = state.live ?? { round: 0, text: '', tools: [] }
+    const live: LiveTurn = rawLive ?? { round: 0, text: '', tools: [] }
     let next: LiveTurn | null = null
 
     switch (event.type) {
@@ -206,35 +418,34 @@ export const agentChatStore = {
       default:
         return // `done` and `error` are handled by the caller
     }
-    state = { ...state, live: next }
-    listeners.forEach((listener) => listener())
+    rawLive = next
+    notify()
   },
-  /** Changes whenever the chat is cleared; see `epoch` above. */
+  /** Changes whenever a conversation with a turn in flight is cleared or deleted; see `epoch`. */
   getEpoch(): number {
     return epoch
   },
+  /** Empty the OPEN conversation. */
   clear(): void {
-    epoch += 1
-    abortStream?.()
-    state = { messages: [], pending: false, live: null }
-    try {
-      // Remove the key outright rather than storing "[]", so nothing of the chat stays behind.
-      localStorage.removeItem(CHAT_STORAGE_KEY)
-    } catch {
-      // ignore
+    // A turn running in a different conversation is left alone.
+    if (pendingId === null || pendingId === activeId) {
+      epoch += 1
+      abortStream?.()
+      pendingId = null
+      rawLive = null
     }
-    listeners.forEach((listener) => listener())
+    setOpenMessages([])
   },
-  /** Called on logout so the next operator never sees this conversation. */
+  /** Called on logout so the next operator never sees these conversations. */
   reset(): void {
     epoch += 1
     abortStream?.()
-    state = { messages: [], pending: false, live: null }
-    try {
-      localStorage.removeItem(CHAT_STORAGE_KEY)
-    } catch {
-      // ignore
-    }
-    listeners.forEach((listener) => listener())
+    pendingId = null
+    rawLive = null
+    const fresh = blank()
+    convs = [fresh]
+    activeId = fresh.id
+    persist() // nothing left to keep: removes the stored keys
+    notify()
   },
 }
