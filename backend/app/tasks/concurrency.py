@@ -12,12 +12,15 @@ is never auto-resumed by lease recovery without operator acknowledgement.
 from __future__ import annotations
 
 import logging
+import os
 import secrets
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox.raise_intervention import park_for_intervention
@@ -28,6 +31,27 @@ from backend.app.tasks.state_machine import TaskStatus
 logger = logging.getLogger(__name__)
 
 DEFAULT_LEASE_TTL_MINUTES = 30
+
+# A task is IN_PROGRESS from the moment it is claimed, but its lease is only taken a moment later
+# (and a task re-run after an earlier attempt still has that attempt's released lease row). Recovery
+# must not mistake that gap for an orphan, so a task with no live lease is only treated as
+# orphaned once it has been quiet for this long.
+RECOVERY_GRACE_SECONDS = 120
+
+# Identifies THIS process. `worker-{pid}` was not unique: containers routinely run as pid 1, and a
+# restarted worker reused its predecessor's id, so a lease held by a dead process looked like the
+# new process's own. Host + pid + a random suffix is unique per process incarnation.
+PROCESS_INSTANCE_ID = f"{socket.gethostname()[:40]}-{os.getpid()}-{secrets.token_hex(4)}"
+
+
+def new_run_worker_id(prefix: str = "controller") -> str:
+    """A holder id unique to one execution run (not merely one process).
+
+    ``controller-{id(self):x}`` was a memory address: unique only inside one interpreter, and
+    reusable once the object was freed. Two runs of the same task must never share a holder id,
+    because a shared id is exactly what let a duplicate "take over" a live lease.
+    """
+    return f"{prefix}-{PROCESS_INSTANCE_ID}-{secrets.token_hex(3)}"
 
 
 class LeaseConflict(Exception):
@@ -84,7 +108,13 @@ class LeaseManager:
         worker_id: str,
         ttl_minutes: int = DEFAULT_LEASE_TTL_MINUTES,
     ) -> LeaseInfo:
-        """Take the lease for a task, or raise LeaseConflict if one is live."""
+        """Take the lease for a task, or raise LeaseConflict if one is live.
+
+        A live lease conflicts whoever asks, the holder's own id included: re-acquiring it would
+        rotate the token under the original run, leaving two runs that both believe they own the
+        task. Only a released or expired lease can be taken, and the takeover is a compare-and-set
+        on the token that was read, so two workers racing for the same stale lease cannot both win.
+        """
         now = self._now()
         expires = now + timedelta(minutes=ttl_minutes)
 
@@ -94,22 +124,34 @@ class LeaseManager:
 
         if existing is not None:
             live = existing.released_at is None and self._as_utc(existing.expires_at) > now
-            if live and existing.worker_id != worker_id:
+            if live:
                 raise LeaseConflict(
                     f"Task {task.task_id} is leased by worker '{existing.worker_id}' "
-                    f"until {existing.expires_at.isoformat()}."
+                    f"until {self._as_utc(existing.expires_at).isoformat()}."
                 )
-            # Same worker re-acquiring, or a stale lease: take it over.
-            existing.worker_id = worker_id
-            existing.lease_token = secrets.token_hex(32)
-            existing.acquired_at = now
-            existing.renewed_at = now
-            existing.expires_at = expires
-            existing.released_at = None
-            existing.broken_reason = None
-            await self.db.flush()
+            token = secrets.token_hex(32)
+            taken = await self.db.execute(
+                update(ExecutionLease)
+                .where(
+                    ExecutionLease.id == existing.id,
+                    ExecutionLease.lease_token == existing.lease_token,
+                    or_(ExecutionLease.released_at.is_not(None), ExecutionLease.expires_at <= now),
+                )
+                .values(
+                    worker_id=worker_id,
+                    lease_token=token,
+                    acquired_at=now,
+                    renewed_at=now,
+                    expires_at=expires,
+                    released_at=None,
+                    broken_reason=None,
+                )
+                .execution_options(synchronize_session="fetch")
+            )
+            if (taken.rowcount or 0) != 1:
+                raise LeaseConflict(f"Task {task.task_id} was leased by another worker first.")
             logger.info("Lease (re)acquired on %s by %s", task.task_id, worker_id)
-            return LeaseInfo(task.task_id, worker_id, existing.lease_token, expires, False)
+            return LeaseInfo(task.task_id, worker_id, token, expires, False)
 
         lease = ExecutionLease(
             task_id=task.id,
@@ -119,32 +161,146 @@ class LeaseManager:
             renewed_at=now,
             expires_at=expires,
         )
-        self.db.add(lease)
-        await self.db.flush()
+        try:
+            # SAVEPOINT: a lost insert race must not abort the caller's whole transaction.
+            async with self.db.begin_nested():
+                self.db.add(lease)
+                await self.db.flush()
+        except IntegrityError as exc:
+            raise LeaseConflict(f"Task {task.task_id} was leased by another worker first.") from exc
         logger.info("Lease acquired on %s by %s", task.task_id, worker_id)
         return LeaseInfo(task.task_id, worker_id, lease.lease_token, expires, False)
 
     async def renew(self, task: Task, lease_token: str, ttl_minutes: int = DEFAULT_LEASE_TTL_MINUTES) -> bool:
-        """Extend a lease. Returns False if the token no longer matches,
-        which means another worker has taken over."""
+        """Extend a lease. Returns False unless the caller still owns a LIVE lease.
+
+        The token must match AND the lease must be neither released nor expired. Matching the
+        token alone let a worker whose lease had been released (by recovery, by a stale-lease
+        break, or by its own run ending) or had run out revive it and keep writing progress over
+        whichever worker had meanwhile taken the task. The check and the extension are one
+        guarded UPDATE, so a takeover that lands between them cannot be overwritten either.
+        """
+        now = self._now()
+        renewed = await self.db.execute(
+            update(ExecutionLease)
+            .where(
+                ExecutionLease.task_id == task.id,
+                ExecutionLease.lease_token == lease_token,
+                ExecutionLease.released_at.is_(None),
+                ExecutionLease.expires_at > now,
+            )
+            .values(expires_at=now + timedelta(minutes=ttl_minutes), renewed_at=now)
+            .execution_options(synchronize_session="fetch")
+        )
+        if (renewed.rowcount or 0) == 1:
+            return True
+
         lease = await self.db.scalar(
             select(ExecutionLease).where(ExecutionLease.task_id == task.id)
         )
-        if lease is None or lease.lease_token != lease_token:
-            logger.warning("Lease renewal rejected for %s: token mismatch", task.task_id)
-            return False
-        lease.expires_at = self._now() + timedelta(minutes=ttl_minutes)
-        lease.renewed_at = self._now()
-        await self.db.flush()
-        return True
+        if lease is None:
+            why = "no lease exists"
+        elif lease.lease_token != lease_token:
+            why = "superseded by another worker"
+        elif lease.released_at is not None:
+            why = "already released"
+        else:
+            why = "expired"
+        logger.warning("Lease renewal rejected for %s: %s", task.task_id, why)
+        return False
 
     async def release(self, task: Task, lease_token: str) -> None:
+        """Release the lease if this token still holds it. Never touches another holder's."""
+        await self.db.execute(
+            update(ExecutionLease)
+            .where(
+                ExecutionLease.task_id == task.id,
+                ExecutionLease.lease_token == lease_token,
+                ExecutionLease.released_at.is_(None),
+            )
+            .values(released_at=self._now())
+            .execution_options(synchronize_session="fetch")
+        )
+
+    @staticmethod
+    async def release_detached(task_pk: Any, lease_token: str, reason: str) -> None:
+        """Release a lease in its OWN committed transaction.
+
+        For a run that is dying (cancelled, or raised): its session is about to be rolled back,
+        and a release that only lived in that session would roll back with it, leaving a dead
+        run's lease live for its whole TTL. Guarded by the token, so it can only release the
+        caller's own lease.
+        """
+        from backend.app.database.session import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                update(ExecutionLease)
+                .where(
+                    ExecutionLease.task_id == task_pk,
+                    ExecutionLease.lease_token == lease_token,
+                    ExecutionLease.released_at.is_(None),
+                )
+                .values(released_at=datetime.now(timezone.utc), broken_reason=reason[:500])
+            )
+            await db.commit()
+
+    async def _break_if_stale(self, lease: ExecutionLease, reason: str) -> bool:
+        """Release `lease` only if it is STILL the same, unreleased, expired lease.
+
+        A plain "set released_at" could land on a lease another worker had just taken over,
+        silently ending a live run's ownership. Guarding on the token and expiry makes the break
+        a compare-and-set: it succeeds for exactly one caller and only for a genuinely stale lease.
+        """
+        now = self._now()
+        broken = await self.db.execute(
+            update(ExecutionLease)
+            .where(
+                ExecutionLease.id == lease.id,
+                ExecutionLease.lease_token == lease.lease_token,
+                ExecutionLease.released_at.is_(None),
+                ExecutionLease.expires_at <= now,
+            )
+            .values(released_at=now, broken_reason=reason[:500])
+            .execution_options(synchronize_session="fetch")
+        )
+        return (broken.rowcount or 0) == 1
+
+    async def break_if_orphaned(
+        self, task: Task, grace_seconds: int = RECOVERY_GRACE_SECONDS
+    ) -> Optional[str]:
+        """Decide whether an IN_PROGRESS task has no live owner, breaking a stale lease if so.
+
+        Returns a reason when the task is orphaned and may be recovered, or None when it must be
+        left alone: a live worker holds it, or it is too fresh to tell (claimed but not yet
+        leased). Recovery that skipped this check released every IN_PROGRESS task's lease at
+        start-up, including ones another live worker was running.
+        """
+        now = self._now()
         lease = await self.db.scalar(
             select(ExecutionLease).where(ExecutionLease.task_id == task.id)
         )
-        if lease is not None and lease.lease_token == lease_token:
-            lease.released_at = self._now()
-            await self.db.flush()
+        if lease is not None and lease.released_at is None:
+            if self._as_utc(lease.expires_at) > now:
+                return None  # a live worker owns it
+            broken = await self._break_if_stale(
+                lease,
+                f"Lease expired at {self._as_utc(lease.expires_at).isoformat()} "
+                f"held by '{lease.worker_id}'.",
+            )
+            return f"stale lease held by '{lease.worker_id}' broken" if broken else None
+
+        # No lease, or a released one: the previous run is over, but a worker may have claimed
+        # the task a moment ago and not leased it yet. Only a quiet task is an orphan.
+        newest = max(
+            (t for t in (self._as_utc(getattr(task, "updated_at", None)),
+                         self._as_utc(lease.released_at) if lease is not None else None)
+             if t is not None),
+            default=None,
+        )
+        if newest is not None and (now - newest).total_seconds() < grace_seconds:
+            return None
+        return "no live lease" if lease is None else "lease already released"
 
     # ------------------------------------------------------------------
     async def find_stale_leases(self, limit: int = 100) -> List[ExecutionLease]:
@@ -190,11 +346,14 @@ class LeaseManager:
 
             uncertain = await self._uncertain_side_effects(task)
 
-            lease.released_at = self._now()
-            lease.broken_reason = (
-                f"Lease expired at {lease.expires_at.isoformat()} held by '{lease.worker_id}'."
-            )
-            await self.db.flush()
+            if not await self._break_if_stale(
+                lease,
+                f"Lease expired at {self._as_utc(lease.expires_at).isoformat()} "
+                f"held by '{lease.worker_id}'.",
+            ):
+                # Taken over, renewed or already broken since it was listed: not ours to recover.
+                logger.info("Stale lease on %s changed hands; left alone", task.task_id)
+                continue
 
             if task.status != TaskStatus.IN_PROGRESS.value:
                 # Only a task that was executing is abandoned. RETRYING/READY/parked/terminal

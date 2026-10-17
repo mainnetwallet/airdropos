@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.context import TaskContextService
@@ -58,7 +58,7 @@ from backend.app.planning.planner import (
 )
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.checkpoints import CheckpointManager
-from backend.app.tasks.concurrency import LeaseManager
+from backend.app.tasks.concurrency import LeaseManager, new_run_worker_id
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.recovery import FailureDiagnosisEngine, next_retry_at
 from backend.app.tasks.state_machine import CompletionProof, TaskStatus
@@ -341,6 +341,9 @@ class AgentController:
         self._window_start_confirmed: int = 0
         self._window_start_outstanding: int = 0
         self._window_start_completed: int = 0
+        # Whether THIS run's window has been counted. One controller runs one window, so this
+        # makes the count exactly-once however many times the window-start path is reached.
+        self._window_counted: bool = False
 
         # Consecutive recovery replans that returned the plan unchanged. This is what
         # stops the same ineffective plan being regenerated forever; the recovery-replan
@@ -384,7 +387,12 @@ class AgentController:
         # Take an execution lease so a dead worker's task is recoverable and a
         # live duplicate cannot execute the same task concurrently.
         lease = None
-        worker_id = f"controller-{id(self):x}"
+        # A holder id unique to this run. `controller-{id(self)}` was a memory address that
+        # could repeat across processes (and after the object was freed), and a repeated id
+        # is what let a duplicate run take over a live lease.
+        worker_id = new_run_worker_id()
+        # Captured now: after a rollback the task instance is expired and cannot be read.
+        task_pk = task.id
         try:
             lease = await self.leases.acquire(task, worker_id)
             await self.db.commit()  # publish the lease; do not hold the DB write lock across the run
@@ -395,6 +403,7 @@ class AgentController:
             return report
 
         iteration = 0
+        abnormal_exit = False
         try:
             # The task context wraps planning as well as execution. Decomposition is
             # typically the single most expensive call the run makes, and leaving it
@@ -453,8 +462,38 @@ class AgentController:
                 )
             await self.db.commit()
             return report
+        except BaseException:
+            # Cancellation or an unexpected error: this run's session is about to be rolled back.
+            abnormal_exit = True
+            raise
         finally:
+            await self._release_lease(task, task_pk, lease, abnormal=abnormal_exit)
+
+    async def _release_lease(self, task: Task, task_pk, lease, *, abnormal: bool) -> None:
+        """Give the lease back so the next attempt is not refused as a conflict.
+
+        A normal exit releases inside this session: the release commits together with the status
+        the worker is about to commit, so recovery can never see "released but still IN_PROGRESS"
+        for a run that actually finished. An abnormal exit (cancellation, an exception) is
+        different: the session is rolled back and would take an in-session release with it,
+        leaving a dead run's lease live for its whole TTL. That release is committed on its own,
+        shielded so a second cancellation cannot abandon it half-done.
+        """
+        if not abnormal:
             await self.leases.release(task, lease.lease_token)
+            return
+        try:
+            await self.db.rollback()
+        except Exception as exc:
+            logger.warning("Could not roll back after an abnormal exit of %s: %s", task_pk, exc)
+        try:
+            await asyncio.shield(
+                LeaseManager.release_detached(
+                    task_pk, lease.lease_token, "run ended abnormally (cancelled or raised)"
+                )
+            )
+        except Exception as exc:
+            logger.error("Could not release the lease of %s after an abnormal exit: %s", task_pk, exc)
 
     async def _run_window(
         self,
@@ -572,14 +611,20 @@ class AgentController:
                 logger.warning("LEASE_LOST task=%s iter=%s", task.task_id, iteration)
                 report.outcome = LoopOutcome.STOPPED
                 report.blockers.append(lost)
-                await self._record_blocker(task, lost)
-                await self._checkpoint(task, iteration, "lease_lost")
+                # Deliberately NOT written to the task: another worker owns it now, and a
+                # checkpoint or blocker from this stale run would sit on top of that worker's
+                # newer one (resume loads the latest checkpoint). What this run did is already
+                # in its execution record; only its own spend, which is purely additive, is kept.
                 await self._flush_telemetry(task)
+                await self.db.commit()
                 return report
 
             if is_terminal:
                 report.outcome = terminal_outcome
                 await self._flush_telemetry(task)
+                # Committed here, as every other iteration is: the flushed counters otherwise
+                # exist only in this transaction and are lost with it if anything below raises.
+                await self.db.commit()
                 break
 
             await self._checkpoint(task, iteration, f"iteration_{iteration}")
@@ -856,6 +901,43 @@ class AgentController:
             logger.warning("Progress check failed for %s: %s", task.task_id, exc)
             return False
 
+    async def _count_window(self, task: Task) -> None:
+        """Count this execution window, exactly once, durably, as it OPENS.
+
+        The window reaches this point after the lease is held and the plan resolved, so it is a
+        real execution window; how it then finishes (completed, failed, parked, yielded,
+        cancelled, or crashed) cannot change the count. Three properties matter:
+
+        * Atomic in SQL (`n = n + 1`), not read-modify-write on a possibly stale in-memory value,
+          so a concurrent writer cannot make this run overwrite a count it never saw.
+        * Committed immediately. It used to sit in the uncommitted transaction until the first
+          iteration committed, so a cancellation or exception before that rolled it back and the
+          window vanished from the count while its retry was still charged.
+        * Once per run (`_window_counted`), and kept out of the progress snapshot's try/except so
+          a snapshot failure cannot skip it. A recovered task opens a NEW window on its next run,
+          which is one more window, not a repeat of this one.
+        """
+        if self._window_counted:
+            return
+        try:
+            # SAVEPOINT: a failed counter write must not poison the transaction holding the
+            # run's other work (on PostgreSQL it would abort it).
+            async with self.db.begin_nested():
+                await self.db.execute(
+                    update(Task)
+                    .where(Task.id == task.id)
+                    .values(execution_windows=func.coalesce(Task.execution_windows, 0) + 1)
+                    .execution_options(synchronize_session="fetch")
+                )
+            await self.db.commit()
+            self._window_counted = True
+            # `n + 1` is a SQL expression, so the in-memory attribute is left expired; the many
+            # synchronous reads of `task.execution_windows` below would otherwise try to lazy-load
+            # it outside the async context (MissingGreenlet).
+            await self.db.refresh(task, attribute_names=["execution_windows"])
+        except Exception as exc:
+            logger.warning("Could not count the execution window for %s: %s", task.task_id, exc)
+
     async def _mark_window_start(self, task: Task, plan_spec, iteration: int) -> None:
         """Snapshot everything that counts as progress, so the window can be judged.
 
@@ -863,17 +945,11 @@ class AgentController:
         re-running the same failing step; judging it by the iteration counter alone would
         declare that a success and the stall guard could never fire.
         """
+        await self._count_window(task)
         try:
             plan = await self.planner.current_plan(task)
             self._window_start_revision = plan.revision if plan else None
             self._window_start_iteration = iteration
-            # Counted ONCE, here, as the window OPENS rather than on any of the ways it
-            # can end. The window reaches this point after the lease is held and the plan
-            # resolved, so it is a real execution window; how it then finishes (completed,
-            # failed, parked for the operator, or yielded for more) cannot change the count.
-            # Incrementing only on the yield path meant a task that completed on its first
-            # window reported ZERO windows, and one that failed reported zero as well.
-            task.execution_windows = (task.execution_windows or 0) + 1
             self._window_start_confirmed = len(
                 [
                     o for o in await self.context.observations(task, limit=None)

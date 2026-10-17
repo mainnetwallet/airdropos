@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import signal
 import sys
 import time
@@ -34,6 +33,7 @@ from backend.app.browser.controller import controller as browser_controller
 from backend.app.live import gateway as live_gateway
 from backend.app.scheduler.worker_status import heartbeat_loop, redact, state as worker_state
 from backend.app.security.emergency_stop import emergency_stop
+from backend.app.tasks.concurrency import LeaseManager
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
 from backend.app.terminal.events import publish_success
@@ -43,7 +43,11 @@ from backend.app.tools.registry import registry
 configure_logging()
 logger = logging.getLogger("airdropos.worker")
 
-WORKER_ID = f"worker-{os.getpid()}"
+# Unique per process incarnation (host + pid + random). `worker-{pid}` collided across containers
+# and across restarts, so a dead worker's lease looked like the new worker's own.
+from backend.app.tasks.concurrency import PROCESS_INSTANCE_ID  # noqa: E402
+
+WORKER_ID = f"worker-{PROCESS_INSTANCE_ID}"
 _shutdown_event = asyncio.Event()
 
 
@@ -410,6 +414,8 @@ async def task_execution_loop(slot: int = 0) -> None:
                 await asyncio.sleep(5)
                 continue
 
+            await sweep_orphaned_tasks()
+
             async with AsyncSessionLocal() as db:
                 manager = TaskManager(db)
                 task = await manager.claim_next_task(WORKER_ID)
@@ -600,20 +606,39 @@ async def recover_interrupted_tasks() -> int:
     from backend.app.tools.registry import registry
 
     async with AsyncSessionLocal() as db:
+        # SKIP LOCKED: two recovering workers never settle the same row (no-op on SQLite, where
+        # the guards below carry the safety).
         interrupted = list(
             (
-                await db.execute(select(Task).where(Task.status == TaskStatus.IN_PROGRESS.value))
+                await db.execute(
+                    select(Task)
+                    .where(Task.status == TaskStatus.IN_PROGRESS.value)
+                    .with_for_update(skip_locked=True)
+                )
             ).scalars().all()
         )
         manager = TaskManager(db)
+        leases = LeaseManager(db)
         # Bound to the real registry. A Planner built without one sees an empty tool
         # catalog, so any replan it produced would have every tool reference dropped as
         # "unregistered" and the recovered task would lose its tools.
         planner = Planner(db, registry)
         queued = parked = failed = 0
+        skipped = 0
         for task in interrupted:
-            # The dead run's committed lease would otherwise block the retry for its full TTL.
-            await _release_task_leases(db, task.id, "worker restarted; run interrupted")
+            # IN_PROGRESS does not mean interrupted: another live worker may be running this very
+            # task. Only a task with no live owner is recovered; a stale lease is broken
+            # atomically, a live one is left strictly alone (its owner stops on its own if it is
+            # in fact dead and the lease runs out, and a later sweep then recovers it).
+            orphaned = await leases.break_if_orphaned(task)
+            if orphaned is None:
+                skipped += 1
+                logger.info("Recovery skipped %s: a live worker owns it", task.task_id)
+                continue
+            # Re-read: the task may have been settled by its owner since it was listed.
+            await db.refresh(task)
+            if task.status != TaskStatus.IN_PROGRESS.value:
+                continue
             blocking, resettable = await _inspect_plan_for_recovery(db, task.id)
 
             if blocking:
@@ -658,12 +683,36 @@ async def recover_interrupted_tasks() -> int:
                 )
                 failed += 1
         await db.commit()
-        if interrupted:
+        if queued or parked or failed or skipped:
             logger.info(
                 "Recovered interrupted tasks: %s queued for retry, %s parked for operator review, "
-                "%s failed (retries exhausted)", queued, parked, failed,
+                "%s failed (retries exhausted), %s left to a live worker",
+                queued, parked, failed, skipped,
             )
         return queued
+
+
+_RECOVERY_SWEEP_INTERVAL_SECONDS = 60.0
+_last_recovery_sweep = 0.0
+
+
+async def sweep_orphaned_tasks() -> int:
+    """Re-run recovery periodically, so a task skipped at start-up is not stranded.
+
+    Start-up recovery now leaves a task alone while its lease is live, and a crashed worker's
+    lease stays live until its TTL. Without a later pass that task would sit IN_PROGRESS for ever.
+    The pass is safe to repeat: it only touches tasks with no live owner.
+    """
+    global _last_recovery_sweep
+    now = time.monotonic()
+    if now - _last_recovery_sweep < _RECOVERY_SWEEP_INTERVAL_SECONDS:
+        return 0
+    _last_recovery_sweep = now
+    try:
+        return await recover_interrupted_tasks()
+    except Exception:
+        logger.warning("Orphaned-task sweep failed", exc_info=True)
+        return 0
 
 
 # ----------------------------------------------------------------------
