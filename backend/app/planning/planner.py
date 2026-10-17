@@ -1110,6 +1110,19 @@ Produce EXACTLY this JSON shape:
         context_section = f"ADDITIONAL CONTEXT:\n{_json(context)}" if context else ""
         critical_block = _critical_context_block(context)
 
+        # CONSTRAINTS are hard limits, and when the context sections are present they are the
+        # large part of this message. Head/tail compaction keeps the opening and the closing of
+        # prose and drops the middle, and the closing here is the tool catalog (tens of
+        # thousands of characters with the real registry), so a CONSTRAINTS section placed
+        # after the context was cut with it. With context present the section therefore goes
+        # in the head, as `decompose` already does; with none it stays where it always was, so
+        # a replan prompt without context is byte-for-byte what it was before.
+        constraints_section = f"CONSTRAINTS (hard limits):\n{_json(constraints.to_dict())}"
+        if context or campaign_context:
+            constraints_head, constraints_tail = f"\n\n{constraints_section}\n", "\n"
+        else:
+            constraints_head, constraints_tail = "", f"{constraints_section}\n\n"
+
         user = f"""OBJECTIVE (unchanged): {current_spec.objective}
 
 PLAN REVISION BEING REPLACED: {plan_revision if plan_revision is not None else "none persisted"}
@@ -1125,13 +1138,10 @@ STEPS THAT MUST NOT BE REPEATED (irreversible, already moved value):
 STEPS THAT FAILED OR REMAIN:
 {_json([{"index": s.index, "description": s.description, "kind": s.kind.value, "failure": s.failure_reason} for s in current_spec.steps if s.status not in ("completed", "skipped")])}
 {_section("REQUIREMENTS DISCOVERED WHILE EXECUTING (an external system stated these; your new plan MUST cover every one that is still outstanding, and MUST NOT claim any is already done)", list(context_notes or []))}
-{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}{critical_block}
+{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}{critical_block}{constraints_head}
 {campaign_section}
 {context_section}
-CONSTRAINTS (hard limits):
-{_json(constraints.to_dict())}
-
-AVAILABLE TOOLS (you may ONLY use these):
+{constraints_tail}AVAILABLE TOOLS (you may ONLY use these):
 {catalog_text}
 
 Produce EXACTLY this JSON shape:
