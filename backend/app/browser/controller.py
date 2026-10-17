@@ -26,6 +26,7 @@ import logging
 import re
 import socket
 import time
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -277,6 +278,15 @@ class BrowserController:
         self._pages: Dict[str, Any] = {}
         self._lock = asyncio.Lock()
         self._key_locks: Dict[str, asyncio.Lock] = {}
+        # Serialises real page interactions per session. Deliberately separate from
+        # ``_key_locks``: that one guards context/page lifecycle and is taken INSIDE
+        # get_page(), so an interaction that held it could never be closed or reopened. Lock
+        # order is always interaction -> lifecycle; nothing in this class ever takes an
+        # interaction lock, so the two can never wait on each other.
+        self._interaction_locks: Dict[str, asyncio.Lock] = {}
+        # Contexts that closed behind the controller's back (window closed, Chrome crashed, an
+        # attached Chrome went away). Weak, so a dead context is never kept alive by this set.
+        self._dead_contexts: "weakref.WeakSet[Any]" = weakref.WeakSet()
         self._healthy = False
         self._last_error: Optional[str] = None
         # session_key -> "persistent" | "ephemeral" | "attached"
@@ -340,6 +350,8 @@ class BrowserController:
             # asyncio locks bind to the loop that first awaits them. Keeping them across a
             # restart would make the next (possibly different) loop refuse every session.
             self._key_locks.clear()
+            self._interaction_locks.clear()
+            self._dead_contexts.clear()
             for browser in list(self._attached.values()):
                 try:
                     # Disconnect, do NOT close: this is somebody's own Chrome.
@@ -371,6 +383,20 @@ class BrowserController:
         lock = self._key_locks.get(session_key)
         if lock is None:
             lock = self._key_locks[session_key] = asyncio.Lock()
+        return lock
+
+    def interaction_lock(self, session_key: str) -> asyncio.Lock:
+        """The lock that makes real interactions on one session's browser run one at a time.
+
+        Two tasks may legitimately share a browser profile, but a page has one focus, one
+        keyboard and one active tab: interleaved clicks and keystrokes corrupt each other. The
+        browser tools hold this for the whole of one call. Not re-entrant, so code holding it
+        must not call another tool's ``execute`` for the same session.
+        """
+        key = normalize_session_key(session_key)
+        lock = self._interaction_locks.get(key)
+        if lock is None:
+            lock = self._interaction_locks[key] = asyncio.Lock()
         return lock
 
     def is_busy(self, session_key: str) -> bool:
@@ -430,6 +456,20 @@ class BrowserController:
         self._modes.pop(session_key, None)
         self._profile_dirs.pop(session_key, None)
 
+    async def _retire_dead_context(self, session_key: str) -> None:
+        """Forget a context that already closed, and release what it may have left behind.
+        Caller holds the key lock."""
+        mode = self._modes.get(session_key)
+        user_data_dir = self._profile_dirs.get(session_key, "")
+        logger.warning("Browser context for '%s' closed unexpectedly; it will be recreated", session_key)
+        await self._discard_context(session_key)
+        if mode == "attached":
+            # A stale CDP handle: drop it so the next attach connects afresh.
+            await self._safe_close(self._attached.pop(session_key, None))
+        elif mode == "persistent" and user_data_dir:
+            # An installed Chrome can outlive its window and keep the profile locked.
+            await self._release_chrome(None, user_data_dir)
+
     async def get_context(self, session_key: str, persistent: bool = True):
         """Get or create an isolated browser context for an account.
 
@@ -461,8 +501,13 @@ class BrowserController:
     async def _ensure_context(self, session_key: str, persistent: bool = True):
         """Create the context if missing. The caller holds this key's lock, so two callers can
         never both create one (the loser used to be overwritten and leaked)."""
-        if session_key in self._contexts:
-            return self._contexts[session_key]
+        existing = self._contexts.get(session_key)
+        if existing is not None:
+            if existing not in self._dead_contexts:
+                return existing
+            # It closed behind our back. Returning it would make every caller (Open, Reconnect,
+            # get_page) fail on a dead handle for ever, so retire it and build a fresh one.
+            await self._retire_dead_context(session_key)
 
         if hub.browser_sessions.is_operator_stopped(session_key):
             # An operator stop must not be undone by an agent call that was already in flight.
@@ -745,6 +790,10 @@ class BrowserController:
             logger.debug("Could not attach page recorders for '%s': %s", session_key, type(exc).__name__)
         self._contexts[session_key] = context
         self._recorders[session_key] = recorders
+        try:
+            context.on("close", lambda *_args, _ctx=context: self._dead_contexts.add(_ctx))
+        except Exception as exc:
+            logger.debug("Could not watch context closure for '%s': %s", session_key, type(exc).__name__)
         # A freshly launched Chrome already has a tab. Adopt it so the session is usable
         # immediately instead of only after the first get_page() call.
         if session_key not in self._pages:
@@ -1224,12 +1273,14 @@ class BrowserController:
                 remaining = [p for p in context.pages if not p.is_closed()]
             except Exception:
                 remaining = []
-            self._pages[session_key] = remaining[0] if remaining else None
             if remaining:
+                self._pages[session_key] = remaining[0]
                 try:
                     await remaining[0].bring_to_front()
                 except Exception:
                     pass
+            else:
+                self._pages.pop(session_key, None)  # never store None: callers iterate this map
         await self._tabs_touch(session_key, self._pages.get(session_key))
         return {"ok": True, "closed_tab_id": closing_id, "remaining_tabs": len(remaining) if was_active else None}
 
@@ -1495,13 +1546,27 @@ class BrowserController:
     # ------------------------------------------------------------------
     def peek_page(self, session_key: str):
         """The existing open page of a session, or None. Never opens anything."""
-        page = self._pages.get(normalize_session_key(session_key))
+        key = normalize_session_key(session_key)
+        page = self._pages.get(key)
         if page is not None and not page.is_closed():
             return page
+        # The active tab is gone. If the session still has another tab it is still a live
+        # session: adopt that tab (what get_page would do) instead of reporting "no page",
+        # which made the reconciler close a session whose other tabs were fine. Opens nothing.
+        context = self._contexts.get(key)
+        if context is not None:
+            try:
+                survivors = [p for p in context.pages if not p.is_closed()]
+            except Exception:
+                survivors = []
+            if survivors:
+                self._pages[key] = survivors[0]
+                self._tab_id(survivors[0])
+                return survivors[0]
         return None
 
     def open_keys(self) -> List[str]:
-        return [k for k, p in self._pages.items() if not p.is_closed()]
+        return [k for k, p in list(self._pages.items()) if p is not None and not p.is_closed()]
 
     def viewport(self, session_key: str) -> Optional[Dict[str, int]]:
         page = self.peek_page(session_key)

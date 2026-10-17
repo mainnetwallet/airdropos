@@ -23,6 +23,7 @@ the operator in ``bootstrap_tools`` before the registry will run the tool at all
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 from datetime import datetime, timezone
@@ -118,6 +119,37 @@ def _interaction_error(exc: BaseException) -> ToolResult:
     return ToolResult.failure(f"{_safe_error(exc)}", category="INTERACTION_FAILED", retryable=True)
 
 
+def _serialized(cls):
+    """Run this tool's ``execute`` one call at a time per browser session.
+
+    ``controller.get_page`` only holds the session's lifecycle lock while it fetches the page; the
+    click or keystrokes that follow ran unprotected, so two tasks sharing a profile interleaved on
+    one page. This holds the controller's per-session INTERACTION lock for the whole call.
+
+    Rules that keep it deadlock-free:
+
+    * The lock is not re-entrant, so a tool's ``execute`` must never call another serialised
+      tool's ``execute`` for the same session (none does; the mini-app tools call them one after
+      another, never from inside one).
+    * Lifecycle tools (open / close / status / close_session) are NOT wrapped: they use the
+      controller's lifecycle lock and must stay able to close a session that is mid-interaction.
+    * ``browser_wait`` is NOT wrapped: it idles for up to two minutes and must not hold a session
+      while the page is waiting for something another task is about to do.
+    * Queueing counts against the registry's per-call timeout, and cancellation while queued or
+      running releases the lock (``async with``).
+    """
+    original = cls.execute
+
+    @functools.wraps(original)
+    async def execute(self, params: Dict[str, Any]) -> ToolResult:
+        async with controller.interaction_lock(_key(params)):
+            return await original(self, params)
+
+    execute._serialises_per_session = True  # type: ignore[attr-defined]
+    cls.execute = execute
+    return cls
+
+
 # ----------------------------------------------------------------------
 # Navigation
 # ----------------------------------------------------------------------
@@ -144,6 +176,7 @@ async def _find_clickable(page, text: str, wait_ms: int = 6000):
     return None
 
 
+@_serialized
 class NavigateTool(BaseTool):
     name = "browser_navigate"
     version = "1.1.0"
@@ -192,6 +225,7 @@ class NavigateTool(BaseTool):
         )
 
 
+@_serialized
 class HistoryTool(BaseTool):
     name = "browser_history"
     version = "1.0.0"
@@ -290,6 +324,7 @@ class WaitTool(BaseTool):
 # ----------------------------------------------------------------------
 # Tabs
 # ----------------------------------------------------------------------
+@_serialized
 class TabsTool(BaseTool):
     name = "browser_tabs"
     version = "1.0.0"
@@ -371,6 +406,7 @@ class TabsTool(BaseTool):
 # ----------------------------------------------------------------------
 # Page inspection
 # ----------------------------------------------------------------------
+@_serialized
 class InspectPageTool(BaseTool):
     name = "inspect_page"
     version = "1.1.0"
@@ -399,6 +435,7 @@ class InspectPageTool(BaseTool):
         return ToolResult.success(data={"observation": obs.__dict__, **_session_context(params)})
 
 
+@_serialized
 class SnapshotTool(BaseTool):
     name = "browser_snapshot"
     version = "1.0.0"
@@ -438,6 +475,7 @@ class SnapshotTool(BaseTool):
         )
 
 
+@_serialized
 class FindElementTool(BaseTool):
     name = "browser_find"
     version = "1.0.0"
@@ -499,6 +537,7 @@ class FindElementTool(BaseTool):
 # ----------------------------------------------------------------------
 # Mouse
 # ----------------------------------------------------------------------
+@_serialized
 class ClickButtonTool(BaseTool):
     name = "browser_click"
     version = "2.0.0"
@@ -673,6 +712,7 @@ class ClickButtonTool(BaseTool):
         )
 
 
+@_serialized
 class ClickCoordinatesTool(BaseTool):
     name = "browser_click_at"
     version = "1.0.0"
@@ -724,6 +764,7 @@ class ClickCoordinatesTool(BaseTool):
         )
 
 
+@_serialized
 class HoverTool(BaseTool):
     name = "browser_hover"
     version = "1.0.0"
@@ -770,6 +811,7 @@ async def _hover(params: Dict[str, Any]):
         return _interaction_error(exc)
 
 
+@_serialized
 class DragTool(BaseTool):
     name = "browser_drag"
     version = "1.0.0"
@@ -813,6 +855,7 @@ class DragTool(BaseTool):
 # ----------------------------------------------------------------------
 # Keyboard
 # ----------------------------------------------------------------------
+@_serialized
 class TypeTool(BaseTool):
     name = "browser_type"
     version = "1.0.0"
@@ -871,6 +914,7 @@ class TypeTool(BaseTool):
         )
 
 
+@_serialized
 class PressKeyTool(BaseTool):
     name = "browser_press"
     version = "1.0.0"
@@ -911,6 +955,7 @@ class PressKeyTool(BaseTool):
 # ----------------------------------------------------------------------
 # Scrolling
 # ----------------------------------------------------------------------
+@_serialized
 class ScrollTool(BaseTool):
     name = "browser_scroll"
     version = "1.0.0"
@@ -964,6 +1009,7 @@ class ScrollTool(BaseTool):
 # ----------------------------------------------------------------------
 # Forms
 # ----------------------------------------------------------------------
+@_serialized
 class FillFormTool(BaseTool):
     name = "browser_fill_form"
     version = "1.1.0"
@@ -1048,6 +1094,7 @@ class FillFormTool(BaseTool):
         )
 
 
+@_serialized
 class FillFieldTool(BaseTool):
     name = "browser_fill_field"
     version = "1.0.0"
@@ -1099,6 +1146,7 @@ class FillFieldTool(BaseTool):
         return ToolResult.success(data={**result, **_session_context(params)})
 
 
+@_serialized
 class ReadValueTool(BaseTool):
     name = "browser_read_value"
     version = "1.0.0"
@@ -1163,6 +1211,7 @@ class ReadValueTool(BaseTool):
         )
 
 
+@_serialized
 class SubmitFormTool(BaseTool):
     name = "browser_submit"
     version = "1.0.0"
@@ -1253,6 +1302,7 @@ class SubmitFormTool(BaseTool):
         )
 
 
+@_serialized
 class UploadFileTool(BaseTool):
     name = "browser_upload_file"
     version = "1.0.0"
@@ -1320,6 +1370,7 @@ def _hash_file(path: str) -> Tuple[str, int]:
     return digest.hexdigest(), size
 
 
+@_serialized
 class CaptureEvidenceTool(BaseTool):
     name = "capture_evidence"
     version = "1.2.0"
@@ -1691,6 +1742,7 @@ class ProfileCloseTool(BaseTool):
 # ----------------------------------------------------------------------
 # Extensions
 # ----------------------------------------------------------------------
+@_serialized
 class ExtensionsTool(BaseTool):
     name = "browser_extensions"
     version = "1.0.0"
@@ -1905,6 +1957,7 @@ def _looks_like_wallet(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+@_serialized
 class WalletExtensionTool(BaseTool):
     name = "browser_wallet"
     version = "1.0.0"
