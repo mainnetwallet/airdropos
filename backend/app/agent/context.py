@@ -584,6 +584,100 @@ class ObservationRecord:
         return self.outcome == OUTCOME_CONFIRMED and self.evidence_authoritative
 
 
+# How many observations of each class may reach one prompt. These bound the prompt, not the
+# database: everything stays persisted, and what a cap leaves out is reported in
+# `ObservationRetrieval` rather than dropped silently.
+RECENT_OBSERVATION_WINDOW = 200
+OLDER_EVIDENCE_LIMIT = 60
+PROMPT_VERIFIED_CAP = 60
+PROMPT_UNVERIFIED_CAP = 40
+PROMPT_FAILED_CAP = 40
+# Cap on the ids a diagnostics block lists, so a diagnostic can never be the thing that
+# makes a prompt large.
+DIAGNOSTIC_ID_CAP = 25
+
+
+@dataclass
+class ObservationRetrieval:
+    """What observation retrieval selected and what it had to leave out.
+
+    Safe by construction: counts, short ids and category names only. No observation
+    content is copied here, so the block can go into a prompt or a trace unchanged.
+    """
+
+    total: int = 0
+    recent_window: int = 0
+    older_selected: int = 0
+    older_matching: int = 0
+    # Older records that matter (authoritative proof, failures, unknown outcomes,
+    # non-idempotent actions) but did not fit the older-evidence limit.
+    omitted_required: int = 0
+    omitted_required_ids: List[str] = field(default_factory=list)
+    # Records outside both the recent window and the required classes. They are not
+    # needed for a decision; the count only says they exist.
+    omitted_other: int = 0
+    included_ids: List[str] = field(default_factory=list)
+    prompt_caps_applied: Dict[str, int] = field(default_factory=dict)
+
+    @property
+    def complete(self) -> bool:
+        """False when a record the prompt should have carried was left out."""
+        return self.omitted_required == 0 and not self.prompt_caps_applied
+
+    def warnings(self) -> List[str]:
+        found: List[str] = []
+        if self.omitted_required:
+            found.append(
+                f"observation_retrieval_omitted_required={self.omitted_required}"
+            )
+        for section, dropped in sorted(self.prompt_caps_applied.items()):
+            found.append(f"observation_section_capped:{section}={dropped}")
+        return found
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_observations": self.total,
+            "recent_window": self.recent_window,
+            "older_authoritative_or_unresolved_included": self.older_selected,
+            "older_matching": self.older_matching,
+            "omitted_required": self.omitted_required,
+            "omitted_required_ids": self.omitted_required_ids[:DIAGNOSTIC_ID_CAP],
+            "omitted_other": self.omitted_other,
+            "prompt_caps_applied": dict(self.prompt_caps_applied),
+            "complete": self.complete,
+        }
+
+
+@dataclass(frozen=True)
+class ContextVersion:
+    """Everything a resolved planning context depends on, reduced to one comparable value.
+
+    `TaskContext.revision` only moves when the task's own context is written through this
+    service. A resolved context also reads campaign and global memory, the task's
+    observation and requirement rows, the campaign row and the current plan, and any of
+    those can change without that counter moving (a memory edited from the API or by a
+    different task, a row deleted, a plan step completed). Each is therefore fingerprinted
+    from the rows themselves - count, newest `updated_at`, and for memory a content-length
+    and confidence sum so an in-place edit or a delete is visible even when the row count
+    and newest timestamp coincide.
+
+    `generation` is a short digest of all of it: the cache key, and the identifier a trace
+    records as the context generation a request was built from.
+    """
+
+    task_context_revision: int
+    plan_revision: Optional[int]
+    components: Tuple[Tuple[str, str], ...]
+    generation: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "task_context_revision": self.task_context_revision,
+            "plan_revision": self.plan_revision,
+            "generation": self.generation,
+        }
+
+
 @dataclass
 class ResolvedContext:
     """The three context levels, assembled but never merged into one blob.
@@ -600,6 +694,10 @@ class ResolvedContext:
     global_facts: List[Dict[str, Any]] = field(default_factory=list)
     observations: List[ObservationRecord] = field(default_factory=list)
     requirements: List[TaskRequirement] = field(default_factory=list)
+    retrieval: ObservationRetrieval = field(default_factory=ObservationRetrieval)
+    # Source-record ids, kept beside the prompt content so a trace can name exactly which
+    # rows fed a request without copying any of their text.
+    source_ids: Dict[str, List[str]] = field(default_factory=dict)
 
     def outstanding_requirements(self) -> List[TaskRequirement]:
         return [r for r in self.requirements if r.status == REQUIREMENT_DISCOVERED]
@@ -749,19 +847,38 @@ class ResolvedContext:
                 ),
             }
 
-        payload["verified_facts"] = [
-            _observation(o) for o in self.observations if o.proved_completion
-        ]
-        payload["unverified_observations"] = [
-            _observation(o)
-            for o in self.observations
-            if o.outcome in (OUTCOME_UNVERIFIED, OUTCOME_ATTEMPTED, OUTCOME_EXECUTED)
-        ]
-        payload["failed_attempts"] = [
-            _observation(o)
-            for o in self.observations
-            if o.outcome in (OUTCOME_FAILED, OUTCOME_BLOCKED)
-        ]
+        # Each section keeps its NEWEST records up to a cap and says what the cap dropped.
+        # A section that silently lost proof would let the model repeat a proven action; one
+        # that reports the loss lets it (and the operator) see that history was left out.
+        capped: Dict[str, int] = {}
+
+        def _section(name: str, records: List[ObservationRecord], cap: int) -> List[Dict[str, Any]]:
+            if len(records) > cap:
+                capped[name] = len(records) - cap
+                records = records[-cap:]
+            return [_observation(o) for o in records]
+
+        payload["verified_facts"] = _section(
+            "verified_facts",
+            [o for o in self.observations if o.proved_completion],
+            PROMPT_VERIFIED_CAP,
+        )
+        payload["unverified_observations"] = _section(
+            "unverified_observations",
+            [
+                o
+                for o in self.observations
+                if o.outcome in (OUTCOME_UNVERIFIED, OUTCOME_ATTEMPTED, OUTCOME_EXECUTED)
+            ],
+            PROMPT_UNVERIFIED_CAP,
+        )
+        payload["failed_attempts"] = _section(
+            "failed_attempts",
+            [o for o in self.observations if o.outcome in (OUTCOME_FAILED, OUTCOME_BLOCKED)],
+            PROMPT_FAILED_CAP,
+        )
+        self.retrieval.prompt_caps_applied = capped
+        payload["retrieval_diagnostics"] = self.retrieval.to_dict()
 
         def _requirement(req: Any) -> Dict[str, Any]:
             return {
@@ -1343,35 +1460,148 @@ class TaskContextService:
             .limit(1)
         )
 
+    @staticmethod
+    def _chronological(stmt):
+        """Newest first, by persisted time then iteration.
+
+        The primary key is a random UUID, so ordering by `id` - which this used to do -
+        returned an arbitrary subset in an arbitrary order: "the last 200" was not the
+        last 200, and `observations[-1]` was not the latest observation. `created_at` is
+        written by the database insert and `iteration` by the executor; `id` only breaks a
+        tie between rows that share both.
+        """
+        return stmt.order_by(
+            TaskObservation.created_at.desc(),
+            TaskObservation.iteration.desc(),
+            TaskObservation.id.desc(),
+        )
+
+    @staticmethod
+    def _observation_record(r: TaskObservation) -> ObservationRecord:
+        return ObservationRecord(
+            id=r.id,
+            fingerprint=r.fingerprint,
+            outcome=r.outcome,
+            tool=r.tool,
+            action=r.action,
+            evidence_kind=r.evidence_kind,
+            evidence_authoritative=r.evidence_authoritative,
+            observed_state=r.observed_state or {},
+            integration_ref=r.integration_ref,
+            iteration=int(r.iteration or 0),
+            error=r.error,
+        )
+
     async def observations(
         self, task: Task, *, limit: Optional[int] = 200
     ) -> List[ObservationRecord]:
         """Most recent observations, oldest first. `limit=None` returns the whole history."""
-        stmt = (
-            select(TaskObservation)
-            .where(TaskObservation.task_id == task.id)
-            .order_by(TaskObservation.id.desc())
+        stmt = self._chronological(
+            select(TaskObservation).where(TaskObservation.task_id == task.id)
         )
         if limit is not None:
             stmt = stmt.limit(limit)
         rows = list((await self.db.execute(stmt)).scalars().all())
         rows.reverse()
-        return [
-            ObservationRecord(
-                id=r.id,
-                fingerprint=r.fingerprint,
-                outcome=r.outcome,
-                tool=r.tool,
-                action=r.action,
-                evidence_kind=r.evidence_kind,
-                evidence_authoritative=r.evidence_authoritative,
-                observed_state=r.observed_state or {},
-                integration_ref=r.integration_ref,
-                iteration=int(r.iteration or 0),
-                error=r.error,
+        return [self._observation_record(r) for r in rows]
+
+    async def retrieve_observations(
+        self,
+        task: Task,
+        *,
+        recent_limit: int = RECENT_OBSERVATION_WINDOW,
+        older_limit: int = OLDER_EVIDENCE_LIMIT,
+    ) -> Tuple[List[ObservationRecord], ObservationRetrieval]:
+        """A bounded set of observations: the recent window plus older evidence that matters.
+
+        The recent window alone drops proof the moment a task outgrows it: an action
+        confirmed 300 observations ago would read as never done, and the model would be
+        invited to repeat it. So beyond the window, retrieval also takes the OLDER records
+        a decision cannot do without:
+
+        * authoritative confirmations (what is already proven),
+        * non-idempotent actions (retry safety: a repeat may move value twice),
+        * failed, blocked, attempted, executed and unverified outcomes (unresolved or
+          unknown results the model must investigate rather than assume).
+
+        Authoritative proof and non-idempotent actions are taken first, newest first,
+        inside `older_limit`. Whatever still does not fit is counted, with ids, in the
+        returned diagnostics - never dropped without a trace. Both queries are scoped to
+        this task; the result is returned in chronological order.
+        """
+        base = select(TaskObservation).where(TaskObservation.task_id == task.id)
+        total = int(
+            await self.db.scalar(
+                select(func.count())
+                .select_from(TaskObservation)
+                .where(TaskObservation.task_id == task.id)
             )
-            for r in rows
-        ]
+            or 0
+        )
+
+        recent_rows = list(
+            (await self.db.execute(self._chronological(base).limit(recent_limit)))
+            .scalars()
+            .all()
+        )
+        diag = ObservationRetrieval(total=total, recent_window=len(recent_rows))
+
+        selected: List[TaskObservation] = list(recent_rows)
+        if total > len(recent_rows):
+            recent_ids = [r.id for r in recent_rows]
+            older = base.where(TaskObservation.id.notin_(recent_ids))
+            required = (
+                (
+                    (TaskObservation.outcome == OUTCOME_CONFIRMED)
+                    & (TaskObservation.evidence_authoritative.is_(True))
+                )
+                | (TaskObservation.is_idempotent.is_(False))
+                | (
+                    TaskObservation.outcome.in_(
+                        (
+                            OUTCOME_FAILED,
+                            OUTCOME_BLOCKED,
+                            OUTCOME_ATTEMPTED,
+                            OUTCOME_EXECUTED,
+                            OUTCOME_UNVERIFIED,
+                        )
+                    )
+                )
+            )
+            matching = list(
+                (await self.db.execute(self._chronological(older.where(required))))
+                .scalars()
+                .all()
+            )
+            diag.older_matching = len(matching)
+
+            def _priority(row: TaskObservation) -> int:
+                proven = row.outcome == OUTCOME_CONFIRMED and bool(row.evidence_authoritative)
+                return 0 if proven or not row.is_idempotent else 1
+
+            # Stable sort keeps newest-first inside each priority class.
+            ranked = sorted(matching, key=_priority)
+            taken = ranked[:older_limit]
+            left_out = ranked[older_limit:]
+            selected.extend(taken)
+            diag.older_selected = len(taken)
+            diag.omitted_required = len(left_out)
+            diag.omitted_required_ids = [str(r.id) for r in left_out[:DIAGNOSTIC_ID_CAP]]
+            diag.omitted_other = max(
+                0, total - len(recent_rows) - len(matching)
+            )
+
+        def _when(r: TaskObservation) -> datetime:
+            # SQLite hands back naive datetimes and PostgreSQL aware ones; comparing the two
+            # raises, so both are reduced to naive UTC before they are ordered.
+            value = r.created_at
+            if value is None:
+                return datetime.min
+            return value.astimezone(timezone.utc).replace(tzinfo=None) if value.tzinfo else value
+
+        selected.sort(key=lambda r: (_when(r), int(r.iteration or 0), str(r.id)))
+        diag.included_ids = [str(r.id) for r in selected]
+        return [self._observation_record(r) for r in selected], diag
 
     async def requirements(self, task: Task, *, only_outstanding: bool = False) -> List[TaskRequirement]:
         stmt = select(TaskRequirement).where(TaskRequirement.task_id == task.id)
@@ -1453,16 +1683,126 @@ class TaskContextService:
             await self.db.flush()
 
     # ------------------------------------------------------------------
+    # Cache versioning
+    # ------------------------------------------------------------------
+    async def context_version(self, task: Task) -> ContextVersion:
+        """Fingerprint every dependency of a resolved context (see `ContextVersion`).
+
+        A handful of aggregate reads, no row bodies. Flushes first so a write made earlier
+        in the same transaction is part of the version rather than invisible to it.
+        """
+        from backend.app.models import AirdropCampaign, ExecutionPlan
+
+        await self.db.flush()
+
+        def _stamp(value: Any) -> str:
+            return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+        context = await self.get(task)
+        revision = int(context.revision or 0) if context is not None else 0
+
+        obs = (
+            await self.db.execute(
+                select(
+                    func.count(),
+                    func.max(TaskObservation.created_at),
+                    func.max(TaskObservation.updated_at),
+                ).where(TaskObservation.task_id == task.id)
+            )
+        ).one()
+        reqs = (
+            await self.db.execute(
+                select(
+                    func.count(),
+                    func.max(TaskRequirement.updated_at),
+                    func.coalesce(func.sum(func.length(TaskRequirement.status)), 0),
+                ).where(TaskRequirement.task_id == task.id)
+            )
+        ).one()
+
+        plan_row = (
+            await self.db.execute(
+                select(ExecutionPlan.revision, ExecutionPlan.updated_at)
+                .where(ExecutionPlan.task_id == task.id, ExecutionPlan.is_current.is_(True))
+                .order_by(ExecutionPlan.revision.desc())
+                .limit(1)
+            )
+        ).first()
+        plan_revision = int(plan_row[0]) if plan_row is not None else None
+
+        async def _memory_fingerprint(*where: Any) -> str:
+            row = (
+                await self.db.execute(
+                    select(
+                        func.count(),
+                        func.max(MemoryRecord.updated_at),
+                        func.coalesce(func.sum(MemoryRecord.confidence), 0.0),
+                        func.coalesce(func.sum(func.length(MemoryRecord.content)), 0),
+                    ).where(*where)
+                )
+            ).one()
+            return "|".join(_stamp(v) for v in row)
+
+        parts: List[Tuple[str, str]] = [
+            ("task_context_revision", str(revision)),
+            ("observations", "|".join(_stamp(v) for v in obs)),
+            ("requirements", "|".join(_stamp(v) for v in reqs)),
+            ("plan", "|".join(_stamp(v) for v in plan_row) if plan_row is not None else "none"),
+            (
+                "global_memory",
+                await _memory_fingerprint(
+                    MemoryRecord.scope == SCOPE_GLOBAL,
+                    MemoryRecord.task_id.is_(None),
+                    MemoryRecord.campaign_id.is_(None),
+                ),
+            ),
+        ]
+        campaign_id = context.campaign_id if context is not None else None
+        if campaign_id is not None:
+            parts.append(
+                (
+                    "campaign_memory",
+                    await _memory_fingerprint(
+                        MemoryRecord.scope == SCOPE_CAMPAIGN,
+                        MemoryRecord.campaign_id == campaign_id,
+                    ),
+                )
+            )
+            campaign_stamp = await self.db.scalar(
+                select(AirdropCampaign.updated_at).where(AirdropCampaign.id == campaign_id)
+            )
+            parts.append(("campaign", _stamp(campaign_stamp) if campaign_stamp else "missing"))
+
+        digest = hashlib.sha256(
+            json.dumps(parts, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()[:16]
+        return ContextVersion(
+            task_context_revision=revision,
+            plan_revision=plan_revision,
+            components=tuple(parts),
+            generation=digest,
+        )
+
+    # ------------------------------------------------------------------
     # Resolution across the three levels
     # ------------------------------------------------------------------
     async def resolve(
-        self, task: Task, *, global_limit: int = 8, observation_limit: int = 200
+        self,
+        task: Task,
+        *,
+        global_limit: int = 8,
+        observation_limit: int = RECENT_OBSERVATION_WINDOW,
+        older_evidence_limit: int = OLDER_EVIDENCE_LIMIT,
     ) -> ResolvedContext:
         """Assemble task, campaign and global context without merging their boundaries.
 
         Task context is always this task's. Campaign context is read only through an
         explicit campaign link. Global context is restricted to records written at global
         scope, so a task- or campaign-scoped memory can never surface as general knowledge.
+
+        Observations are the recent window (`observation_limit`) plus bounded older
+        evidence that a decision depends on; see `retrieve_observations`. The window is
+        still a limit: history is never loaded wholesale into a prompt.
         """
         context = await self.get(task)
         resolved = ResolvedContext(task_context=context)
@@ -1473,14 +1813,26 @@ class TaskContextService:
             # MissingGreenlet in an async session.
             resolved.requirements = await self.requirements(task)
 
-        resolved.observations = await self.observations(task, limit=observation_limit)
+        resolved.observations, resolved.retrieval = await self.retrieve_observations(
+            task, recent_limit=observation_limit, older_limit=older_evidence_limit
+        )
 
         if context is not None and context.campaign_id is not None:
             resolved.campaign_facts = await self._campaign_facts(context.campaign_id)
 
-        resolved.global_facts = await self._global_facts(
-            task, limit=global_limit
-        )
+        resolved.global_facts = await self._global_facts(task, limit=global_limit)
+
+        resolved.source_ids = {
+            "observations": [str(o.id) for o in resolved.observations][:200],
+            "requirements": [str(r.id) for r in resolved.requirements][:100],
+            "memories": [
+                str(f["id"])
+                for f in (*resolved.campaign_facts, *resolved.global_facts)
+                if f.get("id")
+            ],
+        }
+        if context is not None:
+            resolved.source_ids["task_context"] = [str(context.id)]
         return resolved
 
     async def _campaign_facts(self, campaign_id: Any) -> List[Dict[str, Any]]:
@@ -1504,7 +1856,10 @@ class TaskContextService:
             .scalars()
             .all()
         )
-        return [{"content": r.content, "category": r.category, "confidence": r.confidence} for r in rows]
+        return [
+            {"id": str(r.id), "content": r.content, "category": r.category, "confidence": r.confidence}
+            for r in rows
+        ]
 
     async def _global_facts(self, task: Task, *, limit: int) -> List[Dict[str, Any]]:
         """General knowledge only: rows written at global scope and related to nothing else."""
@@ -1524,7 +1879,10 @@ class TaskContextService:
             .scalars()
             .all()
         )
-        return [{"content": r.content, "category": r.category, "confidence": r.confidence} for r in rows]
+        return [
+            {"id": str(r.id), "content": r.content, "category": r.category, "confidence": r.confidence}
+            for r in rows
+        ]
 
     @staticmethod
     async def _notify_context_changed(task: Task, summary: str) -> None:

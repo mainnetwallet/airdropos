@@ -31,6 +31,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.models import ExecutionPlan, PlanRevision, Task
 from backend.app.tools.registry import ToolRegistry
 
@@ -700,10 +701,18 @@ Produce EXACTLY this JSON shape:
 }}
 """
         await self._release_write_lock()
+        # The plan revision this request depends on is read from the persisted plan, not
+        # taken from the caller, so the trace names what is actually stored.
+        persisted = await self.current_plan(task) if task is not None else None
+        trace_fields = {
+            "task_id": task.task_id if task is not None else None,
+            "plan_revision": persisted.revision if persisted is not None else None,
+        }
         try:
-            result = await llm.complete_json(
-                [Message("system", PLANNER_SYSTEM_PROMPT), Message("user", user)]
-            )
+            with llm_trace_scope(purpose="plan", **trace_fields):
+                result = await llm.complete_json(
+                    [Message("system", PLANNER_SYSTEM_PROMPT), Message("user", user)]
+                )
         except LLMError as exc:
             # A planner failure must not be silently papered over with a guess.
             raise PlanningError(
@@ -722,20 +731,21 @@ Produce EXACTLY this JSON shape:
                 list(result.keys()) if isinstance(result, dict) else type(result).__name__,
             )
             try:
-                retry = await llm.complete_json(
-                    [
-                        Message("system", PLANNER_SYSTEM_PROMPT),
-                        Message("user", user),
-                        Message("assistant", _json(result)[:4000]),
-                        Message(
-                            "user",
-                            "That reply contained no usable steps. Reply again with ONLY a JSON "
-                            'object of the exact shape given, with a non-empty "steps" array. '
-                            'Every step needs a one-line "description". Keep it to the few steps '
-                            "that are actually required.",
-                        ),
-                    ]
-                )
+                with llm_trace_scope(purpose="plan_retry", **trace_fields):
+                    retry = await llm.complete_json(
+                        [
+                            Message("system", PLANNER_SYSTEM_PROMPT),
+                            Message("user", user),
+                            Message("assistant", _json(result)[:4000]),
+                            Message(
+                                "user",
+                                "That reply contained no usable steps. Reply again with ONLY a JSON "
+                                'object of the exact shape given, with a non-empty "steps" array. '
+                                'Every step needs a one-line "description". Keep it to the few steps '
+                                "that are actually required.",
+                            ),
+                        ]
+                    )
             except LLMError as exc:
                 raise PlanningError(
                     f"Decomposition failed: the fixed LLM is unavailable ({exc.category})."
@@ -1084,6 +1094,12 @@ Produce EXACTLY this JSON shape:
         ]
         completed = [s for s in current_spec.steps if s.status in ("completed", "skipped")]
 
+        # Read the revision being replaced from the database. `current_spec` is whatever the
+        # caller held in memory, which after an earlier replan can be a superseded plan; the
+        # request must name the revision that is actually current.
+        persisted = await self.current_plan(task)
+        plan_revision = persisted.revision if persisted is not None else None
+
         catalog = self.registry.catalog_for_llm() if self.registry else []
         catalog_text = "\n".join(f"- {t['name']}: {t['description']}" for t in catalog) or "(none)"
 
@@ -1094,6 +1110,7 @@ Produce EXACTLY this JSON shape:
 
         user = f"""OBJECTIVE (unchanged): {current_spec.objective}
 
+PLAN REVISION BEING REPLACED: {plan_revision if plan_revision is not None else "none persisted"}
 REPLAN TRIGGER: {trigger.value}
 REASON: {reason}
 
@@ -1140,9 +1157,12 @@ Produce EXACTLY this JSON shape:
 """
         await self._release_write_lock()
         try:
-            result = await llm.complete_json(
-                [Message("system", REPLAN_SYSTEM_PROMPT), Message("user", user)]
-            )
+            with llm_trace_scope(
+                purpose="replan", task_id=task.task_id, plan_revision=plan_revision
+            ):
+                result = await llm.complete_json(
+                    [Message("system", REPLAN_SYSTEM_PROMPT), Message("user", user)]
+                )
         except LLMError as exc:
             # Fall back to a deterministic salvage plan rather than nothing.
             logger.error("Replanning LLM call failed for %s: %s", task.task_id, exc)

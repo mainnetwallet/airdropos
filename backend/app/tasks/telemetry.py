@@ -237,3 +237,86 @@ def record_llm_call(
 def reset_task_usage(task_id: Optional[str] = None) -> None:
     """Test hook, and the seam a worker uses after it has persisted the totals."""
     registry.clear(task_id)
+
+# ---------------------------------------------------------------------------
+# Per-call LLM traces
+# ---------------------------------------------------------------------------
+# The usage counters above say how much a task spent; this says what each request was.
+# Records come from `backend.app.llm.trace` and hold ids, counts, lengths and category
+# names only (never prompt text or credentials). Kept in a bounded ring per task, and per
+# conversation for requests made outside any task, so a long-lived process cannot grow
+# without limit.
+
+TRACE_RING_SIZE = 200
+_MAX_TRACE_KEYS = 512
+
+
+class _TraceStore:
+    def __init__(self) -> None:
+        from collections import OrderedDict, deque
+
+        self._deque = deque
+        self._lock = threading.Lock()
+        self._rings: "OrderedDict[str, Any]" = OrderedDict()
+
+    @staticmethod
+    def _key(trace: Any) -> str:
+        if trace.task_id:
+            return f"task:{str(trace.task_id).strip().upper()}"
+        if trace.conversation_id:
+            return f"conversation:{trace.conversation_id}"
+        return "unattributed"
+
+    def add(self, trace: Any) -> None:
+        key = self._key(trace)
+        with self._lock:
+            ring = self._rings.get(key)
+            if ring is None:
+                ring = self._deque(maxlen=TRACE_RING_SIZE)
+                self._rings[key] = ring
+                while len(self._rings) > _MAX_TRACE_KEYS:
+                    self._rings.popitem(last=False)
+            else:
+                self._rings.move_to_end(key)
+            ring.append(trace.to_dict())
+
+    def get(self, *, task_id: Optional[str] = None, conversation_id: Optional[str] = None):
+        if task_id:
+            key = f"task:{task_id.strip().upper()}"
+        elif conversation_id:
+            key = f"conversation:{conversation_id}"
+        else:
+            key = "unattributed"
+        with self._lock:
+            return [dict(item) for item in self._rings.get(key, ())]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._rings.clear()
+
+
+trace_store = _TraceStore()
+
+
+def record_llm_trace(trace: Any) -> None:
+    """Store one finished call trace. Safe on every path: it never raises."""
+    try:
+        trace_store.add(trace)
+        logger.debug(
+            "llm.trace id=%s purpose=%s task=%s plan_rev=%s ctx_gen=%s msgs=%s tokens=%s outcome=%s",
+            trace.trace_id, trace.purpose, trace.task_id, trace.plan_revision,
+            trace.context_generation, trace.message_count, trace.estimated_tokens, trace.outcome,
+        )
+    except Exception as exc:  # pragma: no cover - telemetry is best effort
+        logger.debug("Could not record LLM trace: %s", exc)
+
+
+def get_llm_traces(*, task_id: Optional[str] = None,
+                   conversation_id: Optional[str] = None) -> list:
+    """The retained call traces for a task or conversation, oldest first."""
+    return trace_store.get(task_id=task_id, conversation_id=conversation_id)
+
+
+def reset_llm_traces() -> None:
+    """Test hook."""
+    trace_store.clear()

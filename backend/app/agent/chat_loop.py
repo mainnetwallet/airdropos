@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.agent.prompts import build_chat_system_prompt
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, LLMResponse, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.llm.json_stream import JsonStringFieldStreamer
 from backend.app.tasks.telemetry import aggregate_usage_blocks
 from backend.app.tools.base import ToolResultStatus
@@ -240,6 +241,9 @@ class ChatToolLoop:
         # 40, while `max_tool_calls` is documented as a bound on invocations. The same
         # tool used twice is two invocations and must be counted as two.
         self.tool_calls_this_turn: List[str] = []
+        # Set by `run` for the duration of one turn so every model call in it is traced
+        # against the conversation it belongs to.
+        self._conversation_id: Optional[str] = None
 
     @property
     def tool_invocation_count(self) -> int:
@@ -269,6 +273,7 @@ class ChatToolLoop:
         on_event: Optional[EventCallback] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         images: Optional[List[str]] = None,
+        conversation_id: Optional[str] = None,
     ) -> ChatTurnResult:
         """Execute one turn. `create_task` persists a task the model asked for.
 
@@ -284,6 +289,7 @@ class ChatToolLoop:
         started = time.perf_counter()
         stopped = False
         result = ChatTurnResult(reply="")
+        self._conversation_id = conversation_id
 
         catalog = self.registry.catalog_for_llm(self.policy)
         system = build_chat_system_prompt(catalog)
@@ -541,6 +547,19 @@ class ChatToolLoop:
         extracted from the partial JSON, so the operator reads the answer as it is
         written instead of waiting for the whole object.
         """
+        scope = llm_trace_scope(
+            purpose="chat_tool_round" if round_number > 1 else "chat_decision",
+            conversation_id=self._conversation_id,
+        )
+        with scope:
+            return await self._ask_model_scoped(messages, on_event, round_number)
+
+    async def _ask_model_scoped(
+        self,
+        messages: List[Message],
+        on_event: Optional[EventCallback],
+        round_number: int,
+    ) -> LLMResponse:
         if on_event is None:
             return await llm.complete(messages, json_mode=True)
 

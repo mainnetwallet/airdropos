@@ -173,6 +173,7 @@ async def reflect_on_guidance(
     import asyncio
 
     from backend.app.llm.client import Message, llm
+    from backend.app.llm.trace import llm_trace_scope
 
     payload = {
         "task": {"title": _clip(title, 300), "objective": _clip(objective, 1200)},
@@ -180,15 +181,16 @@ async def reflect_on_guidance(
         "operator_guidance": [_clip(g, MAX_RENDERED_CHARS) for g in guidance[-5:]],
     }
     try:
-        raw = await asyncio.wait_for(
-            llm.complete_json(
-                [
-                    Message("system", REFLECT_SYSTEM),
-                    Message("user", json.dumps(payload, ensure_ascii=False, default=str)),
-                ]
-            ),
-            timeout=timeout_seconds,
-        )
+        with llm_trace_scope(purpose="operator_guidance_reflection"):
+            raw = await asyncio.wait_for(
+                llm.complete_json(
+                    [
+                        Message("system", REFLECT_SYSTEM),
+                        Message("user", json.dumps(payload, ensure_ascii=False, default=str)),
+                    ]
+                ),
+                timeout=timeout_seconds,
+            )
     except Exception as exc:  # noqa: BLE001 - reflection is an aid, never a dependency
         logger.warning("Guidance reflection skipped: %s", type(exc).__name__)
         return None
