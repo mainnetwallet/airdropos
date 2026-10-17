@@ -3198,6 +3198,19 @@ class AgentController:
     async def _checkpoint(self, task: Task, iteration: int, name: str) -> None:
         try:
             plan = await self.planner.current_plan(task)
+            # Which context and which plan row this checkpoint was taken against. Diagnostic
+            # only: resume rebuilds the objective, constraints, requirements, blockers and
+            # evidence from the TaskContext/TaskObservation/TaskRequirement rows, never from here.
+            # Read separately so a failure here can never cost the checkpoint itself.
+            context_fields: Dict[str, Any] = {}
+            try:
+                version = await self.context.context_version(task)
+                context_fields = {
+                    "context_generation": version.generation,
+                    "task_context_revision": version.task_context_revision,
+                }
+            except Exception as exc:
+                logger.warning("Checkpoint for %s saved without a context version: %s", task.task_id, exc)
             await self.checkpoints.save(
                 task,
                 checkpoint_name=name,
@@ -3212,7 +3225,9 @@ class AgentController:
                         # Persisting plan position is what makes resume exact
                         # rather than approximate.
                         "plan_revision": plan.revision if plan else None,
+                        "plan_id": str(plan.id) if plan else None,
                         "plan_steps": plan.steps if plan else [],
+                        **context_fields,
                         # Enough to tell a resumed run where it is in the task's lifetime,
                         # and to keep the window counters from being reset by a restart.
                         "execution_windows": task.execution_windows or 0,
