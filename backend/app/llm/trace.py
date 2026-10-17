@@ -182,11 +182,19 @@ def new_trace(*, streaming: bool = False, json_mode: bool = False, purpose: Opti
     """Start a trace from the ambient scope. Never raises."""
     try:
         scope = current_scope()
+        task_id = scope.task_id
+        if task_id is None:
+            # A request made from inside a tool call carries no controller scope, but the
+            # tool dispatcher publishes the task it runs for. Using it keeps that request
+            # attributed to its task instead of falling into the unattributed ring.
+            from backend.app.tools.context import get_current_task_id
+
+            task_id = safe_token(get_current_task_id(), limit=128)
         return LLMCallTrace(
             trace_id=uuid.uuid4().hex[:16],
             purpose=safe_token(purpose) or scope.purpose or "unlabelled",
             parent_trace_id=parent_trace_id,
-            task_id=scope.task_id,
+            task_id=task_id,
             conversation_id=scope.conversation_id,
             execution_window=scope.execution_window,
             plan_revision=scope.plan_revision,

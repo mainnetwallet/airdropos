@@ -482,6 +482,30 @@ def _extract_identifiers(text: str) -> List[str]:
     return found
 
 
+CREDENTIAL_MARKER = "[REDACTED: credential field]"
+
+# Field names that hold a credential whatever the value looks like. Value patterns alone
+# (`MemoryManager.assert_no_secrets`) cannot see `{"password": "hunter2"}` or
+# `{"Authorization": "Bearer ..."}`: the value has no recognisable shape, only its label
+# says what it is. Names are matched whole (after normalising case and separators) so an
+# ordinary field such as `token_balance` or `tokens` - real, useful evidence - is left alone.
+_CREDENTIAL_KEYS = frozenset(
+    {
+        "password", "passwd", "pwd", "passphrase", "authorization", "proxy_authorization",
+        "cookie", "cookies", "set_cookie", "session_cookie", "api_key", "apikey", "x_api_key",
+        "secret", "client_secret", "private_key", "privatekey", "secret_key", "mnemonic",
+        "seed", "seed_phrase", "recovery_phrase", "access_token", "refresh_token",
+        "auth_token", "bearer_token", "session_token", "id_token", "csrf_token",
+        "otp", "two_factor_code", "verification_code",
+    }
+)
+
+
+def _is_credential_key(key: Any) -> bool:
+    normalised = re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower()).strip("_")
+    return normalised in _CREDENTIAL_KEYS
+
+
 def _screen_value(value: Any, *, limit: int, depth: int = 0) -> Any:
     """Recursively bound and secret-screen any value on its way into the context.
 
@@ -513,6 +537,11 @@ def _screen_value(value: Any, *, limit: int, depth: int = 0) -> Any:
             # Keys are screened at every level, not only at the root. Applying it only in
             # `_screened_dict` left `{"metadata": {"api_key: sk-live-...": ...}}` written
             # verbatim one level down, which is the shape most real payloads have.
+            if _is_credential_key(key) and item not in (None, "", [], {}):
+                # The label says this is a credential, so the value is dropped whatever
+                # it looks like. Presence is kept; the content is not.
+                screened[_screen_mapping_key(key)] = CREDENTIAL_MARKER
+                continue
             screened[_screen_mapping_key(key)] = _screen_value(
                 item, limit=limit, depth=depth + 1
             )
@@ -1133,8 +1162,12 @@ class TaskContextService:
             action=str(action)[:500],
             evidence_kind=observation.evidence_kind,
             evidence_authoritative=observation.evidence_authoritative,
-            observed_state=observed_state or {},
+            # The screened copy, like everything else written from this call: handing back
+            # the raw payload would let a caller forward what the screening just removed.
+            observed_state=safe_state,
             integration_ref=integration_ref,
+            iteration=int(iteration or 0),
+            error=safe_error,
         )
 
     async def record_requirement(
@@ -1937,6 +1970,9 @@ class TaskContextService:
             return {"value": _screen_value(payload, limit=limit)}
         screened: Dict[str, Any] = {}
         for key, value in list(payload.items())[:MAX_SCREEN_ITEMS]:
+            if _is_credential_key(key) and value not in (None, "", [], {}):
+                screened[_screen_mapping_key(key)] = CREDENTIAL_MARKER
+                continue
             screened[_screen_mapping_key(key)] = _screen_value(value, limit=limit)
         if len(payload) > MAX_SCREEN_ITEMS:
             screened["__truncated__"] = (

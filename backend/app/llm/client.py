@@ -435,9 +435,20 @@ class FixedLLMClient:
                 "characters_removed": report.characters_removed,
                 "references_emitted": report.references_emitted,
             }
-            trace.warnings.append(
-                "preflight_aggressive_reduction" if aggressive else "preflight_over_trigger_compacted"
-            )
+            # Say what happened, not what was attempted: a summarisation round that came
+            # back unusable leaves the request exactly as it was, and calling that
+            # "compacted" would make the trace claim a reduction that never took place.
+            reduced = bool(report.messages_reduced or report.characters_removed)
+            if aggressive:
+                trace.warnings.append(
+                    "preflight_aggressive_reduction" if reduced
+                    else "preflight_aggressive_reduction_made_no_change"
+                )
+            else:
+                trace.warnings.append(
+                    "preflight_over_trigger_compacted" if reduced
+                    else "preflight_over_trigger_not_reduced"
+                )
         logger.info(
             "llm.context compacted: estimated=%s -> counted=%s strategies=%s reduced=%s "
             "llm_rounds=%s removed_chars=%s references=%s",
