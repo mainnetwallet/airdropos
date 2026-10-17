@@ -665,12 +665,13 @@ class Planner:
             f"CAMPAIGN CONTEXT:\n{_json(campaign_context)}" if campaign_context else ""
         )
         context_section = f"ADDITIONAL CONTEXT:\n{_json(context)}" if context else ""
+        critical_block = _critical_context_block(context)
 
         user = f"""OBJECTIVE:
 {objective}
 
 CONSTRAINTS (these are hard limits you must respect):
-{_json(constraints.to_dict())}
+{_json(constraints.to_dict())}{critical_block}
 
 {task_state_section}
 {campaign_section}
@@ -1107,6 +1108,7 @@ Produce EXACTLY this JSON shape:
             f"CAMPAIGN CONTEXT:\n{_json(campaign_context)}" if campaign_context else ""
         )
         context_section = f"ADDITIONAL CONTEXT:\n{_json(context)}" if context else ""
+        critical_block = _critical_context_block(context)
 
         user = f"""OBJECTIVE (unchanged): {current_spec.objective}
 
@@ -1123,7 +1125,7 @@ STEPS THAT MUST NOT BE REPEATED (irreversible, already moved value):
 STEPS THAT FAILED OR REMAIN:
 {_json([{"index": s.index, "description": s.description, "kind": s.kind.value, "failure": s.failure_reason} for s in current_spec.steps if s.status not in ("completed", "skipped")])}
 {_section("REQUIREMENTS DISCOVERED WHILE EXECUTING (an external system stated these; your new plan MUST cover every one that is still outstanding, and MUST NOT claim any is already done)", list(context_notes or []))}
-{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}
+{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}{critical_block}
 {campaign_section}
 {context_section}
 CONSTRAINTS (hard limits):
@@ -1435,6 +1437,72 @@ Produce EXACTLY this JSON shape:
 # ======================================================================
 # Helpers
 # ======================================================================
+# How much of the context digest below is kept. These are bounds on the DIGEST only; the full
+# record is still sent in ADDITIONAL CONTEXT. Anything the digest leaves out is counted in it.
+CRITICAL_MAX_REQUIREMENTS = 15
+CRITICAL_MAX_FACTS = 12
+CRITICAL_TEXT_CLIP = 200
+CRITICAL_FACT_CLIP = 100
+
+
+def _clip(value: Any, limit: int = CRITICAL_TEXT_CLIP) -> str:
+    text = " ".join(str(value if value is not None else "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _critical_context_block(context: Optional[Dict[str, Any]]) -> str:
+    """A short digest of what a plan must not lose, placed in the HEAD of a planner prompt, after the objective and step lists.
+
+    The resolved context is a large JSON object embedded in the middle of a prose message. If
+    that message is ever too big, compaction reduces prose by keeping its head and tail, so the
+    middle (outstanding requirements and verified facts) is what goes first. This digest is
+    small, bounded and sits in the head, so it survives that reduction. It repeats information
+    that is also present in full in ADDITIONAL CONTEXT, and never replaces it.
+
+    Returns "" (and therefore changes nothing about the prompt) when the context carries none
+    of these sections.
+    """
+    if not isinstance(context, dict):
+        return ""
+
+    digest: Dict[str, Any] = {}
+    if context.get("plan_revision") is not None:
+        digest["plan_revision"] = context["plan_revision"]
+    if context.get("context_generation") is not None:
+        digest["context_generation"] = context["context_generation"]
+
+    outstanding = [r for r in (context.get("outstanding_requirements") or []) if isinstance(r, dict)]
+    if outstanding:
+        digest["outstanding_requirements"] = [
+            _clip(r.get("text")) for r in outstanding[:CRITICAL_MAX_REQUIREMENTS]
+        ]
+        if len(outstanding) > CRITICAL_MAX_REQUIREMENTS:
+            digest["outstanding_requirements_not_listed_here"] = (
+                len(outstanding) - CRITICAL_MAX_REQUIREMENTS
+            )
+
+    facts = [f for f in (context.get("verified_facts") or []) if isinstance(f, dict)]
+    if facts:
+        # Newest first: the most recent proof is the most likely to matter, and an older fact
+        # that is left out is counted rather than silently dropped.
+        newest = list(reversed(facts))[:CRITICAL_MAX_FACTS]
+        digest["verified_facts_newest_first"] = [
+            {"action": _clip(f.get("action"), CRITICAL_FACT_CLIP), "tool": f.get("tool"), "iteration": f.get("iteration")}
+            for f in newest
+        ]
+        if len(facts) > CRITICAL_MAX_FACTS:
+            digest["verified_facts_not_listed_here"] = len(facts) - CRITICAL_MAX_FACTS
+
+    if not any(k in digest for k in ("outstanding_requirements", "verified_facts_newest_first")):
+        return ""  # a revision number alone is not worth a block
+
+    return (
+        "\n\nCRITICAL CONTEXT (a digest of ADDITIONAL CONTEXT below, which holds the full "
+        "record; outstanding requirements must be covered, verified facts must not be repeated):\n"
+        + _json(digest)
+    )
+
+
 def _json(obj: Any) -> str:
     import json
 

@@ -821,9 +821,10 @@ class ResolvedContext:
             "current_step_index": ctx.current_step_index if ctx else None,
             "last_error": ctx.last_error if ctx else None,
             "campaign_id": str(self.campaign_id) if self.campaign_id is not None else None,
-            # Timestamps where they exist. Context updates are stamped; individual
-            # observations are not (the table keeps no created_at column), so they are
-            # attributed by iteration instead of by an invented time.
+            # Context updates carry their timestamps. Observations are RETRIEVED in
+            # `created_at` order (then iteration, then id; see `_chronological`), but each
+            # one is shown below by its `iteration` rather than a repeated wall-clock time, so
+            # the prompt carries no time the executor did not record.
             "context_updated_at": (
                 ctx.updated_at.isoformat()
                 if ctx is not None and getattr(ctx, "updated_at", None)
