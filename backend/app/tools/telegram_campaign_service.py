@@ -93,6 +93,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from backend.app.agent.context import TaskContextService, normalize_requirement
 from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.models.context import (
     OUTCOME_ATTEMPTED,
     OUTCOME_BLOCKED,
@@ -1387,7 +1388,8 @@ async def _llm_judgement(
         ),
     ]
     try:
-        parsed = await llm.complete_json(messages, temperature=0.0)
+        with llm_trace_scope(purpose="telegram_requirement_classification"):
+            parsed = await llm.complete_json(messages, temperature=0.0)
     except LLMError as exc:
         return {}, f"The classification model was unavailable ({exc.category or 'error'})."
     except Exception as exc:  # defensive: a transport layer that is not an LLMError

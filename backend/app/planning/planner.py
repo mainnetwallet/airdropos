@@ -31,6 +31,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from backend.app.blockchain.chains import known_networks
 from backend.app.core.config import settings
 from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.models import ExecutionPlan, PlanRevision, Task
 from backend.app.tools.registry import ToolRegistry
 
@@ -664,12 +665,13 @@ class Planner:
             f"CAMPAIGN CONTEXT:\n{_json(campaign_context)}" if campaign_context else ""
         )
         context_section = f"ADDITIONAL CONTEXT:\n{_json(context)}" if context else ""
+        critical_block = _critical_context_block(context)
 
         user = f"""OBJECTIVE:
 {objective}
 
 CONSTRAINTS (these are hard limits you must respect):
-{_json(constraints.to_dict())}
+{_json(constraints.to_dict())}{critical_block}
 
 {task_state_section}
 {campaign_section}
@@ -700,10 +702,18 @@ Produce EXACTLY this JSON shape:
 }}
 """
         await self._release_write_lock()
+        # The plan revision this request depends on is read from the persisted plan, not
+        # taken from the caller, so the trace names what is actually stored.
+        persisted = await self.current_plan(task) if task is not None else None
+        trace_fields = {
+            "task_id": task.task_id if task is not None else None,
+            "plan_revision": persisted.revision if persisted is not None else None,
+        }
         try:
-            result = await llm.complete_json(
-                [Message("system", PLANNER_SYSTEM_PROMPT), Message("user", user)]
-            )
+            with llm_trace_scope(purpose="plan", **trace_fields):
+                result = await llm.complete_json(
+                    [Message("system", PLANNER_SYSTEM_PROMPT), Message("user", user)]
+                )
         except LLMError as exc:
             # A planner failure must not be silently papered over with a guess.
             raise PlanningError(
@@ -722,20 +732,21 @@ Produce EXACTLY this JSON shape:
                 list(result.keys()) if isinstance(result, dict) else type(result).__name__,
             )
             try:
-                retry = await llm.complete_json(
-                    [
-                        Message("system", PLANNER_SYSTEM_PROMPT),
-                        Message("user", user),
-                        Message("assistant", _json(result)[:4000]),
-                        Message(
-                            "user",
-                            "That reply contained no usable steps. Reply again with ONLY a JSON "
-                            'object of the exact shape given, with a non-empty "steps" array. '
-                            'Every step needs a one-line "description". Keep it to the few steps '
-                            "that are actually required.",
-                        ),
-                    ]
-                )
+                with llm_trace_scope(purpose="plan_retry", **trace_fields):
+                    retry = await llm.complete_json(
+                        [
+                            Message("system", PLANNER_SYSTEM_PROMPT),
+                            Message("user", user),
+                            Message("assistant", _json(result)[:4000]),
+                            Message(
+                                "user",
+                                "That reply contained no usable steps. Reply again with ONLY a JSON "
+                                'object of the exact shape given, with a non-empty "steps" array. '
+                                'Every step needs a one-line "description". Keep it to the few steps '
+                                "that are actually required.",
+                            ),
+                        ]
+                    )
             except LLMError as exc:
                 raise PlanningError(
                     f"Decomposition failed: the fixed LLM is unavailable ({exc.category})."
@@ -1084,6 +1095,12 @@ Produce EXACTLY this JSON shape:
         ]
         completed = [s for s in current_spec.steps if s.status in ("completed", "skipped")]
 
+        # Read the revision being replaced from the database. `current_spec` is whatever the
+        # caller held in memory, which after an earlier replan can be a superseded plan; the
+        # request must name the revision that is actually current.
+        persisted = await self.current_plan(task)
+        plan_revision = persisted.revision if persisted is not None else None
+
         catalog = self.registry.catalog_for_llm() if self.registry else []
         catalog_text = "\n".join(f"- {t['name']}: {t['description']}" for t in catalog) or "(none)"
 
@@ -1091,9 +1108,24 @@ Produce EXACTLY this JSON shape:
             f"CAMPAIGN CONTEXT:\n{_json(campaign_context)}" if campaign_context else ""
         )
         context_section = f"ADDITIONAL CONTEXT:\n{_json(context)}" if context else ""
+        critical_block = _critical_context_block(context)
+
+        # CONSTRAINTS are hard limits, and when the context sections are present they are the
+        # large part of this message. Head/tail compaction keeps the opening and the closing of
+        # prose and drops the middle, and the closing here is the tool catalog (tens of
+        # thousands of characters with the real registry), so a CONSTRAINTS section placed
+        # after the context was cut with it. With context present the section therefore goes
+        # in the head, as `decompose` already does; with none it stays where it always was, so
+        # a replan prompt without context is byte-for-byte what it was before.
+        constraints_section = f"CONSTRAINTS (hard limits):\n{_json(constraints.to_dict())}"
+        if context or campaign_context:
+            constraints_head, constraints_tail = f"\n\n{constraints_section}\n", "\n"
+        else:
+            constraints_head, constraints_tail = "", f"{constraints_section}\n\n"
 
         user = f"""OBJECTIVE (unchanged): {current_spec.objective}
 
+PLAN REVISION BEING REPLACED: {plan_revision if plan_revision is not None else "none persisted"}
 REPLAN TRIGGER: {trigger.value}
 REASON: {reason}
 
@@ -1106,13 +1138,10 @@ STEPS THAT MUST NOT BE REPEATED (irreversible, already moved value):
 STEPS THAT FAILED OR REMAIN:
 {_json([{"index": s.index, "description": s.description, "kind": s.kind.value, "failure": s.failure_reason} for s in current_spec.steps if s.status not in ("completed", "skipped")])}
 {_section("REQUIREMENTS DISCOVERED WHILE EXECUTING (an external system stated these; your new plan MUST cover every one that is still outstanding, and MUST NOT claim any is already done)", list(context_notes or []))}
-{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}
+{_section("ALREADY PROVEN BY AUTHORITATIVE EVIDENCE (do not propose these again)", list(evidence or []))}{critical_block}{constraints_head}
 {campaign_section}
 {context_section}
-CONSTRAINTS (hard limits):
-{_json(constraints.to_dict())}
-
-AVAILABLE TOOLS (you may ONLY use these):
+{constraints_tail}AVAILABLE TOOLS (you may ONLY use these):
 {catalog_text}
 
 Produce EXACTLY this JSON shape:
@@ -1140,9 +1169,12 @@ Produce EXACTLY this JSON shape:
 """
         await self._release_write_lock()
         try:
-            result = await llm.complete_json(
-                [Message("system", REPLAN_SYSTEM_PROMPT), Message("user", user)]
-            )
+            with llm_trace_scope(
+                purpose="replan", task_id=task.task_id, plan_revision=plan_revision
+            ):
+                result = await llm.complete_json(
+                    [Message("system", REPLAN_SYSTEM_PROMPT), Message("user", user)]
+                )
         except LLMError as exc:
             # Fall back to a deterministic salvage plan rather than nothing.
             logger.error("Replanning LLM call failed for %s: %s", task.task_id, exc)
@@ -1415,6 +1447,72 @@ Produce EXACTLY this JSON shape:
 # ======================================================================
 # Helpers
 # ======================================================================
+# How much of the context digest below is kept. These are bounds on the DIGEST only; the full
+# record is still sent in ADDITIONAL CONTEXT. Anything the digest leaves out is counted in it.
+CRITICAL_MAX_REQUIREMENTS = 15
+CRITICAL_MAX_FACTS = 12
+CRITICAL_TEXT_CLIP = 200
+CRITICAL_FACT_CLIP = 100
+
+
+def _clip(value: Any, limit: int = CRITICAL_TEXT_CLIP) -> str:
+    text = " ".join(str(value if value is not None else "").split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _critical_context_block(context: Optional[Dict[str, Any]]) -> str:
+    """A short digest of what a plan must not lose, placed in the HEAD of a planner prompt, after the objective and step lists.
+
+    The resolved context is a large JSON object embedded in the middle of a prose message. If
+    that message is ever too big, compaction reduces prose by keeping its head and tail, so the
+    middle (outstanding requirements and verified facts) is what goes first. This digest is
+    small, bounded and sits in the head, so it survives that reduction. It repeats information
+    that is also present in full in ADDITIONAL CONTEXT, and never replaces it.
+
+    Returns "" (and therefore changes nothing about the prompt) when the context carries none
+    of these sections.
+    """
+    if not isinstance(context, dict):
+        return ""
+
+    digest: Dict[str, Any] = {}
+    if context.get("plan_revision") is not None:
+        digest["plan_revision"] = context["plan_revision"]
+    if context.get("context_generation") is not None:
+        digest["context_generation"] = context["context_generation"]
+
+    outstanding = [r for r in (context.get("outstanding_requirements") or []) if isinstance(r, dict)]
+    if outstanding:
+        digest["outstanding_requirements"] = [
+            _clip(r.get("text")) for r in outstanding[:CRITICAL_MAX_REQUIREMENTS]
+        ]
+        if len(outstanding) > CRITICAL_MAX_REQUIREMENTS:
+            digest["outstanding_requirements_not_listed_here"] = (
+                len(outstanding) - CRITICAL_MAX_REQUIREMENTS
+            )
+
+    facts = [f for f in (context.get("verified_facts") or []) if isinstance(f, dict)]
+    if facts:
+        # Newest first: the most recent proof is the most likely to matter, and an older fact
+        # that is left out is counted rather than silently dropped.
+        newest = list(reversed(facts))[:CRITICAL_MAX_FACTS]
+        digest["verified_facts_newest_first"] = [
+            {"action": _clip(f.get("action"), CRITICAL_FACT_CLIP), "tool": f.get("tool"), "iteration": f.get("iteration")}
+            for f in newest
+        ]
+        if len(facts) > CRITICAL_MAX_FACTS:
+            digest["verified_facts_not_listed_here"] = len(facts) - CRITICAL_MAX_FACTS
+
+    if not any(k in digest for k in ("outstanding_requirements", "verified_facts_newest_first")):
+        return ""  # a revision number alone is not worth a block
+
+    return (
+        "\n\nCRITICAL CONTEXT (a digest of ADDITIONAL CONTEXT below, which holds the full "
+        "record; outstanding requirements must be covered, verified facts must not be repeated):\n"
+        + _json(digest)
+    )
+
+
 def _json(obj: Any) -> str:
     import json
 

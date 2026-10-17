@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox.service import ConversationService
 from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.llm.compaction import redact_secrets
 from backend.app.memory.manager import SECRET_PATTERNS
 from backend.app.models import AgentConversation, InterventionRequest, Task
@@ -402,9 +403,10 @@ class ReplyInterpreter:
             Message("user", json.dumps(context, ensure_ascii=False)),
         ]
         try:
-            raw = await asyncio.wait_for(
-                llm.complete_json(messages), timeout=INTERPRET_TIMEOUT_SECONDS
-            )
+            with llm_trace_scope(purpose="inbox_reply_interpretation"):
+                raw = await asyncio.wait_for(
+                    llm.complete_json(messages), timeout=INTERPRET_TIMEOUT_SECONDS
+                )
         except asyncio.TimeoutError as exc:
             raise InterpretationError("The interpretation timed out.", category="TIMEOUT") from exc
         except LLMError as exc:

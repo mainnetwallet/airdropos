@@ -43,6 +43,12 @@ from backend.app.llm.compaction import (
     detect_billing_refusal_in_content,
 )
 from backend.app.llm.token_budget import TokenBudget, count_request_tokens, record_usage
+from backend.app.llm.trace import (
+    LLMCallTrace,
+    describe_final_request,
+    finish_trace,
+    new_trace,
+)
 from backend.app.tasks.telemetry import record_llm_call
 from backend.app.tools.context import get_current_task_id
 
@@ -368,7 +374,11 @@ class FixedLLMClient:
         return _in_compaction.get()
 
     async def _preflight(
-        self, messages: List[Message], *, aggressive: bool = False
+        self,
+        messages: List[Message],
+        *,
+        aggressive: bool = False,
+        trace: Optional[LLMCallTrace] = None,
     ) -> List[Message]:
         """Size-check and, only if necessary, reduce a request.
 
@@ -397,14 +407,48 @@ class FixedLLMClient:
             aggressive,
         )
 
+        parent_id = trace.trace_id if trace is not None else None
+
+        async def _summarize(batch: List[Message]) -> Optional[str]:
+            # The summarisation round is a request of its own; naming its parent is what
+            # keeps it from reading as an unrelated call in the trace.
+            return await self._compaction_summarize(batch, parent_trace_id=parent_id)
+
         token = _in_compaction.set(True)
         try:
-            compactor = build_compactor(budget, summarizer=self._compaction_summarize)
+            compactor = build_compactor(budget, summarizer=_summarize)
             result = await compactor.compact_request(messages, aggressive=aggressive)
         finally:
             _in_compaction.reset(token)
 
         report = result.report
+        if trace is not None:
+            passes = int((trace.compaction or {}).get("passes", 0)) + 1
+            trace.compaction = {
+                "passes": passes,
+                "aggressive": aggressive,
+                "original_tokens": report.original_tokens,
+                "final_tokens": report.final_tokens,
+                "strategies": list(report.strategies),
+                "messages_reduced": report.messages_reduced,
+                "llm_rounds": report.llm_rounds,
+                "characters_removed": report.characters_removed,
+                "references_emitted": report.references_emitted,
+            }
+            # Say what happened, not what was attempted: a summarisation round that came
+            # back unusable leaves the request exactly as it was, and calling that
+            # "compacted" would make the trace claim a reduction that never took place.
+            reduced = bool(report.messages_reduced or report.characters_removed)
+            if aggressive:
+                trace.warnings.append(
+                    "preflight_aggressive_reduction" if reduced
+                    else "preflight_aggressive_reduction_made_no_change"
+                )
+            else:
+                trace.warnings.append(
+                    "preflight_over_trigger_compacted" if reduced
+                    else "preflight_over_trigger_not_reduced"
+                )
         logger.info(
             "llm.context compacted: estimated=%s -> counted=%s strategies=%s reduced=%s "
             "llm_rounds=%s removed_chars=%s references=%s",
@@ -418,7 +462,9 @@ class FixedLLMClient:
         )
         return result.messages
 
-    async def _compaction_summarize(self, messages: List[Message]) -> Optional[str]:
+    async def _compaction_summarize(
+        self, messages: List[Message], *, parent_trace_id: Optional[str] = None
+    ) -> Optional[str]:
         """Ask the fixed model to summarise context for compaction - no recursion.
 
         This is a DEDICATED internal path: it builds the payload and posts it directly,
@@ -429,17 +475,31 @@ class FixedLLMClient:
         The model is the same locked `LLM_MODEL_ID` as every other call. No routing, no
         fallback and no model switching is introduced here, and the output-token limit is
         left exactly as configured (unset by default).
+
+        It is traced as its own request, with `parent_trace_id` naming the call that
+        needed the compaction, because it is a real request against the model with its
+        own size and outcome.
         """
         if _in_compaction_call.get():
             logger.warning("Refusing a nested compaction summarisation call")
             return None
 
+        trace = new_trace(
+            json_mode=True,
+            purpose="compaction",
+            requested_model=self._model_id,
+            parent_trace_id=parent_trace_id,
+        )
+        describe_final_request(trace, messages, count_request_tokens(messages))
+        trace.attempts = 1
+        outcome, category, served = "error", None, None
         token = _in_compaction_call.set(True)
         try:
             payload = self._build_payload(messages, temperature=0.0, json_mode=True)
             try:
                 raw = await self._post("/chat/completions", payload)
             except LLMError as exc:
+                category = exc.category
                 logger.warning(
                     "LLM compaction round could not complete (%s); falling back.", exc.category
                 )
@@ -448,6 +508,7 @@ class FixedLLMClient:
             try:
                 response = self._normalize(raw)
             except LLMError as exc:
+                category = exc.category
                 logger.warning(
                     "LLM compaction round produced an unusable reply (%s); falling back.",
                     exc.category,
@@ -459,12 +520,21 @@ class FixedLLMClient:
             # is the only place it can be counted; omitting it made every context overflow
             # invisible in per-task request telemetry.
             self._record_task_usage(raw.get("usage"), response.model)
+            outcome, served = "ok", response.model
             return response.content
+        except BaseException as exc:
+            category = category or getattr(exc, "category", type(exc).__name__)
+            raise
         finally:
             _in_compaction_call.reset(token)
+            finish_trace(trace, outcome=outcome, error_category=category, served_model=served)
 
     async def _try_preflight(
-        self, messages: List[Message], *, aggressive: bool = False
+        self,
+        messages: List[Message],
+        *,
+        aggressive: bool = False,
+        trace: Optional[LLMCallTrace] = None,
     ) -> List[Message]:
         """Preflight, surfacing "cannot fit" as the error type callers already handle.
 
@@ -476,8 +546,10 @@ class FixedLLMClient:
         the operator still gets the actionable explanation.
         """
         try:
-            return await self._preflight(messages, aggressive=aggressive)
+            return await self._preflight(messages, aggressive=aggressive, trace=trace)
         except ContextCompactionError as exc:
+            if trace is not None:
+                trace.warnings.append("request_could_not_be_reduced_to_budget")
             raise LLMError(str(exc), category="CONTEXT_TOO_LARGE", retryable=False) from exc
 
     # ------------------------------------------------------------------
@@ -491,7 +563,42 @@ class FixedLLMClient:
         json_mode: bool = False,
         stop: Optional[List[str]] = None,
     ) -> LLMResponse:
-        """Execute a chat completion against the single fixed model."""
+        """Execute a chat completion against the single fixed model.
+
+        Every call leaves one safe trace record (see `llm.trace`) describing the request
+        as it was finally sent. Tracing cannot change the outcome: it is best effort and
+        the original exception, if any, is re-raised untouched.
+        """
+        trace = new_trace(json_mode=json_mode, requested_model=self._model_id)
+        try:
+            response = await self._complete_traced(
+                messages,
+                trace,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                stop=stop,
+            )
+        except BaseException as exc:
+            finish_trace(
+                trace,
+                outcome="error",
+                error_category=getattr(exc, "category", None) or type(exc).__name__,
+            )
+            raise
+        finish_trace(trace, outcome="ok", served_model=response.model)
+        return response
+
+    async def _complete_traced(
+        self,
+        messages: List[Message],
+        trace: LLMCallTrace,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        json_mode: bool = False,
+        stop: Optional[List[str]] = None,
+    ) -> LLMResponse:
         if self.in_compaction or _in_compaction_call.get():
             # Compacting a request by making a request that needs the same compaction
             # would recurse, so it is refused rather than retried. The dedicated
@@ -503,7 +610,7 @@ class FixedLLMClient:
                 retryable=False,
             )
 
-        prepared = await self._try_preflight(messages)
+        prepared = await self._try_preflight(messages, trace=trace)
 
         attempts = 0
         empty_retries = 0
@@ -516,6 +623,10 @@ class FixedLLMClient:
                 stop=stop,
             )
             estimated = count_request_tokens(prepared)
+            # Described HERE, every time round: after compaction and after an overflow
+            # retry has rebuilt `prepared`, so the trace is of the request on the wire.
+            describe_final_request(trace, prepared, estimated)
+            trace.attempts += 1
 
             try:
                 raw = await self._post("/chat/completions", payload)
@@ -542,7 +653,9 @@ class FixedLLMClient:
                 # A smaller request is required. Retrying the same payload could
                 # only fail the same way, so the retry is built from a harder
                 # reduction and recounted before it is sent.
-                prepared = await self._try_preflight(messages, aggressive=True)
+                trace.overflow_retries = attempts
+                trace.warnings.append("provider_reported_context_overflow")
+                prepared = await self._try_preflight(messages, aggressive=True, trace=trace)
                 if count_request_tokens(prepared) >= estimated:
                     raise LLMError(
                         "The provider reported a context overflow but the request could not "
@@ -564,6 +677,7 @@ class FixedLLMClient:
                     and empty_retries < settings.LLM_EMPTY_CONTENT_MAX_RETRIES
                 ):
                     empty_retries += 1
+                    trace.empty_content_retries = empty_retries
                     record_usage(estimated, raw.get("usage"))
                     # The discarded reply still cost a round trip, so it is still counted.
                     # Without this a task that repeatedly draws empty answers would look
@@ -784,6 +898,7 @@ class FixedLLMClient:
         max_tokens: Optional[int] = None,
         json_mode: bool = False,
         stop: Optional[List[str]] = None,
+        trace: Optional[LLMCallTrace] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """Open one streamed completion and yield each decoded provider chunk.
 
@@ -800,7 +915,9 @@ class FixedLLMClient:
 
         # Preflight runs BEFORE the stream opens, because once the first token
         # has been handed to the caller a retry is no longer transparent.
-        prepared = await self._try_preflight(messages)
+        prepared = await self._try_preflight(messages, trace=trace)
+        if trace is not None:
+            describe_final_request(trace, prepared, count_request_tokens(prepared))
         payload = self._build_payload(
             prepared,
             temperature=temperature,
@@ -825,6 +942,8 @@ class FixedLLMClient:
         send_usage_option = settings.LLM_STREAM_INCLUDE_USAGE and not self._stream_usage_rejected
 
         for attempt in (1, 2):
+            if trace is not None:
+                trace.attempts += 1
             body = dict(payload)
             if not send_usage_option:
                 body.pop("stream_options", None)
@@ -844,6 +963,8 @@ class FixedLLMClient:
                                 and "stream_options" in text
                             ):
                                 self._stream_usage_rejected = True
+                                if trace is not None:
+                                    trace.warnings.append("stream_options_rejected_resent")
                                 logger.warning(
                                     "LLM endpoint rejected stream_options; streamed requests "
                                     "will not carry usage. Accounting for streamed turns will "
@@ -906,18 +1027,34 @@ class FixedLLMClient:
         stop: Optional[List[str]] = None,
     ) -> AsyncIterator[str]:
         """Stream tokens from the single fixed model for chat UIs."""
-        async for chunk in self._iter_stream(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            json_mode=json_mode,
-            stop=stop,
-        ):
-            for choice in chunk.get("choices") or []:
-                delta = choice.get("delta") or {}
-                token = delta.get("content")
-                if token:
-                    yield token
+        trace = new_trace(streaming=True, json_mode=json_mode, requested_model=self._model_id)
+        outcome, category = "ok", None
+        try:
+            async for chunk in self._iter_stream(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                stop=stop,
+                trace=trace,
+            ):
+                trace.served_model = chunk.get("model") or trace.served_model
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    token = delta.get("content")
+                    if token:
+                        yield token
+        except GeneratorExit:
+            # The consumer stopped reading; the stream did not fail and did not finish.
+            outcome = "abandoned_by_consumer"
+            raise
+        except BaseException as exc:
+            outcome, category = "error", getattr(exc, "category", None) or type(exc).__name__
+            raise
+        finally:
+            finish_trace(
+                trace, outcome=outcome, error_category=category, served_model=trace.served_model
+            )
 
     async def stream_complete(
         self,
@@ -936,6 +1073,45 @@ class FixedLLMClient:
         contract the chat loop depends on) exactly as before. `on_token` must be cheap and
         synchronous; an exception it raises is logged and never breaks the request.
         """
+        trace = new_trace(streaming=True, json_mode=json_mode, requested_model=self._model_id)
+        try:
+            response = await self._stream_complete_traced(
+                messages,
+                trace,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                stop=stop,
+                on_token=on_token,
+            )
+        except BaseException as exc:
+            finish_trace(
+                trace,
+                outcome="error",
+                error_category=getattr(exc, "category", None) or type(exc).__name__,
+                served_model=trace.served_model,
+            )
+            raise
+        # A cut-off stream that returned partial text is recorded as incomplete, never as
+        # a clean success: the trace must not say the model finished an answer it did not.
+        finish_trace(
+            trace,
+            outcome="incomplete" if response.incomplete else "ok",
+            served_model=response.model,
+        )
+        return response
+
+    async def _stream_complete_traced(
+        self,
+        messages: List[Message],
+        trace: LLMCallTrace,
+        *,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        json_mode: bool = False,
+        stop: Optional[List[str]] = None,
+        on_token: Optional[Callable[[str], None]] = None,
+    ) -> LLMResponse:
         parts: List[str] = []
         model: Optional[str] = None
         usage: Dict[str, Any] = {}
@@ -949,8 +1125,10 @@ class FixedLLMClient:
                 max_tokens=max_tokens,
                 json_mode=json_mode,
                 stop=stop,
+                trace=trace,
             ):
                 model = chunk.get("model") or model
+                trace.served_model = model
                 if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                     usage = chunk["usage"]
                 for choice in chunk.get("choices") or []:
@@ -982,6 +1160,7 @@ class FixedLLMClient:
             # report a cut-off answer as though the model had never begun. The partial
             # answer is returned, explicitly labelled, with the failure attached so the
             # caller can present it as incomplete rather than as a finished reply.
+            trace.warnings.append(f"stream_ended_early:{type(exc).__name__}")
             logger.warning(
                 "LLM stream ended after %s character(s) with an unfinished answer (%s); "
                 "returning the partial text rather than discarding it.",

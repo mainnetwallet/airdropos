@@ -16,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.models import ImprovementProposal
 
 logger = logging.getLogger(__name__)
@@ -93,9 +94,10 @@ Respond with EXACTLY this JSON:
 }}
 """
         try:
-            result = await llm.complete_json(
-                [Message("system", GENERATOR_SYSTEM_PROMPT), Message("user", user)]
-            )
+            with llm_trace_scope(purpose="self_coding_proposal"):
+                result = await llm.complete_json(
+                    [Message("system", GENERATOR_SYSTEM_PROMPT), Message("user", user)]
+                )
         except LLMError as exc:
             logger.error("Self-coding proposal failed: %s", exc)
             proposal = CodeProposal(

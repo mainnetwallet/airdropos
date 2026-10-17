@@ -40,6 +40,7 @@ from backend.app.agent.discovery import (
 from backend.app.core.config import settings
 from backend.app.core.runlog import clip, param_keys
 from backend.app.llm.client import LLMError, Message, llm
+from backend.app.llm.trace import llm_trace_scope
 from backend.app.models import AirdropCampaign, Task
 from backend.app.models.context import (
     OUTCOME_BLOCKED,
@@ -346,8 +347,11 @@ class AgentController:
         # may have happened, so a second planner call in the same cycle does not re-read
         # the same rows and a context that has moved on is never served stale.
         self._planning_context_cache: Dict[
-            str, Tuple[int, Dict[str, Any], Optional[Dict[str, Any]]]
+            str, Tuple[str, Dict[str, Any], Optional[Dict[str, Any]]]
         ] = {}
+        # Safe trace metadata for the context most recently served per task: versions,
+        # source-record ids and retrieval warnings. Ids and counts only, never content.
+        self._context_trace: Dict[str, Dict[str, Any]] = {}
 
         # Snapshot of the four things that count as progress, taken when an execution
         # window opens so `_window_made_no_progress` can judge it at the end. Without a
@@ -1268,13 +1272,18 @@ class AgentController:
         """
         from backend.app.airdrops.campaign_context import CampaignContextService
 
-        revision = await self._context_revision(task)
+        version = await self.context.context_version(task)
         cached = self._planning_context_cache.get(str(task.id))
-        if cached is not None and cached[0] == revision:
+        if cached is not None and cached[0] == version.generation:
             return cached[1], cached[2]
 
         resolved = await self.context.resolve(task)
         context_payload = resolved.to_prompt_dict()
+        # The versions the payload was built from travel inside it, so the model - and a
+        # reader of the actual request - can see which plan revision this context belongs to.
+        context_payload["task_context_revision"] = version.task_context_revision
+        context_payload["plan_revision"] = version.plan_revision
+        context_payload["context_generation"] = version.generation
 
         # The campaign id comes from the context that was just read, not from a second
         # lookup, so this cannot add a duplicate database read.
@@ -1286,8 +1295,40 @@ class AgentController:
                     await CampaignContextService(self.db).snapshot(campaign)
                 ).to_dict()
 
-        self._planning_context_cache[str(task.id)] = (revision, context_payload, campaign_payload)
+        self._planning_context_cache[str(task.id)] = (
+            version.generation,
+            context_payload,
+            campaign_payload,
+        )
+        self._context_trace[str(task.id)] = {
+            "context_revision": version.task_context_revision,
+            "plan_revision": version.plan_revision,
+            "context_generation": version.generation,
+            "source_ids": resolved.source_ids,
+            "warnings": resolved.retrieval.warnings(),
+        }
         return context_payload, campaign_payload
+
+    def _llm_scope(self, task: Task, purpose: str, **extra: Any):
+        """Trace scope for an LLM request made on this task's behalf.
+
+        Carries the versions and source ids of the context last resolved for the task.
+        Ids and counts only. Anything the caller passes in `extra` overrides them, which is
+        how a call that read fresher state than the cache (the completion judge) reports it.
+        """
+        info = self._context_trace.get(str(task.id), {})
+        fields: Dict[str, Any] = {
+            "purpose": purpose,
+            "task_id": task.task_id,
+            "execution_window": task.execution_windows,
+            "plan_revision": info.get("plan_revision"),
+            "context_revision": info.get("context_revision"),
+            "context_generation": info.get("context_generation"),
+            "source_ids": info.get("source_ids"),
+            "warnings": info.get("warnings"),
+        }
+        fields.update({k: v for k, v in extra.items() if v is not None})
+        return llm_trace_scope(**fields)
 
     async def _context_revision(self, task: Task) -> int:
         """Current write-counter for this task's context. One cheap scalar read.
@@ -1474,14 +1515,15 @@ class AgentController:
                         "Could not store the operator's rules for %s: %s", task.task_id, exc
                     )
             try:
-                revised = await self.planner.replan(
-                    task,
-                    existing,
-                    trigger=ReplanTrigger.OPERATOR_REQUEST,
-                    reason=reason,
-                    context=context_payload,
-                    campaign_context=campaign_payload,
-                )
+                with self._llm_scope(task, "replan_operator_request"):
+                    revised = await self.planner.replan(
+                        task,
+                        existing,
+                        trigger=ReplanTrigger.OPERATOR_REQUEST,
+                        reason=reason,
+                        context=context_payload,
+                        campaign_context=campaign_payload,
+                    )
             except PlanningError as exc:
                 logger.warning(
                     "Could not apply operator guidance to task %s: %s", task.task_id, exc
@@ -1508,13 +1550,14 @@ class AgentController:
             objective = (
                 f"{objective}\n\nOperator guidance given for this task: " + "; ".join(instructions)
             )
-        spec = await self.planner.decompose(
-            objective=objective,
-            task=task,
-            constraints=constraints,
-            context=context_payload,
-            campaign_context=campaign_payload,
-        )
+        with self._llm_scope(task, "plan"):
+            spec = await self.planner.decompose(
+                objective=objective,
+                task=task,
+                constraints=constraints,
+                context=context_payload,
+                campaign_context=campaign_payload,
+            )
         await self.planner.persist_plan(task, spec)
         report.steps.append(
             StepResult(0, "plan created", None, {"steps": len(spec.steps)}, True,
@@ -2139,20 +2182,21 @@ class AgentController:
         context_payload, campaign_payload = await self._resolved_planning_context(task)
 
         try:
-            revised = await self.planner.replan(
-                task,
-                plan,
-                trigger=ReplanTrigger.DISCOVERY,
-                reason=(
-                    f"Executing the plan revealed {len(unaddressed)} requirement(s) that no "
-                    f"current step addresses: "
-                    + "; ".join(r.text[:120] for r in unaddressed[:5])
-                ),
-                context_notes=[r.text for r in unaddressed],
-                evidence=confirmed,
-                context=context_payload,
-                campaign_context=campaign_payload,
-            )
+            with self._llm_scope(task, "replan_discovery"):
+                revised = await self.planner.replan(
+                    task,
+                    plan,
+                    trigger=ReplanTrigger.DISCOVERY,
+                    reason=(
+                        f"Executing the plan revealed {len(unaddressed)} requirement(s) that no "
+                        f"current step addresses: "
+                        + "; ".join(r.text[:120] for r in unaddressed[:5])
+                    ),
+                    context_notes=[r.text for r in unaddressed],
+                    evidence=confirmed,
+                    context=context_payload,
+                    campaign_context=campaign_payload,
+                )
         except PlanningError as exc:
             logger.warning("Discovery replan for %s failed: %s", task.task_id, exc)
             return None
@@ -2512,14 +2556,15 @@ class AgentController:
 
         context_payload, campaign_payload = await self._resolved_planning_context(task)
         try:
-            await self.planner.replan(
-                task,
-                plan,
-                trigger=trigger,
-                reason=reason,
-                context=context_payload,
-                campaign_context=campaign_payload,
-            )
+            with self._llm_scope(task, f"replan_{trigger.value}"):
+                await self.planner.replan(
+                    task,
+                    plan,
+                    trigger=trigger,
+                    reason=reason,
+                    context=context_payload,
+                    campaign_context=campaign_payload,
+                )
         except PlanningError as exc:
             logger.error("Replanning failed for %s: %s", task.task_id, exc)
             report.failures.append(f"Replanning failed: {exc}")
@@ -2975,8 +3020,17 @@ class AgentController:
         if proof is None:
             proof = CompletionProof()
         try:
-            observations = await self.context.observations(task, limit=60)
+            # The recent window alone would hide proof older than it: an action confirmed
+            # many observations ago would read as never done. Older authoritative proof,
+            # failures and unresolved outcomes are retrieved too, within a bound, and
+            # anything that still does not fit is reported rather than dropped.
+            observations, retrieval = await self.context.retrieve_observations(
+                task, recent_limit=60
+            )
             outstanding = await self.context.requirements(task, only_outstanding=True)
+            persisted_plan = await self.planner.current_plan(task)
+            plan_revision = persisted_plan.revision if persisted_plan is not None else None
+            context_version = await self.context.context_version(task)
         except Exception as exc:
             logger.warning("Could not load history for completion judgment: %s", exc)
             return None
@@ -3004,6 +3058,8 @@ class AgentController:
             ],
             "outstanding_requirements": [clip(r.text, 200) for r in outstanding[:10]],
             "outstanding_requirement_count": len(outstanding),
+            "plan_revision": plan_revision,
+            "history_completeness": retrieval.to_dict(),
             # Why the task stopped for the operator and what they did about it: without this
             # the judge sees a gap in the history and cannot tell a manual step the operator
             # completed from one that never happened.
@@ -3040,9 +3096,21 @@ class AgentController:
         )
         await self._release_write_lock()
         try:
-            result = await llm.complete_json(
-                [Message("system", system), Message("user", json.dumps(payload, default=str))]
-            )
+            with self._llm_scope(
+                task,
+                "completion_verification",
+                plan_revision=plan_revision,
+                context_revision=context_version.task_context_revision,
+                context_generation=context_version.generation,
+                source_ids={
+                    "observations": [str(o.id) for o in observations],
+                    "requirements": [str(r.id) for r in outstanding],
+                },
+                warnings=retrieval.warnings(),
+            ):
+                result = await llm.complete_json(
+                    [Message("system", system), Message("user", json.dumps(payload, default=str))]
+                )
         except LLMError as exc:
             logger.warning("Completion judgment unavailable for %s: %s", task.task_id, exc)
             return None
@@ -3130,6 +3198,19 @@ class AgentController:
     async def _checkpoint(self, task: Task, iteration: int, name: str) -> None:
         try:
             plan = await self.planner.current_plan(task)
+            # Which context and which plan row this checkpoint was taken against. Diagnostic
+            # only: resume rebuilds the objective, constraints, requirements, blockers and
+            # evidence from the TaskContext/TaskObservation/TaskRequirement rows, never from here.
+            # Read separately so a failure here can never cost the checkpoint itself.
+            context_fields: Dict[str, Any] = {}
+            try:
+                version = await self.context.context_version(task)
+                context_fields = {
+                    "context_generation": version.generation,
+                    "task_context_revision": version.task_context_revision,
+                }
+            except Exception as exc:
+                logger.warning("Checkpoint for %s saved without a context version: %s", task.task_id, exc)
             await self.checkpoints.save(
                 task,
                 checkpoint_name=name,
@@ -3144,7 +3225,9 @@ class AgentController:
                         # Persisting plan position is what makes resume exact
                         # rather than approximate.
                         "plan_revision": plan.revision if plan else None,
+                        "plan_id": str(plan.id) if plan else None,
                         "plan_steps": plan.steps if plan else [],
+                        **context_fields,
                         # Enough to tell a resumed run where it is in the task's lifetime,
                         # and to keep the window counters from being reset by a restart.
                         "execution_windows": task.execution_windows or 0,

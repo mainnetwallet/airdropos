@@ -345,7 +345,12 @@ async def agent_chat(
 
     try:
         turn = await loop.run(
-            db=db, message=message, history=history, create_task=create_task, images=payload.images
+            db=db,
+            message=message,
+            history=history,
+            create_task=create_task,
+            images=payload.images,
+            conversation_id=str(conversation.id) if conversation is not None else None,
         )
     except Exception as exc:  # the loop is defensive; never silently lose a turn
         logger.exception("Agent chat turn failed")
@@ -431,6 +436,7 @@ async def agent_chat_stream(
                     message=message,
                     history=history,
                     create_task=create_task,
+                    conversation_id=str(conversation.id) if conversation is not None else None,
                     on_event=queue.put_nowait,
                     should_stop=lambda: client_gone,
                     images=payload.images,
