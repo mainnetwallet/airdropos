@@ -256,18 +256,6 @@ export interface AutonomyPolicy {
   note: string
 }
 
-/** A prepared transfer the backend has authorized on its own. */
-export interface AutonomousApproval {
-  tool: string
-  rule_id: string
-  network: string
-  to: string
-  asset: string
-  amount: string
-  estimated_fee_native: string
-  tx_hash?: string
-}
-
 export interface AgentChatResponse {
   reply: string
   tool_calls: AgentToolCall[]

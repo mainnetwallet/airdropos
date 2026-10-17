@@ -114,10 +114,6 @@ export function useStale(q: { isError: boolean; dataUpdatedAt: number }): { stal
   return { stale: q.isError || ageSeconds > 15, ageSeconds }
 }
 
-export function sessionRef(s: Pick<LiveSession, 'integration' | 'key'>): string {
-  return `${s.integration}:${s.key}`
-}
-
 // ---------------------------------------------------------------- elapsed time
 export function useElapsed(session: LiveSession | undefined, fetchedAt: number): number {
   const [now, setNow] = useState(() => Date.now())

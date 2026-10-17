@@ -110,10 +110,6 @@ export function clearSession(): void {
 // `null` until the liveness probe has answered, which it does without credentials.
 let authRequired: boolean | null = null
 
-export function isAuthRequired(): boolean | null {
-  return authRequired
-}
-
 export function setAuthRequired(value: boolean | null): void {
   authRequired = value
 }

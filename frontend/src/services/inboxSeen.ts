@@ -57,10 +57,6 @@ export function markSeen(conversationId: string, at: string) {
   commit(next)
 }
 
-export function lastSeen(conversationId: string): string | null {
-  return seen[conversationId] ?? null
-}
-
 /**
  * A conversation is unread when it holds a message newer than the last time the operator
  * opened it, or when it has messages and has never been opened.
