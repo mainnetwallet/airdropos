@@ -58,7 +58,13 @@ from backend.app.planning.planner import (
 )
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.tasks.checkpoints import CheckpointManager
-from backend.app.tasks.concurrency import LeaseManager, new_run_worker_id
+from backend.app.tasks.concurrency import (
+    DEFAULT_LEASE_TTL_MINUTES,
+    LeaseHeartbeat,
+    LeaseLostError,
+    LeaseManager,
+    new_run_worker_id,
+)
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.recovery import FailureDiagnosisEngine, next_retry_at
 from backend.app.tasks.state_machine import CompletionProof, TaskStatus
@@ -296,6 +302,13 @@ class AgentController:
     `FailureDiagnosisEngine`. This class coordinates them and owns the loop.
     """
 
+    # Execution lease length and heartbeat cadence. Class attributes (not constants buried in the
+    # call) so a test can shorten them; production uses the defaults. The heartbeat is a class
+    # default too, so a controller built without `__init__` still has "no lease to protect".
+    LEASE_TTL_MINUTES: float = DEFAULT_LEASE_TTL_MINUTES
+    LEASE_HEARTBEAT_INTERVAL_SECONDS: Optional[float] = None
+    _heartbeat: Optional[LeaseHeartbeat] = None
+
     def __init__(
         self,
         db: AsyncSession,
@@ -307,6 +320,9 @@ class AgentController:
         self.checkpoints = CheckpointManager(db)
         self.planner = Planner(db, registry)
         self.leases = LeaseManager(db)
+        # Set for the duration of `execute_task`: keeps this run's lease alive and answers whether
+        # the run may still start new side effects.
+        self._heartbeat = None
         self.diagnosis = FailureDiagnosisEngine()
         self.registry = registry
         self.policy = policy
@@ -394,13 +410,26 @@ class AgentController:
         # Captured now: after a rollback the task instance is expired and cannot be read.
         task_pk = task.id
         try:
-            lease = await self.leases.acquire(task, worker_id)
+            lease = await self.leases.acquire(task, worker_id, ttl_minutes=self.LEASE_TTL_MINUTES)
             await self.db.commit()  # publish the lease; do not hold the DB write lock across the run
         except Exception as exc:
             logger.warning("Could not acquire lease for %s: %s", task.task_id, exc)
             report.outcome = LoopOutcome.STOPPED
             report.blockers.append(f"Another worker holds this task: {exc}")
             return report
+
+        # Renew the lease from the background for as long as the run lasts. Before this, it was only
+        # renewed after an iteration finished, so one long LLM or tool call could outlive the TTL
+        # and let another worker take a task that was still running.
+        heartbeat = LeaseHeartbeat(
+            task_pk,
+            task.task_id,
+            lease.lease_token,
+            ttl_minutes=self.LEASE_TTL_MINUTES,
+            interval_seconds=self.LEASE_HEARTBEAT_INTERVAL_SECONDS,
+            expires_at=lease.expires_at,
+        ).start()
+        self._heartbeat = heartbeat
 
         iteration = 0
         abnormal_exit = False
@@ -467,7 +496,13 @@ class AgentController:
             abnormal_exit = True
             raise
         finally:
-            await self._release_lease(task, task_pk, lease, abnormal=abnormal_exit)
+            # Stop renewing BEFORE the lease is given back, and make sure the lease is given back
+            # even if stopping the heartbeat is itself interrupted.
+            try:
+                await heartbeat.stop()
+            finally:
+                self._heartbeat = None
+                await self._release_lease(task, task_pk, lease, abnormal=abnormal_exit)
 
     async def _release_lease(self, task: Task, task_pk, lease, *, abnormal: bool) -> None:
         """Give the lease back so the next attempt is not refused as a conflict.
@@ -525,6 +560,14 @@ class AgentController:
                 report.duration_ms = int((time.perf_counter() - started) * 1000)
                 return report  # the `finally` below releases the lease
 
+            # A lease that is gone (or can no longer be confirmed) ends the run before it plans
+            # anything else: another worker may already own this task.
+            heartbeat = self._heartbeat
+            if heartbeat is not None and not heartbeat.owned:
+                return await self._stop_on_lost_lease(
+                    task, report, started, iteration + 1, heartbeat.lost_reason or "ownership lost"
+                )
+
             iteration += 1
             iteration_started = time.perf_counter()
 
@@ -537,6 +580,13 @@ class AgentController:
                 report.outcome = LoopOutcome.STOPPED
                 report.blockers.append("Execution cancelled.")
                 raise
+            except LeaseLostError as exc:
+                # Raised before a side effect (nothing was started) or after one (its outcome is
+                # unknown). Either way this run no longer owns the task: say exactly which, and
+                # write nothing to the task, which another worker may now be running.
+                return await self._stop_on_lost_lease(
+                    task, report, started, iteration, exc.reason, in_flight=exc.in_flight
+                )
             except LLMError as exc:
                 logger.error(
                     "RUN llm_error task=%s iteration=%s category=%s error=%s",
@@ -602,22 +652,14 @@ class AgentController:
             # The lease return value is checked: a lease taken over by another worker means
             # this run no longer owns the task, and continuing would execute the same task
             # concurrently with the worker that took it.
-            renewed = await self.leases.renew(task, lease.lease_token)
+            renewed = await self.leases.renew(
+                task, lease.lease_token, ttl_minutes=self.LEASE_TTL_MINUTES
+            )
             if not renewed:
-                lost = (
-                    "This run's execution lease was taken over by another worker; it stopped "
-                    "so the same task cannot be executed twice at once."
+                return await self._stop_on_lost_lease(
+                    task, report, started, iteration,
+                    "This run's execution lease was taken over by another worker",
                 )
-                logger.warning("LEASE_LOST task=%s iter=%s", task.task_id, iteration)
-                report.outcome = LoopOutcome.STOPPED
-                report.blockers.append(lost)
-                # Deliberately NOT written to the task: another worker owns it now, and a
-                # checkpoint or blocker from this stale run would sit on top of that worker's
-                # newer one (resume loads the latest checkpoint). What this run did is already
-                # in its execution record; only its own spend, which is purely additive, is kept.
-                await self._flush_telemetry(task)
-                await self.db.commit()
-                return report
 
             if is_terminal:
                 report.outcome = terminal_outcome
@@ -648,6 +690,82 @@ class AgentController:
             clip(report.failures[0] if report.failures else (report.blockers[0] if report.blockers else ""), 300),
         )
         return report
+
+    # ------------------------------------------------------------------
+    async def _stop_on_lost_lease(
+        self,
+        task: Task,
+        report: LoopReport,
+        started: float,
+        iteration: int,
+        reason: str,
+        *,
+        in_flight: Optional[str] = None,
+    ) -> LoopReport:
+        """End the run because it no longer owns the task.
+
+        Deliberately NOT written to the task: another worker owns it now (or will), and a
+        checkpoint or blocker from this stale run would sit on top of that worker's newer one
+        (resume loads the latest checkpoint). What this run did is already in its execution
+        record; only its own spend, which is purely additive, is kept. A step that was marked
+        running stays running: if it can have a side effect, recovery parks the task for the
+        operator to verify rather than repeating it.
+        """
+        lost = (
+            f"This run stopped because it no longer owns the task ({reason}), so the same task "
+            "cannot be executed twice at once."
+        )
+        if in_flight:
+            lost += (
+                f" {in_flight} had already been started when ownership was lost: its outcome is "
+                "UNKNOWN. It may have completed, failed or partly run. It was not assumed to have "
+                "not happened; verify its effect before anything repeats it."
+            )
+        else:
+            lost += " No new operation was started."
+        logger.warning(
+            "LEASE_LOST task=%s iter=%s in_flight=%s reason=%s",
+            task.task_id, iteration, bool(in_flight), clip(reason, 200),
+        )
+        report.outcome = LoopOutcome.STOPPED
+        report.blockers.append(lost)
+        report.duration_ms = int((time.perf_counter() - started) * 1000)
+        await self._flush_telemetry(task)
+        await self.db.commit()
+        return report
+
+    async def _confirm_lease_for_side_effect(self) -> None:
+        """Refuse to START a side-effecting operation unless this run provably owns the task.
+
+        Checked in the database at the moment of the call (which also extends the lease), not
+        from a flag that may be stale. Raises `LeaseLostError`; the caller must not start the
+        operation.
+
+        The check writes from its own session, so anything this run has flushed is committed
+        first: otherwise, on SQLite, the check would queue behind this run's own write lock and
+        wait for a commit that only happens after the check returns.
+        """
+        heartbeat = self._heartbeat
+        if heartbeat is None:
+            return
+        await self._release_write_lock()
+        if not await heartbeat.verify():
+            raise LeaseLostError(heartbeat.lost_reason or "ownership could not be confirmed")
+
+    async def _confirm_lease_after_side_effect(self, what: str) -> None:
+        """After an operation that was already started: is the result still this run's to record?
+
+        The operation is never assumed not to have happened. If ownership is gone the run raises
+        `LeaseLostError` carrying `what` as the in-flight operation of unknown outcome, and
+        records nothing about it on the task.
+        """
+        heartbeat = self._heartbeat
+        if heartbeat is None:
+            return
+        if not await heartbeat.verify():
+            raise LeaseLostError(
+                heartbeat.lost_reason or "ownership could not be confirmed", in_flight=what
+            )
 
     # ------------------------------------------------------------------
     async def _external_stop_reason(self, task: Task) -> Optional[str]:
@@ -1519,6 +1637,10 @@ class AgentController:
                 LoopOutcome.PARTIALLY_COMPLETED,
             )
 
+        # Ownership is confirmed before the step is even marked running, so a run that has lost
+        # the task does not write a "running" mark over whoever owns it now.
+        await self._confirm_lease_for_side_effect()
+
         step.status = "running"
         await self.planner.update_step_status(task, step.index, "running")
         logger.info(
@@ -1709,6 +1831,9 @@ class AgentController:
         # take many seconds (Telegram, browser), so release the lock first or the API, scheduler
         # and heartbeat writers time out with "database is locked".
         await self._release_write_lock()
+        # The last check, immediately before the tool starts. The call itself is never
+        # interrupted once begun: cancelling it would not undo what it already did.
+        await self._confirm_lease_for_side_effect()
         tool_result = await self.registry.invoke(
             step.tool,
             step.parameters,
@@ -1723,6 +1848,12 @@ class AgentController:
             # A tool must not outlive the window it is running in. This is a cap only, so
             # a task near the end of its budget gets shorter waits, never longer ones.
             remaining_budget=self._remaining_window_seconds(iteration),
+        )
+        # The tool ran. If the lease was lost while it did, its outcome (whatever status it
+        # reports) cannot be recorded against a task this run no longer owns, and it must not
+        # be treated as not having happened.
+        await self._confirm_lease_after_side_effect(
+            f"tool '{step.tool}' (step {step.index}, reported {tool_result.status.value})"
         )
         if tool_result.status is ToolResultStatus.SUCCESS:
             logger.info(

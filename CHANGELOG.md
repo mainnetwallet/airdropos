@@ -5,6 +5,29 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (lease heartbeat, ownership loss and atomic recovery claims)
+- **A lease no longer expires under a long LLM or tool call.** It was renewed only after an
+  iteration finished, so one call longer than the TTL let recovery or another worker take a task
+  that was still running. `LeaseHeartbeat` now renews it from a background task with its own
+  session, using the same guarded UPDATE as `renew` (token matches, not released, not expired), so it
+  can never extend another worker's lease or revive one that ran out.
+- **Ownership is checked before every side effect.** The run confirms the lease in the database
+  before a step is marked running and again immediately before the tool starts. A rejected renewal is
+  permanent; a renewal that merely errors is retried, but ownership is only assumed for as long as
+  the last confirmed renewal guarantees, so the run fails closed.
+- **An in-flight call is never assumed not to have happened.** A tool already running is not
+  cancelled. If ownership is lost while it runs, the run stops, records nothing against the task, and
+  reports the outcome as UNKNOWN; the step stays `running`, so recovery parks a side-effecting task
+  for the operator instead of repeating it.
+- **Recovery claims a task atomically before acting.** Two recovery workers that both found a task
+  orphaned (no lease, or an already released one) both recovered it, because `SKIP LOCKED` does nothing
+  on SQLite: the interruption was counted twice and a parked task raised two interventions.
+  Recovery now takes the task's lease as a compare-and-set claim (`try_claim_for_recovery`), committed
+  before any action and released in the same transaction as the outcome. It works the same on SQLite and
+  PostgreSQL. One task failing to recover no longer aborts the rest, and a failed or cancelled recovery
+  releases its claim.
+- Tests: `backend/tests/test_lease_heartbeat_and_recovery_claim.py`.
+
 ### Added (live streaming for the Agent Chat turn)
 - **`POST /agent/chat/stream`** runs the same `ChatToolLoop` turn as `/agent/chat` and delivers it
   as Server-Sent Events: `round_start`, `reply_delta` (the answer as it is written),

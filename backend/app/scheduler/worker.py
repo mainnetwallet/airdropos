@@ -33,7 +33,7 @@ from backend.app.browser.controller import controller as browser_controller
 from backend.app.live import gateway as live_gateway
 from backend.app.scheduler.worker_status import heartbeat_loop, redact, state as worker_state
 from backend.app.security.emergency_stop import emergency_stop
-from backend.app.tasks.concurrency import LeaseManager
+from backend.app.tasks.concurrency import LeaseManager, new_run_worker_id
 from backend.app.tasks.manager import TaskManager
 from backend.app.tasks.state_machine import TaskStatus
 from backend.app.terminal.events import publish_success
@@ -605,89 +605,151 @@ async def recover_interrupted_tasks() -> int:
     from backend.app.planning.planner import Planner
     from backend.app.tools.registry import registry
 
+    # Distinguishes THIS recovery pass from any other worker's, including another pass in this
+    # same process, so two passes can never mistake each other's claim for their own.
+    claimant_id = new_run_worker_id("recovery")
     async with AsyncSessionLocal() as db:
-        # SKIP LOCKED: two recovering workers never settle the same row (no-op on SQLite, where
-        # the guards below carry the safety).
-        interrupted = list(
-            (
+        # SKIP LOCKED is a cheap early filter on PostgreSQL only: SQLite ignores it, and on either
+        # backend its row locks end at the first commit below. The atomic CLAIM taken for each
+        # task is what actually guarantees one recovering worker per task.
+        interrupted = [
+            (row.id, row.task_id)
+            for row in (
                 await db.execute(
-                    select(Task)
+                    select(Task.id, Task.task_id)
                     .where(Task.status == TaskStatus.IN_PROGRESS.value)
                     .with_for_update(skip_locked=True)
                 )
-            ).scalars().all()
-        )
-        manager = TaskManager(db)
-        leases = LeaseManager(db)
+            ).all()
+        ]
         # Bound to the real registry. A Planner built without one sees an empty tool
         # catalog, so any replan it produced would have every tool reference dropped as
         # "unregistered" and the recovered task would lose its tools.
         planner = Planner(db, registry)
+        manager = TaskManager(db)
+        leases = LeaseManager(db)
         queued = parked = failed = 0
-        skipped = 0
-        for task in interrupted:
+        skipped = lost_claim = errors = 0
+        for task_pk, task_label in interrupted:
+            # Fresh read per task (and never a row object that an earlier task's rollback
+            # expired): what this pass decides must rest on the committed state of the row.
+            task = await db.get(Task, task_pk, populate_existing=True)
+            if task is None or task.status != TaskStatus.IN_PROGRESS.value:
+                continue  # settled or removed since it was listed
             # IN_PROGRESS does not mean interrupted: another live worker may be running this very
             # task. Only a task with no live owner is recovered; a stale lease is broken
             # atomically, a live one is left strictly alone (its owner stops on its own if it is
             # in fact dead and the lease runs out, and a later sweep then recovers it).
             orphaned = await leases.break_if_orphaned(task)
             if orphaned is None:
+                await db.commit()
                 skipped += 1
-                logger.info("Recovery skipped %s: a live worker owns it", task.task_id)
-                continue
-            # Re-read: the task may have been settled by its owner since it was listed.
-            await db.refresh(task)
-            if task.status != TaskStatus.IN_PROGRESS.value:
-                continue
-            blocking, resettable = await _inspect_plan_for_recovery(db, task.id)
-
-            if blocking:
-                details = dict(task.error_details or {})
-                details["recovery"] = (
-                    "Worker stopped mid-run with a side-effecting step in flight; parked so it is "
-                    f"not executed again automatically. {blocking}"
-                )[:900]
-                task.error_details = details
-                # Tell the operator in the task's own conversation instead of leaving them to
-                # find this in the Task Manager and work out what happened. This also performs
-                # the NEEDS_USER_ACTION transition and saves a checkpoint.
-                await park_for_intervention(
-                    db,
-                    task,
-                    owner_email=task.owner_email or OPERATOR_FALLBACK_EMAIL,
-                    error_text=(
-                        f"The worker restarted while a side-effecting step was in flight: {blocking}. "
-                        "I stopped this task rather than repeating a step whose real-world outcome "
-                        "I cannot confirm."
-                    ),
-                    error_category="HUMAN_INTERVENTION_REQUIRED",
-                    blocking_step=blocking,
-                    force_reason_code=UNKNOWN_REASON,
-                )
-                parked += 1
+                logger.info("Recovery skipped %s: a live worker owns it", task_label)
                 continue
 
-            for index in resettable:
-                await planner.update_step_status(task, index, "pending")
-            if task.retry_count < task.max_retries:
-                await manager.transition(
-                    task, TaskStatus.RETRYING, reason="worker restarted; run interrupted",
-                    progress=task.progress,
-                )
-                queued += 1
-            else:
-                await manager.transition(
-                    task, TaskStatus.FAILED,
-                    reason="worker restarted; run interrupted (retries exhausted)",
-                    progress=task.progress,
-                )
-                failed += 1
-        await db.commit()
-        if queued or parked or failed or skipped:
+            # CLAIM before acting. Without this, two recovery workers that both found the task
+            # orphaned (no lease at all, or an already released one: nothing was left to break)
+            # both went on to retry it, counting the interruption twice, writing duplicate
+            # transition events and, for a parked task, raising two interventions. The claim is a
+            # compare-and-set that exactly one of them wins, committed so the rest can see it.
+            claim = await leases.try_claim_for_recovery(task, claimant_id)
+            await db.commit()
+            if claim is None:
+                lost_claim += 1
+                logger.info("Recovery skipped %s: another worker is recovering it", task_label)
+                continue
+
+            outcome = None
+            try:
+                # Re-read under the claim: the task may have been settled between listing and
+                # claiming, and only the claim holder may now change it.
+                await db.refresh(task)
+                if task.status != TaskStatus.IN_PROGRESS.value:
+                    await leases.release(task, claim.lease_token)
+                    await db.commit()
+                    continue
+                blocking, resettable = await _inspect_plan_for_recovery(db, task.id)
+
+                if blocking:
+                    details = dict(task.error_details or {})
+                    details["recovery"] = (
+                        "Worker stopped mid-run with a side-effecting step in flight; parked so "
+                        f"it is not executed again automatically. {blocking}"
+                    )[:900]
+                    task.error_details = details
+                    # Tell the operator in the task's own conversation instead of leaving them to
+                    # find this in the Task Manager and work out what happened. This also performs
+                    # the NEEDS_USER_ACTION transition and saves a checkpoint.
+                    await park_for_intervention(
+                        db,
+                        task,
+                        owner_email=task.owner_email or OPERATOR_FALLBACK_EMAIL,
+                        error_text=(
+                            f"The worker restarted while a side-effecting step was in flight: {blocking}. "
+                            "I stopped this task rather than repeating a step whose real-world outcome "
+                            "I cannot confirm."
+                        ),
+                        error_category="HUMAN_INTERVENTION_REQUIRED",
+                        blocking_step=blocking,
+                        force_reason_code=UNKNOWN_REASON,
+                    )
+                    outcome = "parked"
+                else:
+                    for index in resettable:
+                        await planner.update_step_status(task, index, "pending")
+                    if task.retry_count < task.max_retries:
+                        await manager.transition(
+                            task, TaskStatus.RETRYING, reason="worker restarted; run interrupted",
+                            progress=task.progress,
+                        )
+                        outcome = "queued"
+                    else:
+                        await manager.transition(
+                            task, TaskStatus.FAILED,
+                            reason="worker restarted; run interrupted (retries exhausted)",
+                            progress=task.progress,
+                        )
+                        outcome = "failed"
+                # The outcome and the end of the claim commit together: nobody can observe a
+                # recovered task that is still claimed, or a released claim on an unrecovered one.
+                await leases.release(task, claim.lease_token)
+                await db.commit()
+                # Counted only once it is durable.
+                if outcome == "parked":
+                    parked += 1
+                elif outcome == "queued":
+                    queued += 1
+                elif outcome == "failed":
+                    failed += 1
+            except BaseException as exc:
+                # One task failing to recover must not strand the rest, and its half-done writes
+                # must not be committed. The claim is released on its own so the task is not left
+                # unrecoverable until the claim times out. Cancellation gets the same cleanup
+                # and is then re-raised, never swallowed.
+                cancelled = not isinstance(exc, Exception)
+                if not cancelled:
+                    errors += 1
+                    logger.exception("Recovery of %s failed; it stays IN_PROGRESS", task_label)
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.warning("Rollback after a failed recovery of %s failed", task_label)
+                try:
+                    await asyncio.shield(
+                        LeaseManager.release_detached(
+                            task_pk, claim.lease_token, "recovery failed; claim released"
+                        )
+                    )
+                except Exception:
+                    logger.error("Could not release the recovery claim on %s", task_label)
+                if cancelled:
+                    raise
+        if queued or parked or failed or skipped or lost_claim or errors:
             logger.info(
                 "Recovered interrupted tasks: %s queued for retry, %s parked for operator review, "
-                "%s failed (retries exhausted), %s left to a live worker",
-                queued, parked, failed, skipped,
+                "%s failed (retries exhausted), %s left to a live worker, %s claimed by another "
+                "recovery worker, %s errors",
+                queued, parked, failed, skipped, lost_claim, errors,
             )
         return queued
 
