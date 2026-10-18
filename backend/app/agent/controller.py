@@ -240,6 +240,11 @@ from backend.app.inbox.service import (  # noqa: E402
 )
 
 
+# Non-retryable model errors a person can fix (credentials, billing, endpoint/model settings).
+# Every other non-retryable error settles the task as FAILED.
+USER_FIXABLE_LLM_ERRORS = frozenset({"AUTH_FAILURE", "BILLING_REFUSAL", "NOT_FOUND", "MODEL_MISMATCH"})
+
+
 class LoopOutcome(str, Enum):
     COMPLETED = "completed"
     PARTIALLY_COMPLETED = "partially_completed"
@@ -474,28 +479,68 @@ class AgentController:
             # picks it up unchanged. Letting this escape produced a generic "execution
             # raised PlanningError" at the worker and lost the reason entirely.
             category = getattr(exc, "category", "PLANNING")
-            blocker = (
-                f"The configured model was unavailable ({category}) while planning this task, "
-                f"so no step ran in this window: {clip(exc, 300)}. Everything already done is "
-                f"preserved and the task remains queued."
-            )
-            logger.error("RUN pre_plan_failed task=%s category=%s", task.task_id, category)
+            # A PlanningError carries no flag and keeps its old (retryable) treatment.
+            retryable = bool(getattr(exc, "retryable", True))
+            if retryable:
+                blocker = (
+                    f"The configured model was unavailable ({category}) while planning this task, "
+                    f"so no step ran in this window: {clip(exc, 300)}. Everything already done is "
+                    f"preserved and the task remains queued."
+                )
+            elif category in USER_FIXABLE_LLM_ERRORS:
+                blocker = (
+                    f"The configured model refused this task ({category}): {clip(exc, 300)}. "
+                    f"Fix the model settings or account, then resume the task. Nothing ran and "
+                    f"everything already done is preserved."
+                )
+            else:
+                blocker = (
+                    f"The configured model returned an error that retrying cannot fix "
+                    f"({category}): {clip(exc, 300)}. No step ran; the task was stopped."
+                )
+            logger.error("RUN pre_plan_failed task=%s category=%s retryable=%s", task.task_id, category, retryable)
             report.outcome = LoopOutcome.FAILED
             report.blockers.append(blocker)
             await self._record_blocker(task, blocker)
             await self._checkpoint(task, iteration, "pre_plan_failed")
             await self._flush_telemetry(task)
             if task.status == TaskStatus.IN_PROGRESS.value:
-                # Back off like every other retry path. Without a schedule the task was claimable
-                # at once, so a short outage spent the whole retry budget within seconds.
-                task.next_execution_at = next_retry_at(retry_delay_seconds(task.retry_count))
-                await self.tasks.transition(
-                    task,
-                    TaskStatus.RETRYING,
-                    reason=blocker,
-                    next_planned_action="Retry once the configured model is reachable again.",
-                    error_details={"llm_category": category},
-                )
+                details = {"llm_category": category, "llm_retryable": retryable}
+                if retryable:
+                    # Back off like every other retry path. Without a schedule the task was
+                    # claimable at once, so a short outage spent the whole retry budget.
+                    task.next_execution_at = next_retry_at(retry_delay_seconds(task.retry_count))
+                    await self.tasks.transition(
+                        task,
+                        TaskStatus.RETRYING,
+                        reason=blocker,
+                        next_planned_action="Retry once the configured model is reachable again.",
+                        error_details=details,
+                    )
+                elif category in USER_FIXABLE_LLM_ERRORS:
+                    # Retrying cannot help and must not spend the retry budget: park the SAME
+                    # task for the operator. NEEDS_USER_ACTION is not claimable, so nothing
+                    # retries until a person resumes it.
+                    task.next_execution_at = None
+                    task.error_details = details
+                    parked = await self._request_operator_input(
+                        task, iteration=iteration, error_text=blocker, error_category=category
+                    )
+                    if parked is None and task.status == TaskStatus.IN_PROGRESS.value:
+                        # No inbox entry could be raised; still never leave the task IN_PROGRESS.
+                        await self.tasks.transition(
+                            task,
+                            TaskStatus.NEEDS_USER_ACTION,
+                            reason=blocker[:500],
+                            next_planned_action="Fix the model settings or account, then resume the task.",
+                            error_details=details,
+                        )
+                    report.outcome = LoopOutcome.NEEDS_USER_ACTION
+                else:
+                    task.next_execution_at = None
+                    await self.tasks.transition(
+                        task, TaskStatus.FAILED, reason=blocker, error_details=details
+                    )
             await self.db.commit()
             return report
         except BaseException:
