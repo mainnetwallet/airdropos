@@ -42,6 +42,7 @@ from backend.app.inbox.service import (
     APPROVAL_GATED,
     INFORMATION_RESOLVABLE,
     MODEL_VERIFIED_ONLY,
+    REAL_CHECK_REQUIRED,
     effective_reason_code,
     ConversationService,
     InterventionService,
@@ -697,6 +698,16 @@ class ReplyRouter:
                 clarification=clarification, info_saved=info_saved, view=view,
             )
 
+        # Same rule for any reason whose check is real AND conclusive: if the live page still
+        # shows Discord's sign-in form, a confirmation click does not make that go away, and
+        # resuming would send the task straight back into the same wall. An inconclusive check
+        # is treated the same way, because "I could not tell" is not "logged in".
+        if effective_reason_code(request) in REAL_CHECK_REQUIRED:
+            return await self._real_check_still_parked(
+                conversation, task, base, request, result,
+                clarification=clarification, info_saved=info_saved, view=view,
+            )
+
         # The automatic check could not confirm the blocker is gone (or said it is not). That
         # never holds the task back: the operator is the one running this agent, and their
         # reply is the confirmation. The check result is kept in the message as a note, and
@@ -792,6 +803,49 @@ class ReplyRouter:
                 "has not been resumed."
             )
             tail = result.question or "Please reply again and I will re-run the check."
+        return await self._reply_agent(
+            conversation, task, base,
+            f"{noted}{lead}\n\nCheck performed: {result.method}\nResult: {result.outcome}\n\n{tail}",
+            status="NEEDS_MORE_INFO",
+            verification=_verification_view(result),
+            interpretation=view,
+        )
+
+    async def _real_check_still_parked(
+        self,
+        conversation: AgentConversation,
+        task: Task,
+        base: Dict[str, Any],
+        request,
+        result: VerificationResult,
+        *,
+        clarification: Optional[str],
+        info_saved: bool,
+        view: Optional[Dict[str, Any]],
+    ) -> ReplyOutcome:
+        """The real check did not pass, so this task stays exactly where it is.
+
+        Same no-side-effects contract as `_model_still_parked`: nothing about the
+        task, its checkpoints, its retry budget or the open request changes, so
+        the operator can fix the login and confirm again as often as they need.
+        That is what makes repeated confirmation safe -- it can never start a
+        second execution, because it never starts the first.
+        """
+        noted = ""
+        if info_saved:
+            noted = "I have saved the information you gave and will use it once the task can run.\n\n"
+        elif clarification:
+            noted = f"I have recorded your instruction to use {clarification} instead.\n\n"
+        if result.checkable:
+            lead = (
+                f"The check did not pass, so task {task.task_id} has not been resumed."
+            )
+        else:
+            lead = (
+                f"I could not confirm the condition, so task {task.task_id} has not been "
+                "resumed."
+            )
+        tail = result.question or "Please confirm again and I will re-run the check."
         return await self._reply_agent(
             conversation, task, base,
             f"{noted}{lead}\n\nCheck performed: {result.method}\nResult: {result.outcome}\n\n{tail}",

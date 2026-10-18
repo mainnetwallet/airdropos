@@ -632,6 +632,20 @@ class Settings(BaseSettings):
     X_DUPLICATE_WINDOW_HOURS: float = 6.0
 
     # =========================================================================
+    # DISCORD (BROWSER ONLY)
+    # =========================================================================
+    # There is deliberately no DISCORD_BOT_TOKEN for the browser integration and none
+    # is required: a Discord account here is a Chrome profile the operator signed into
+    # by hand. The bot-token settings further up stay supported for the legacy bot
+    # router only, which never connects.
+    #
+    # Fallback duplicate-send window, in hours. The live value is the stored setting
+    # `discord.duplicate_window_hours`. 0 allows a deliberate repeat of a KNOWN
+    # completed send; it never permits repeating one whose outcome is unknown, which
+    # stays blocked for as long as the record exists.
+    DISCORD_DUPLICATE_WINDOW_HOURS: float = 6.0
+
+    # =========================================================================
     # BROWSER AUTOMATION (PLAYWRIGHT)
     # =========================================================================
     BROWSER_HEADLESS: bool = True

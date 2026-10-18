@@ -56,6 +56,17 @@ import type {
   XOverview,
   XTestResult,
 } from '@/types/x'
+import type {
+  DiscordActivityRecord,
+  DiscordCatalog,
+  DiscordCreateTaskInput,
+  DiscordCreateTaskResult,
+  DiscordLoginStateResponse,
+  DiscordOpenProfileResponse,
+  DiscordOverview,
+  DiscordProfile,
+  DiscordTask,
+} from '@/types/discord'
 
 /** Query-string builder shared by the list endpoints that take filters. */
 function buildQuery(params: Record<string, string | number | undefined | null>): string {
@@ -665,6 +676,59 @@ export const api = {
       note: string
     }>(`/x/activity${buildQuery(params)}`),
   xCatalog: () => request<XCatalog>('/x/catalog'),
+
+  // --- Discord integration -------------------------------------------------
+  // Browser-only: these calls carry a browser profile id and nothing else. There is
+  // no token, secret or credential to send, because the Discord integration stores
+  // none - an account is a Chrome profile the operator signed into by hand.
+  discordStatus: () => request<DiscordOverview>('/discord/status'),
+  discordCatalog: () => request<DiscordCatalog>('/discord/catalog'),
+  discordProfiles: () =>
+    request<{
+      profiles: DiscordProfile[]
+      count: number
+      default_agent_profile_id: string
+      manage_url: string
+      note: string
+    }>('/discord/profiles'),
+  /** Start (or reuse) a profile's browser on discord.com. */
+  openDiscordProfile: (profileId: string, url?: string) =>
+    request<DiscordOpenProfileResponse>(`/discord/profiles/${encodeURIComponent(profileId)}/open`, {
+      method: 'POST',
+      body: JSON.stringify({ url: url ?? '' }),
+    }),
+  /**
+   * Ask the worker to read one profile's real Discord login state.
+   *
+   * An explicit operator read, never a poll: a healthy session produces no
+   * background traffic. `UNKNOWN` is a legitimate answer.
+   */
+  discordLoginState: (profileId: string) =>
+    request<DiscordLoginStateResponse>(
+      `/discord/profiles/${encodeURIComponent(profileId)}/login-state`,
+    ),
+  createDiscordTask: (body: DiscordCreateTaskInput) =>
+    request<DiscordCreateTaskResult>('/discord/tasks', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  discordTasks: (params: { limit?: number; browser_profile_id?: string } = {}) =>
+    request<{ tasks: DiscordTask[]; count: number }>(`/discord/tasks${buildQuery(params)}`),
+  discordTask: (taskId: string) =>
+    request<{ task: DiscordTask }>(`/discord/tasks/${encodeURIComponent(taskId)}`),
+  discordActivity: (
+    params: { limit?: number; browser_profile_id?: string; operation?: string; status?: string; task_id?: string } = {},
+  ) =>
+    request<{
+      activity: DiscordActivityRecord[]
+      filters: Record<string, string>
+      note: string
+    }>(`/discord/activity${buildQuery(params)}`),
+  setDiscordDuplicateWindow: (hours: number) =>
+    request<{ duplicate_window_hours: number }>('/discord/duplicate-window', {
+      method: 'POST',
+      body: JSON.stringify({ hours }),
+    }),
 }
 
 // --- Live Broadcast ----------------------------------------------------------

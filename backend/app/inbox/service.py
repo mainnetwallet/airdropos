@@ -50,6 +50,7 @@ class InterventionReason(str, Enum):
     MISSING_AUTHENTICATION = "MISSING_AUTHENTICATION"
     TELEGRAM_SESSION_UNAVAILABLE = "TELEGRAM_SESSION_UNAVAILABLE"
     BROWSER_SESSION_UNAVAILABLE = "BROWSER_SESSION_UNAVAILABLE"
+    DISCORD_LOGIN_REQUIRED = "DISCORD_LOGIN_REQUIRED"
     EXTENSION_INSTALL_REQUIRED = "EXTENSION_INSTALL_REQUIRED"
     HUMAN_VERIFICATION = "HUMAN_VERIFICATION"
     MISSING_CONFIGURATION = "MISSING_CONFIGURATION"
@@ -70,6 +71,7 @@ class InterventionReason(str, Enum):
 MISSING_AUTHENTICATION = InterventionReason.MISSING_AUTHENTICATION.value
 TELEGRAM_SESSION_UNAVAILABLE = InterventionReason.TELEGRAM_SESSION_UNAVAILABLE.value
 BROWSER_SESSION_UNAVAILABLE = InterventionReason.BROWSER_SESSION_UNAVAILABLE.value
+DISCORD_LOGIN_REQUIRED = InterventionReason.DISCORD_LOGIN_REQUIRED.value
 EXTENSION_INSTALL_REQUIRED = InterventionReason.EXTENSION_INSTALL_REQUIRED.value
 HUMAN_VERIFICATION = InterventionReason.HUMAN_VERIFICATION.value
 MISSING_CONFIGURATION = InterventionReason.MISSING_CONFIGURATION.value
@@ -92,6 +94,12 @@ LLM_REASON_BY_CATEGORY = {
     "NOT_FOUND": LLM_NOT_FOUND,
     "MODEL_MISMATCH": LLM_MODEL_MISMATCH,
 }
+
+# The `error_category` the Discord browser adapter sets when it has positively
+# observed Discord's sign-in form. Duplicated as a literal here on purpose:
+# `integrations.discord.browser` imports this module, so importing the constant back
+# from there would be circular.
+DISCORD_CATEGORY = "DISCORD_LOGIN_REQUIRED"
 
 
 def classify_llm_reason(category: Optional[str]) -> Optional[str]:
@@ -121,6 +129,7 @@ MACHINE_VERIFIABLE = frozenset(
         MISSING_AUTHENTICATION,
         TELEGRAM_SESSION_UNAVAILABLE,
         BROWSER_SESSION_UNAVAILABLE,
+        DISCORD_LOGIN_REQUIRED,
         EXTENSION_INSTALL_REQUIRED,
         HUMAN_VERIFICATION,
         MISSING_CONFIGURATION,
@@ -131,12 +140,25 @@ MACHINE_VERIFIABLE = frozenset(
     }
 )
 
-# Reasons that are cleared ONLY by a successful probe of the configured model. An operator's
+# Reasons cleared ONLY by a successful probe of the configured model. An operator's
 # reply is never accepted in place of the check: a reply that "I fixed it" resumed the task
 # straight into the same refusal, which is exactly what these reasons exist to prevent.
 MODEL_VERIFIED_ONLY = frozenset(
     {LLM_AUTH_FAILURE, LLM_BILLING_REFUSAL, LLM_NOT_FOUND, LLM_MODEL_MISMATCH}
 )
+
+# Reasons where a real check is available AND conclusive, so its verdict is the verdict.
+#
+# Everywhere else in MACHINE_VERIFIABLE the default is that the operator's word wins over a
+# failed check, because those checks can only observe a session status and a human is a better
+# reader of their own browser than a status field. That default is wrong here: the Discord
+# verifier reads the actual discord.com page, so a conclusive negative is real evidence that
+# the account is still signed out, and an inconclusive one is real uncertainty. Neither may be
+# overridden by a confirmation button.
+#
+# This is the same principle as INFORMATION_RESOLVABLE states in the other direction: "I logged
+# in" is a claim, and only a real check may satisfy it.
+REAL_CHECK_REQUIRED = frozenset({DISCORD_LOGIN_REQUIRED})
 
 # Reasons that are a deliberate human decision: an operator pause or an approval. Only an
 # explicit instruction ("resume this task") given through the authorisation flow clears one.
@@ -206,6 +228,14 @@ def classify_reason(error_text: str, error_category: Optional[str] = None) -> st
     text = (error_text or "").lower()
     if error_category:
         text = f"{text} {error_category.lower()}"
+
+    # Checked before the text signatures. A Discord login wall is raised ONLY from
+    # positive evidence by `integrations.discord.browser`, so when the adapter says this
+    # category it is a fact about the page, not a guess at one. Letting the generic
+    # "not logged in" wording below decide instead would let an unrelated failure that
+    # happened to contain those words be parked as a Discord login request.
+    if error_category == DISCORD_CATEGORY:
+        return DISCORD_LOGIN_REQUIRED
 
     for reason, needles in _REASON_SIGNATURES:
         if any(needle in text for needle in needles):

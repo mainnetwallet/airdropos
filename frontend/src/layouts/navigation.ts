@@ -17,6 +17,7 @@ import {
   Layers,
   LifeBuoy,
   ListChecks,
+  MessagesSquare,
   Radio,
   RadioTower,
   Send,
@@ -68,6 +69,10 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
       // X.com is its own integration rather than a tab on Social Monitors: it has
       // browser profiles, API credentials and a routing preference of its own.
       { to: '/x', label: 'X.com Integration', icon: Twitter },
+      // Discord is its own page rather than a tab on Social Monitors: it runs on
+      // persistent browser profiles with their own accounts, and it has a login
+      // recovery flow the other social pages do not have.
+      { to: '/discord', label: 'Discord Integration', icon: MessagesSquare },
       { to: '/telegram', label: 'Telegram Integration', icon: Send },
     ],
   },
@@ -121,6 +126,7 @@ export const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
   ['/airdrops', 'airdrops'],
   ['/telegram', 'airdrops'],
   ['/x', 'airdrops'],
+  ['/discord', 'airdrops'],
   ['/tasks', 'tasks'],
   ['/tools', 'tasks'],
   ['/goals', 'tasks'],

@@ -333,6 +333,32 @@ def build_app() -> FastAPI:
         except Exception as exc:
             raise _guard(exc)
 
+    @app.get("/discord/profiles/{profile_id}/login-state", dependencies=deps)
+    async def discord_login_state(profile_id: str) -> Dict[str, Any]:
+        """Whether this browser profile is signed in to discord.com.
+
+        Runs in the WORKER because that is where the Playwright page lives: the
+        API process has no browser and cannot answer this. Deliberately a read
+        only - it never navigates, never types, and is not called on a timer. It
+        exists so an operator's "I have logged in" is answered by looking at the
+        real page rather than taken on trust.
+        """
+        from backend.app.browser import profiles as profile_store
+        from backend.app.integrations.discord import browser as discord_browser
+
+        try:
+            key = profile_store.normalize_session_key(profile_id)
+            return await discord_browser.check_login(key)
+        except discord_browser.DiscordBrowserError as exc:
+            # No browser open for this profile, or an operator has it paused. A
+            # definite, explainable answer - not a 500 and never a guess.
+            return {"ok": False, "login_state": {"state": discord_browser.NO_BROWSER,
+                                                  "detail": str(exc)}}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _guard(exc)
+
     @app.delete("/events", dependencies=deps)
     async def clear_events() -> Dict[str, Any]:
         return {"cleared": hub.events.clear()}

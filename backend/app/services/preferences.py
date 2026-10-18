@@ -27,6 +27,13 @@ X_EXECUTION_PREFERENCE = "x.execution_preference"
 X_BROWSER_PROFILE_ID = "x.browser_profile_id"
 X_DUPLICATE_WINDOW_HOURS = "x.duplicate_window_hours"
 
+# Discord is browser-only and has no per-integration profile PIN: every Discord task
+# names its own browser profile explicitly, so there is no "which account is the
+# default" to store. What it does need is the duplicate-send window, stored here for
+# the same reason as the X one - the API and the worker are separate processes and
+# must agree on it.
+DISCORD_DUPLICATE_WINDOW_HOURS = "discord.duplicate_window_hours"
+
 
 async def get_preference(db: AsyncSession, key: str, default: str = "") -> str:
     """Read one preference. An unreadable or corrupt row returns the default."""

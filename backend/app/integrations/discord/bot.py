@@ -1,7 +1,23 @@
-"""Discord Bot Integration.
+"""The Discord BOT interface - legacy, and not the way Discord is driven.
 
-Shares the same database, task engine, and agent controller as the web dashboard.
-A task created here is immediately visible there and vice versa.
+**This module is not how AirdropOS uses Discord.** The working integration is
+browser-only: :mod:`backend.app.integrations.discord.browser` drives the ordinary
+discord.com web app through the operator's own persistent Chrome profiles, which
+they sign into by hand.
+
+What is still here
+------------------
+The original bot command router, preserved unchanged so that
+``from backend.app.integrations.discord import discord_bot`` keeps resolving for
+anything that referenced it. It has never connected: ``start_polling`` reports
+``False`` and ``health`` reports ``NOT_IMPLEMENTED``, which is an honest description
+rather than a stub pretending to work.
+
+Deliberately not extended
+-------------------------
+No bot token is required for, or used by, the browser integration. Do not add one:
+a bot posts as a bot, cannot read the operator's existing DMs or private channels,
+and would be a second, differently-authorised identity on the same server.
 """
 
 from __future__ import annotations

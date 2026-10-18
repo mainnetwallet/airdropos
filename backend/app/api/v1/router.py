@@ -7,6 +7,7 @@ from backend.app.api.v1.endpoints import (
     auth,
     browser_profiles,
     campaigns,
+    discord,
     inbox,
     live,
     knowledge,
@@ -34,3 +35,4 @@ api_router.include_router(ws.router)
 api_router.include_router(live.router)
 api_router.include_router(browser_profiles.router)
 api_router.include_router(x_integration.router)
+api_router.include_router(discord.router)

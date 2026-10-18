@@ -41,6 +41,9 @@ from backend.app.models.x_integration import (
     XActivityRecord,
     XApiConfiguration,
 )
+from backend.app.models.discord_integration import (
+    DiscordActivityRecord,
+)
 from backend.app.models.scheduler import (
     AutomationSchedule,
     ScheduledRun,
@@ -118,4 +121,5 @@ __all__ = [
     "InterventionRequest",
     "XApiConfiguration",
     "XActivityRecord",
+    "DiscordActivityRecord",
 ]

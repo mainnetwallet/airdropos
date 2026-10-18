@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.inbox.service import (
     BROWSER_SESSION_UNAVAILABLE,
+    DISCORD_LOGIN_REQUIRED,
     EXTENSION_INSTALL_REQUIRED,
     HUMAN_VERIFICATION,
     LLM_AUTH_FAILURE,
@@ -75,8 +76,11 @@ class VerificationResult:
         return cls(ok=False, method=method, outcome=outcome, checkable=True, question=question, detail=dict(detail))
 
     @classmethod
-    def unchecked(cls, method: str, outcome: str, question: str) -> "VerificationResult":
-        return cls(ok=False, method=method, outcome=outcome, checkable=False, question=question)
+    def unchecked(cls, method: str, outcome: str, question: str, **detail: object) -> "VerificationResult":
+        return cls(
+            ok=False, method=method, outcome=outcome, checkable=False,
+            question=question, detail=dict(detail),
+        )
 
 
 Verifier = Callable[[AsyncSession, Task, InterventionRequest], Awaitable[VerificationResult]]
@@ -305,6 +309,22 @@ SESSION_PAUSED = "paused"
 KNOWN_SESSION_STATUSES = frozenset(
     {SESSION_OK, SESSION_WAITING, SESSION_STOPPED, SESSION_FAILED, SESSION_PAUSED}
 )
+
+
+def _discord_profile_from_ref(integration_ref: Optional[str]) -> Optional[str]:
+    """Recover the browser profile id from an ``integration_ref``.
+
+    Only a ``browser:`` ref names a profile. A Telegram session ref names an
+    account, and reading its key as a profile id would send the operator to open
+    the wrong thing.
+    """
+    raw = str(integration_ref or "").strip()
+    if ":" not in raw:
+        return None
+    integration, _, key = raw.partition(":")
+    if integration != "browser" or not key:
+        return None
+    return key
 
 
 def _extract_session(payload: Any) -> Optional[Dict[str, Any]]:
@@ -691,10 +711,124 @@ async def _verify_llm_model(
     )
 
 
+async def _verify_discord_login(
+    db: AsyncSession, task: Task, request: InterventionRequest
+) -> VerificationResult:
+    """Look at the real discord.com page before believing "I have logged in".
+
+    The operator's confirmation is a CLAIM. This is the check. It runs in the
+    worker (the API process has no browser), reads the live page, and only
+    reports success on positive evidence that the profile is signed in.
+
+    An unreadable page is INCONCLUSIVE, not a failure and not a pass. That
+    distinction is the whole point: a Discord error page or a dead connection is
+    not evidence of a logout, and treating it as one would keep asking a person
+    to sign in to an account that is already fine.
+    """
+    from backend.app.live import client as gateway
+
+    ref = str(request.integration_ref or "")
+    profile_id = _discord_profile_from_ref(ref)
+    if not profile_id:
+        return VerificationResult.unchecked(
+            method=NOT_CHECKED,
+            outcome="This request does not name a browser profile, so Discord cannot be checked.",
+            question="Which browser profile did you log in on?",
+        )
+
+    try:
+        payload = await gateway.get_json(f"/discord/profiles/{profile_id}/login-state")
+    except gateway.GatewayUnavailable as exc:
+        return VerificationResult.unchecked(
+            method="discord_login_state",
+            outcome=f"The worker is not reachable, so the Discord session cannot be inspected ({exc}).",
+            question=(
+                "I cannot look at the Discord page right now. Leave this request open and try "
+                "again in a moment; the task will stay paused until then."
+            ),
+        )
+    except gateway.GatewayError as exc:
+        return VerificationResult.unchecked(
+            method="discord_login_state",
+            outcome=f"The worker answered {exc.status} ({exc.code}).",
+            question="I could not read the Discord page. Please try again in a moment.",
+        )
+    except Exception as exc:
+        return VerificationResult.unchecked(
+            method="discord_login_state",
+            outcome=f"The Discord check could not run: {type(exc).__name__}.",
+            question="I could not read the Discord page. Please try again in a moment.",
+        )
+
+    state = payload.get("login_state") if isinstance(payload, dict) else None
+    if not isinstance(state, dict) or not state.get("state"):
+        return VerificationResult.unchecked(
+            method="discord_login_state",
+            outcome="The worker did not report a Discord session state.",
+            question="I could not read the Discord page. Please try again in a moment.",
+        )
+
+    reading = str(state.get("state") or "")
+    indicator = str(state.get("indicator") or "")
+    detail = str(state.get("detail") or "")
+
+    if reading == "LOGGED_IN":
+        return VerificationResult.satisfied(
+            method="discord_login_state",
+            outcome=(
+                "Discord reports this profile is signed in"
+                + (f" (checked {indicator})." if indicator else ".")
+            ),
+            profile_id=profile_id,
+            indicator=indicator,
+        )
+
+    if reading == "LOGGED_OUT":
+        return VerificationResult.failed(
+            method="discord_login_state",
+            outcome=(
+                "Discord is still showing its sign-in form for this profile"
+                + (f" (checked {indicator})." if indicator else ".")
+                + " The task stays paused."
+            ),
+            question=(
+                "Discord still asks this profile to sign in. Open Discord browser, finish "
+                "logging in, then press 'I have logged in — Resume task' again."
+            ),
+            profile_id=profile_id,
+            indicator=indicator,
+        )
+
+    if reading == "NO_BROWSER":
+        return VerificationResult.failed(
+            method="discord_login_state",
+            outcome="There is no browser running for this profile, so I cannot check Discord.",
+            question="Press 'Open Discord browser' first, then log in and confirm again.",
+            profile_id=profile_id,
+        )
+
+    # UNKNOWN. Honest, and deliberately not a pass and not a logout.
+    return VerificationResult.unchecked(
+        method="discord_login_state",
+        outcome=(
+            "I could not determine whether Discord is signed in"
+            + (f": {detail}" if detail else ".")
+            + " The task stays paused rather than resuming on an unverified assumption."
+        ),
+        question=(
+            "Open Discord browser and check whether you are signed in. If you are, press "
+            "'I have logged in — Resume task' again; if Discord is showing an error page, "
+            "that is a different problem and this check will keep waiting."
+        ),
+        profile_id=profile_id,
+    )
+
+
 def register_default_verifiers() -> None:
     """Install the built-in verifiers. Safe to call more than once."""
     register(TELEGRAM_SESSION_UNAVAILABLE, _verify_telegram_session)
     register(BROWSER_SESSION_UNAVAILABLE, _verify_live_session)
+    register(DISCORD_LOGIN_REQUIRED, _verify_discord_login)
     register(EXTENSION_INSTALL_REQUIRED, _verify_extension_installed)
     register(HUMAN_VERIFICATION, _verify_live_session)
     register(MISSING_AUTHENTICATION, _verify_authentication)

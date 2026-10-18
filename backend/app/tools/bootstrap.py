@@ -17,6 +17,7 @@ from backend.app.tools.arithmetic_tools import VERIFICATION_TOOLS
 from backend.app.tools.blockchain_tools import register_blockchain_tools
 from backend.app.tools.browser_tools import register_browser_tools
 from backend.app.tools.diagnostic_tools import register_diagnostic_tools
+from backend.app.tools.discord_tools import register_discord_tools
 from backend.app.tools.miniapp_tools import MINIAPP_TOOLS
 from backend.app.tools.notification_tools import register_notification_tools
 from backend.app.tools.registry import AuthorizationPolicy, registry
@@ -69,6 +70,12 @@ def bootstrap_tools() -> None:
     # whether the API or a browser profile can run, and the permission policy
     # below is what actually lets the agent use them.
     register_x_tools(registry)
+    # Discord. Browser-only, on the operator's own signed-in Chrome profiles, so
+    # there is no credential to gate on - which is why this registers
+    # unconditionally like X. Whether a Discord ACTION is permitted is decided by the
+    # permission policy below, and whether it may SEND at all is decided again, from
+    # the operator's own wording, inside the tool.
+    register_discord_tools(registry)
     telegram_user_enabled = register_telegram_user_tools(registry)
 
     # The rest of the Telegram family: session/account, bot discovery and commands,
@@ -123,6 +130,15 @@ def bootstrap_tools() -> None:
         # to drive a browser.
         "x.read",
         "x.write",
+        # Discord reads (open the app, list servers, open a channel, read, search,
+        # find unanswered questions, verify a send) and Discord writes (send a
+        # message, reply, join a server, leave one). As with X, a write-capable tool
+        # also declares the browser permission it needs, because Discord is driven
+        # through a signed-in browser profile. Granting `discord.*` alone does not
+        # let the agent drive a browser, and `discord.write` does not by itself
+        # override the read-only boundary the tools enforce from the task wording.
+        "discord.read",
+        "discord.write",
         "wallet.read",
         "wallet.write",
         "task.read",

@@ -27,6 +27,7 @@ from backend.app.inbox import events
 from backend.app.inbox.service import (
     AMBIGUOUS_INSTRUCTION,
     BROWSER_SESSION_UNAVAILABLE,
+    DISCORD_LOGIN_REQUIRED,
     EXTENSION_INSTALL_REQUIRED,
     HUMAN_APPROVAL,
     HUMAN_VERIFICATION,
@@ -73,6 +74,27 @@ def guidance_for(reason_code: str, error_text: str, integration_ref: Optional[st
             "how_verified": (
                 "I will reconnect to Telegram and ask it directly whether the session is "
                 "authorised, then resume only if it says yes."
+            ),
+        }
+
+    if reason_code == DISCORD_LOGIN_REQUIRED:
+        return {
+            "required_action": (
+                "Log in to Discord in the browser profile this task uses, then confirm."
+            ),
+            "where_to_act": common_where,
+            "instructions": [
+                "Press 'Open Discord browser' below to bring up the right profile on discord.com.",
+                "Log in to Discord yourself. I will not type your password, pass MFA or "
+                "extract the session.",
+                "Press 'I have logged in — Resume task'. I will re-check the live session "
+                "before resuming anything.",
+            ],
+            "how_verified": (
+                "I will read the live Discord page and confirm this profile is signed in "
+                "before I resume. Your confirmation starts the check; it is not itself "
+                "treated as proof, and if the session is still signed out the task stays "
+                "paused with an explanation."
             ),
         }
 
