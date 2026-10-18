@@ -553,15 +553,41 @@ class BrowserController:
 
         lock = chrome.profile_lock(user_data_dir)
         if lock["locked"]:
-            detail = (
-                f"This Chrome profile is already open in another process: {lock['reason']} "
-                "Close that window (or reconnect to it) before starting a session here."
-            )
+            # Two different situations, and the operator is told which. A LIVE owner
+            # needs closing. An UNVERIFIED lock (no psutil, a marker from another host,
+            # an owner we cannot inspect) is not the same thing and must not be
+            # described as if another window were definitely open.
+            if lock.get("verified"):
+                detail = (
+                    f"This Chrome profile is already open in another process: {lock['reason']} "
+                    "Close that window (or reconnect to it) before starting a session here."
+                )
+            else:
+                detail = (
+                    f"This Chrome profile cannot be verified as free: {lock['reason']} "
+                    "AirdropOS will not guess, because starting a second Chrome on one profile "
+                    "corrupts it. Close any Chrome using this profile and try again."
+                )
             self._last_error = detail
             profile_store.record_use(session_key, error=detail)
-            hub.browser_sessions.mark_error(session_key, "Chrome profile is already in use")
-            logger.warning("Refusing to launch locked profile '%s': %s", session_key, lock["reason"])
+            hub.browser_sessions.mark_error(
+                session_key,
+                "Chrome profile is already in use" if lock.get("verified")
+                else "Chrome profile lock could not be verified",
+            )
+            logger.warning(
+                "Refusing to launch profile '%s' (verified=%s stale=%s): %s",
+                session_key, lock.get("verified"), lock.get("stale"), lock["reason"],
+            )
             return None
+        if lock.get("stale"):
+            # Not a warning and nothing is deleted: Chrome removes its own markers on
+            # exit, and it takes a stale lock over on launch. AirdropOS only declines
+            # to block, and says so, rather than pretending the profile was clean.
+            logger.info(
+                "Proceeding with profile '%s' despite a stale Chrome lock (%s): %s",
+                session_key, ", ".join(lock.get("markers") or []), lock.get("reason"),
+            )
         try:
             user_data_dir = chrome.ensure_profile_dir(user_data_dir)
         except OSError as exc:

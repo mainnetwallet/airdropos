@@ -19,6 +19,25 @@ What is genuinely supported, and what is not
 * Programmatic installation from the Chrome Web Store is NOT automated. Chrome shows
   an "Add to Chrome" confirmation that the user must accept; the browser tools pause
   the session for that click and verify the result afterwards.
+
+Ownership of a profile directory
+--------------------------------
+``profile_lock`` answers one question: is a LIVE Chrome using this directory?
+
+Lock MARKERS (``lockfile``, ``SingletonLock``, ...) are evidence, not proof, and this
+module deliberately never deletes them. Chrome holds its own exclusive lock while
+running, removes its markers on a clean exit, and takes a stale lock over on launch -
+verified against real Chrome for both an empty ``lockfile`` and one naming a dead pid.
+So the only thing AirdropOS has to get right is the DECISION, and the rule is:
+
+* a live owner process, or ownership that cannot be determined at all -> refuse
+* markers whose recorded owner is provably gone, and a trustworthy process scan
+  -> let Chrome try; it recovers the lock itself
+
+That distinction is what stops a killed Chrome's leftovers from locking a profile for
+ever, without ever risking a second Chrome on a directory that is genuinely in use.
+Recovery is therefore safe against a Chrome that happens to be starting at the same
+moment: nothing is removed from underneath it.
 """
 
 from __future__ import annotations
@@ -353,14 +372,29 @@ def chrome_processes_for(user_data_dir: str) -> List[Dict[str, Any]]:
     Used for profile-lock detection and, when AirdropOS stops a managed profile, for
     terminating only the processes it started. A user's own Chrome, running a different
     profile, is never matched and never touched.
+
+    NOTE: an empty result means "none found" *or* "could not look". Use
+    :func:`scan_profile_owners` when that distinction matters - it is the difference
+    between recovering a stale lock and deleting a live one.
+    """
+    return scan_profile_owners(user_data_dir)[1]
+
+
+def scan_profile_owners(user_data_dir: str) -> Tuple[bool, List[Dict[str, Any]]]:
+    """Find owning Chrome processes, and report whether the scan was trustworthy.
+
+    Returns ``(reliable, processes)``. ``reliable`` is False when psutil is not
+    installed or the enumeration raised. That distinction is load-bearing: treating
+    "could not look" as "found nobody" is what turns stale-lock recovery into a way
+    to steal a profile somebody else is using.
     """
     try:
         import psutil  # optional dependency
     except Exception:
-        return []
+        return False, []
     target = _norm_dir(user_data_dir)
     if not target:
-        return []
+        return False, []
     found: List[Dict[str, Any]] = []
     try:
         # ad_value=None: a process we may not inspect (another user's, or a protected one)
@@ -378,34 +412,306 @@ def chrome_processes_for(user_data_dir: str) -> List[Dict[str, Any]]:
                 if len(found) >= 16:
                     break
     except Exception:
-        return found
-    return found
+        # Partial results, but the enumeration did not finish: not trustworthy.
+        return False, found
+    return True, found
+
+
+def process_uses_profile(pid: Any, user_data_dir: str) -> Optional[bool]:
+    """Whether ``pid`` is a Chrome running exactly this profile directory.
+
+    Returns ``True``/``False``, or ``None`` when the process cannot be inspected at
+    all. ``None`` is the answer that must never be collapsed into ``False``: an
+    unreadable process could be the real owner.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        proc = psutil.Process(int(pid))
+        name = (proc.name() or "").lower()
+        if "chrome" not in name and "chromium" not in name:
+            return False
+        cmdline = proc.cmdline()
+    except Exception:
+        return None
+    if not cmdline:
+        return None
+    return _command_line_uses_profile(list(cmdline), _norm_dir(user_data_dir))
+
+
+def process_alive(pid: Any) -> Optional[bool]:
+    """Whether ``pid`` is a live process. ``None`` when that cannot be determined.
+
+    A ZOMBIE counts as dead. It has already exited and only waits to be reaped, so it
+    cannot own a profile directory - but psutil reports ``is_running()`` as True for
+    one. Treating that as alive would let a crashed-and-unreaped worker keep a profile
+    locked until someone reaps it.
+    """
+    try:
+        import psutil
+    except Exception:
+        return None
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        if not psutil.pid_exists(pid):
+            return False
+        proc = psutil.Process(pid)
+        if not proc.is_running():
+            return False
+        try:
+            if proc.status() == psutil.STATUS_ZOMBIE:
+                return False
+        except Exception:
+            # Status unavailable; fall through to the liveness answer we do have.
+            pass
+        return True
+    except Exception:
+        return None
+
+
+#: No mainstream OS allocates a pid anywhere near this. Linux caps at ``pid_max``
+#: (2**22 by default), Windows well under 2**32. A larger number is not an unusually
+#: high pid, it is corrupt metadata - and treating it as a real pid would make it
+#: "unverifiable", which locks the profile for ever and reintroduces exactly the
+#: lockout this module exists to remove.
+_MAX_PID = 2 ** 32
+
+
+def _plausible_pid(value: Any) -> Optional[int]:
+    """The pid if it could name a real process, else ``None``."""
+    try:
+        pid = int(value)
+    except (TypeError, ValueError):
+        return None
+    return pid if 0 < pid <= _MAX_PID else None
+
+
+def _marker_owner(user_data_dir: str) -> Optional[Dict[str, Any]]:
+    """The owner identity recorded in Chrome's own lock markers, if any.
+
+    This is best effort by platform, and the difference matters:
+
+    * POSIX: ``SingletonLock`` is a SYMLINK to ``<hostname>-<pid>``. The pid is real
+      evidence, and it is only meaningful for the host named in it.
+    * Windows: ``lockfile`` is an empty file. Verified against Chrome on this
+      platform - it is zero bytes and carries NO owner identity at all. Its presence
+      only ever said "a Chrome has been here", never "a Chrome is here now".
+
+    Returns ``{"pid", "host", "source", "raw"}``, or ``None`` when no marker names
+    an owner. Malformed, partial, unreadable and non-numeric metadata all return
+    ``None`` rather than a guess.
+    """
+    directory = expand(user_data_dir)
+    if not directory.is_dir():
+        return None
+
+    # POSIX: the symlink target is the owner record.
+    lock = directory / "SingletonLock"
+    try:
+        if lock.is_symlink():
+            target = os.readlink(str(lock))
+            host, _, pid_text = str(target).rpartition("-")
+            pid = _plausible_pid(pid_text) if (host and pid_text.isdigit()) else None
+            if host and pid is not None:
+                return {"pid": pid, "host": host, "source": "SingletonLock", "raw": str(target)}
+            # A symlink we cannot parse, or one naming an impossible pid, is
+            # malformed metadata rather than an owner. Recording it with no pid keeps
+            # the diagnostic without letting it block recovery.
+            return {"pid": None, "host": "", "source": "SingletonLock", "raw": str(target)}
+    except OSError:
+        pass
+
+    # Some platforms record the pid in the marker body instead. ``SingletonLock``
+    # is included on purpose: on POSIX it is a symlink (handled above), but a copied
+    # profile, a restored backup, or a filesystem that dropped the link can leave it
+    # as a regular file holding the same "<host>-<pid>" text. Reading it here keeps
+    # the host check working instead of silently degrading to "no owner recorded".
+    for name in ("SingletonLock", "lockfile", "SingletonCookie", "SingletonSocket"):
+        path = directory / name
+        try:
+            if not path.is_file() or path.is_symlink():
+                continue
+            raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if not raw:
+            # Windows writes a zero-byte file. That is a marker, not an owner.
+            continue
+        if raw.isdigit():
+            pid = _plausible_pid(raw)
+            return {"pid": pid, "host": "", "source": name, "raw": raw}
+        if "-" in raw:
+            host, _, pid_text = raw.rpartition("-")
+            pid = _plausible_pid(pid_text) if pid_text.isdigit() else None
+            if host and pid is not None:
+                return {"pid": pid, "host": host, "source": name, "raw": raw}
+        return {"pid": None, "host": "", "source": name, "raw": raw[:80]}
+    return None
+
+
+def _host_name() -> str:
+    try:
+        import socket
+
+        return socket.gethostname()
+    except Exception:
+        return ""
 
 
 def profile_lock(user_data_dir: str) -> Dict[str, Any]:
-    """Whether another Chrome appears to own this profile directory right now."""
+    """Whether another Chrome genuinely owns this profile directory right now.
+
+    The decision has exactly one authority: a LIVE process using this directory. Lock
+    MARKERS are evidence, not proof, and this function used to treat them as proof -
+    which stranded a profile for ever after its Chrome was killed, because nothing
+    ever removed the leftover marker.
+
+    Chrome itself is the final arbiter: it holds an exclusive lock while running and
+    demonstrably takes over a stale one on launch (verified against Chrome on this
+    platform - both an empty ``lockfile`` and one naming a dead pid are recovered
+    without intervention). So this function does not delete anything. It only decides
+    whether to let Chrome try, and reports honestly when it cannot tell.
+
+    Results, in the order they are decided:
+
+    * a live owner process      -> ``locked``, with its pids
+    * markers, none of whose recorded owners is alive, and a TRUSTED scan
+                                 -> ``locked: False``, ``stale: True``
+    * a recorded owner that is alive but not on this directory (pid reuse)
+                                 -> ``locked: False``, ``stale: True``
+    * markers and NO trustworthy scan (no psutil, or it failed)
+                                 -> ``locked``, ``verified: False``. Absence of
+                                   evidence is only evidence when looking worked.
+    """
     target = normalize_path(user_data_dir)
     if not target:
-        return {"locked": False, "reason": "", "processes": []}
-    processes = chrome_processes_for(target)
+        return _lock_result(False, "", [], [], stale=False, verified=False)
+
+    reliable, processes = scan_profile_owners(target)
     markers = lock_markers(target)
+
     if processes:
-        return {
-            "locked": True,
-            "reason": (
-                f"Chrome process(es) {[p.get('pid') for p in processes]} already have this profile open."
+        return _lock_result(
+            True,
+            f"Chrome process(es) {[p.get('pid') for p in processes]} already have this profile open.",
+            processes,
+            markers,
+            stale=False,
+            verified=True,
+        )
+
+    if not markers:
+        return _lock_result(False, "", [], [], stale=False, verified=True)
+
+    # Markers, no owning process found. Decide whether that is trustworthy.
+    owner = _marker_owner(target)
+    recorded_pid = (owner or {}).get("pid")
+
+    if not reliable:
+        return _lock_result(
+            True,
+            (
+                f"The profile directory holds Chrome's lock file(s) ({', '.join(markers)}) and "
+                "AirdropOS could not check whether a Chrome still owns it. Close any Chrome "
+                "using this profile and try again, or install psutil so the check can be made."
             ),
-            "processes": processes,
-            "markers": markers,
-        }
-    if markers:
-        return {
-            "locked": True,
-            "reason": f"The profile directory still holds Chrome's lock file(s): {', '.join(markers)}.",
-            "processes": [],
-            "markers": markers,
-        }
-    return {"locked": False, "reason": "", "processes": [], "markers": markers}
+            [],
+            markers,
+            stale=False,
+            verified=False,
+        )
+
+    if recorded_pid is not None:
+        owner_host = str((owner or {}).get("host") or "")
+        if owner_host and owner_host != _host_name():
+            # Another machine's marker (a shared/network profile). We cannot see its
+            # processes, so this is not ours to declare stale.
+            return _lock_result(
+                True,
+                (
+                    f"The profile directory holds Chrome's lock file(s) ({', '.join(markers)}) "
+                    f"recorded by host '{owner_host}'. AirdropOS cannot verify that host's "
+                    "processes, so it will not treat the lock as stale."
+                ),
+                [],
+                markers,
+                stale=False,
+                verified=False,
+            )
+
+        alive = process_alive(recorded_pid)
+        if alive is None:
+            return _lock_result(
+                True,
+                (
+                    f"The profile directory records Chrome owner pid {recorded_pid}, but AirdropOS "
+                    "could not determine whether that process is alive. Not treating it as stale."
+                ),
+                [],
+                markers,
+                stale=False,
+                verified=False,
+            )
+        if alive:
+            uses = process_uses_profile(recorded_pid, target)
+            if uses is None:
+                return _lock_result(
+                    True,
+                    (
+                        f"Chrome pid {recorded_pid} recorded in the profile's lock file is alive but "
+                        "its command line could not be read, so ownership cannot be confirmed or "
+                        "denied. Not treating it as stale."
+                    ),
+                    [],
+                    markers,
+                    stale=False,
+                    verified=False,
+                )
+            if uses:
+                # Alive AND on this directory: the scan missed it (a race, or a process
+                # that appeared between the scan and now). Genuinely locked.
+                return _lock_result(
+                    True,
+                    f"Chrome process {recorded_pid} owns this profile.",
+                    [{"pid": recorded_pid, "name": "chrome"}],
+                    markers,
+                    stale=False,
+                    verified=True,
+                )
+            # Alive but on a DIFFERENT directory: the recorded pid was recycled after
+            # this profile's Chrome exited. That is not an owner of this profile.
+        # recorded pid is dead (or recycled onto another profile) -> stale below.
+
+    reason = (
+        f"Chrome's lock file(s) ({', '.join(markers)}) were left behind by a Chrome that is no "
+        "longer running. Chrome will take the profile over on launch."
+    )
+    return _lock_result(False, reason, [], markers, stale=True, verified=True)
+
+
+def _lock_result(
+    locked: bool,
+    reason: str,
+    processes: List[Dict[str, Any]],
+    markers: List[str],
+    *,
+    stale: bool,
+    verified: bool,
+) -> Dict[str, Any]:
+    """One place builds the verdict, so every caller sees the same keys."""
+    return {
+        "locked": locked,
+        "reason": reason,
+        "processes": processes,
+        "markers": markers,
+        "stale": stale,
+        "verified": verified,
+    }
 
 
 def ensure_profile_dir(user_data_dir: str) -> str:
@@ -813,8 +1119,13 @@ __all__ = [
     "installed_extensions",
     "internal_page_reason",
     "is_personal_user_data_dir",
+    "lock_markers",
     "normalize_path",
+    "process_alive",
+    "process_uses_profile",
     "profile_data_size",
     "profile_lock",
     "profile_root",
+    "reset_caches",
+    "scan_profile_owners",
 ]

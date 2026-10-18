@@ -23,7 +23,7 @@ AirdropOS launches the **installed Google Chrome** with
 - Cookies, storage, installed extensions and extension settings **persist**.
 - Chrome enforces the directory lock: a second Chrome cannot open a profile another
   Chrome owns. AirdropOS checks the lock first and reports a conflict honestly rather
-  than working around it.
+  than working around it. See "Profile locking and stale-lock recovery" below.
 - **Show browser on PC** is a per-profile switch. Off (the default): Chrome runs hidden
   (`--headless=new`, which supports extensions) and nothing opens on the PC; watch and
   click it from Live Broadcast. On: a real Chrome window also opens on the PC.
@@ -56,6 +56,47 @@ Set `debugger_port` on the profile (host must stay `127.0.0.1`).
   person's own browser data.
 - Remote debugging on a non-loopback interface.
 - Any `chrome://` page other than `chrome://extensions` and `chrome://version`.
+
+### Profile locking and stale-lock recovery
+
+Chrome leaves lock markers in the profile directory (`lockfile` on Windows,
+`SingletonLock` on macOS/Linux). The presence of a marker means *a Chrome has been
+here*, **not** *a Chrome is here now* — Chrome removes its markers on a clean exit
+but not after a crash, a kill, or a power loss.
+
+`profile_lock` therefore decides on a **live process using that directory**, never on
+a file being present:
+
+| Evidence found | Verdict |
+| --- | --- |
+| A Chrome process running on this directory | **Locked** — refuse to launch |
+| Markers, but the recorded owner is provably gone | **Stale** — let Chrome try |
+| Markers and the recorded PID is alive but on a *different* directory (PID reuse) | **Stale** |
+| No `psutil`, a process scan that failed, a marker from another host, or an owner whose command line cannot be read | **Locked, unverified** — refuse rather than guess |
+
+The governing rule: **absence of evidence only counts as evidence when the search
+actually worked.** If AirdropOS cannot look for an owner, it will not assume there is
+none.
+
+Nothing is ever deleted. Chrome holds its own exclusive lock, removes its markers on
+exit, and takes a stale lock over on launch — verified against real Chrome for both an
+empty `lockfile` and one naming a dead PID. AirdropOS only declines to block, and says
+so, which is what makes recovery safe against a Chrome that happens to be starting at
+the same moment. Two concurrent starts are separated by Chrome's own atomic lock, not
+by a check-then-act race here.
+
+Platform limits:
+
+- **Windows** writes a zero-byte `lockfile` that records no owner at all (confirmed by
+  inspecting a real one). Recovery therefore rests entirely on the process scan. If
+  `psutil` is unavailable there, recovery is refused — safe, but the profile stays
+  blocked until `psutil` is installed.
+- **macOS/Linux** record the owner as a `<hostname>-<pid>` symlink target. If the host
+  does not match this machine, or the symlink was lost (a copied or restored profile),
+  the check degrades to the process scan.
+- A **zombie** owner counts as dead: it has already exited and cannot hold a profile.
+- Processes belonging to **another user** are invisible to `psutil`. Such a profile
+  reports unverified and refuses; it needs manual intervention.
 
 ---
 
