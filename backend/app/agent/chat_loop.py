@@ -474,6 +474,15 @@ class ChatToolLoop:
         if not result.reply:
             result.reply = self._fallback_reply(result)
 
+        # The client can leave while the last model call is still running, after the final
+        # poll above. Persisting a task is the one side effect left, so it is a safe boundary
+        # too: a stopped turn creates no task.
+        if spec and create_task is not None and not stopped and should_stop is not None and should_stop():
+            stopped = True
+            result.truncated = True
+            result.blockers.append(
+                "The client disconnected, so the requested task was not created."
+            )
         if spec and create_task is not None and not stopped:
             task_info, task_error = await create_task(spec)
             if task_error:
