@@ -348,14 +348,36 @@ async def test_resume_after_a_replan_uses_the_newer_checkpointed_revision(factor
 
 # ---------------------------------------------------------------- isolation
 async def test_two_tasks_never_share_context_or_trace_metadata(factory, transport):
+    """Two tasks must never see each other's context or trace metadata.
+
+    The observations are written through ``TaskContextService`` rather than by
+    inserting rows directly. That is not incidental: the write path is what bumps
+    ``TaskContext.revision`` via ``_touch``, and the revision is the component
+    that makes ``context_generation`` distinguish two contexts. Inserting rows
+    behind the service's back left both tasks at revision 1, and because
+    ``obs()`` pins ``created_at`` to the same value for both, the generation
+    correctly reported "identical content" - so the assertion below could never
+    have held, and could not have been testing the real mechanism either.
+    """
     async with factory() as db:
         a = await make_task(db)
         b = await make_task(db)
         controller = AgentController(db)
+        service = TaskContextService(db)
         for t in (a, b):
-            await controller.context.load_or_create(t)
-        db.add(obs(a, 1, authoritative=True, action="only-in-a"))
-        db.add(obs(b, 1, authoritative=True, action="only-in-b"))
+            await service.load_or_create(t)
+        record_a = await service.record_observation(
+            a, action="only-in-a", outcome=OUTCOME_CONFIRMED, tool="web_read", iteration=1,
+        )
+        record_b = await service.record_observation(
+            b, action="only-in-b", outcome=OUTCOME_CONFIRMED, tool="web_read", iteration=1,
+        )
+        # `record_observation` has no authoritative flag of its own, and that flag
+        # is what promotes an observation into `verified_facts` - which is exactly
+        # what the isolation assertions below compare.
+        for task, record in ((a, record_a), (b, record_b)):
+            row = await db.get(TaskObservation, record.id)
+            row.evidence_authoritative = True
         await db.commit()
         pa, _ = await controller._resolved_planning_context(a)
         pb, _ = await controller._resolved_planning_context(b)
@@ -372,6 +394,58 @@ async def test_two_tasks_never_share_context_or_trace_metadata(factory, transpor
     assert scope_a.task_id == a.task_id and scope_b.task_id == b.task_id
     assert set(scope_a.source_ids["observations"]).isdisjoint(scope_b.source_ids["observations"])
     assert scope_a.context_generation != scope_b.context_generation
+
+
+async def test_a_context_change_always_bumps_the_generation(factory, transport):
+    """The guarantee `_resolved_planning_context` relies on when it memoises.
+
+    Its cache is keyed by task id and validated by ``context_generation``, so a
+    stale generation means the planner is served context it should have
+    re-read. Any recorded observation must bump it, on the SAME task.
+    """
+    async with factory() as db:
+        task = await make_task(db)
+        service = TaskContextService(db)
+        await service.load_or_create(task)
+        controller = AgentController(db)
+
+        first, _ = await controller._resolved_planning_context(task)
+        assert service.record_observation  # the write path is what bumps the revision
+
+        await service.record_observation(
+            task, action="new-fact", outcome=OUTCOME_CONFIRMED, tool="web_read", iteration=1,
+        )
+        await db.commit()
+
+        second, _ = await controller._resolved_planning_context(task)
+
+    assert first["context_generation"] != second["context_generation"]
+    assert second["task_context_revision"] > first["task_context_revision"]
+
+
+async def test_identical_context_shares_a_generation_by_design(factory, transport):
+    """`context_generation` is a CONTENT digest, not an identity.
+
+    Two tasks whose resolved context is genuinely identical produce the same
+    digest, and that is correct: it is a cache-validity token and a trace
+    annotation, never a key. Isolation comes from the per-task cache keyed on
+    ``str(task.id)`` plus the ``task_id`` recorded beside it - both asserted in
+    `test_two_tasks_never_share_context_or_trace_metadata`.
+    """
+    async with factory() as db:
+        a = await make_task(db)
+        b = await make_task(db)
+        controller = AgentController(db)
+        service = TaskContextService(db)
+        for t in (a, b):
+            await service.load_or_create(t)
+        await db.commit()
+
+        ga = (await controller.context.context_version(a)).generation
+        gb = (await controller.context.context_version(b)).generation
+
+    assert ga == gb
+    assert a.task_id != b.task_id
 
 
 async def test_credential_fields_are_redacted_by_name_but_ordinary_fields_are_kept(factory, transport):

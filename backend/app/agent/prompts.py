@@ -207,6 +207,25 @@ families (the live catalog is authoritative):
     TELEGRAM USERNAME and none was given, call telegram_get_my_account and submit
     exactly the @username it returns (the account you are logged in as). If that
     account has no username, tell the operator instead of inventing one.
+  - X.com       : x_status, x_read_profile, x_read_post, x_post, x_reply,
+                  x_like, x_unlike, x_follow, x_unfollow, x_verify_action
+                  (ONE capability with TWO methods. `method` is auto by default
+                  and you do not need to set it: AirdropOS picks per task. Omit
+                  `method` unless the operator explicitly asks. Pass
+                  `method: "browser"` for anything phrased as "open x.com and
+                  ...", and `method: "api"` when the operator says "via the API".
+                  A method you force is still refused when it cannot do the
+                  operation or is not authorized - that refusal is an answer, not
+                  an obstacle. Run x_status first when you are unsure whether an X
+                  action is possible at all.
+                  THE DUPLICATE RULE, which overrides any urge to retry: x_post,
+                  x_reply, x_like, x_follow and x_unlike NEVER repeat themselves.
+                  If one reports `already_completed`, the action is DONE - report
+                  that, do not send it again. If one reports `outcome_uncertain`
+                  or times out, the outcome is UNKNOWN: call x_verify_action to
+                  look at the real state, and only then decide whether to send.
+                  Reporting "it probably worked" is not acceptable; report what
+                  the check actually showed.)
   - Dynamic tools registered at runtime
 Tool usage rules:
   - Pass parameters that match the tool's input schema exactly.

@@ -20,6 +20,7 @@ const SecuritySettings = lazy(() => import('@/pages/SecuritySettings'))
 const Telegram = lazy(() => import('@/pages/Telegram'))
 const BrowserAutomation = lazy(() => import('@/pages/BrowserAutomation'))
 const BrowserProfiles = lazy(() => import('@/pages/BrowserProfiles'))
+const XIntegration = lazy(() => import('@/pages/XIntegration'))
 const LiveBroadcast = lazy(() => import('@/pages/LiveBroadcast'))
 const LiveSessionPage = lazy(() => import('@/pages/LiveSession'))
 const named = (pick: string) => lazy(() => import('@/pages').then((m) => ({ default: (m as any)[pick] })))
@@ -64,6 +65,7 @@ const router = createBrowserRouter([
       { path: 'evidence', element: <Evidence /> },
       { path: 'memory', element: <Memory /> },
       { path: 'social', element: <Social /> },
+      { path: 'x', element: <XIntegration /> },
       { path: 'wallets', element: <Wallets /> },
       { path: 'transactions', element: <Transactions /> },
       { path: 'tools', element: <ToolsPage /> },

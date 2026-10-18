@@ -479,7 +479,7 @@ export const Social = () => (
     title="Social Monitors"
     description="Discord and X announcement tracking"
     icon={<Radio className="h-8 w-8" />}
-    note="Discord and X adapters are specified but not yet implemented; the Telegram integration is functional."
+    note="X is its own integration now: see X.com Integration for browser profiles, API configurations and task history. Discord monitoring is specified but not yet implemented; the Telegram integration is functional."
   />
 )
 

@@ -5,6 +5,129 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added (X.com integration: browser profiles + official X API v2)
+- **X.com is now one capability with two methods, and the agent picks per task.** A new
+  `backend/app/integrations/x/` package holds the API transport, credential store, routing
+  decisions and browser adapter; `backend/app/tools/x_tools.py` exposes ten registered tools
+  (`x_status`, `x_read_profile`, `x_read_post`, `x_post`, `x_reply`, `x_like`, `x_unlike`,
+  `x_follow`, `x_unfollow`, `x_verify_action`). Each tool takes an optional `method`
+  (`auto` / `api` / `browser`); routing is deterministic code in `routing.py`, not a prompt
+  instruction, so "open x.com and inspect this page" goes to the browser while "like this post
+  via the API" goes to the API. An explicit request is honoured only when that method supports the
+  operation and is authorized; otherwise the agent reports why it cannot.
+- **Browser mode reuses the existing browser controller and persistent Chrome profiles.** It
+  reports login state from the page's own controls (`LOGGED_IN` / `LOGGED_OUT` / `UNKNOWN` — never
+  a false "signed out"), and raises `needs_user_action` for a CAPTCHA, MFA or login challenge
+  rather than attempting to bypass it.
+- **API mode implements the official X API v2** against the published OpenAPI (`2.172`): whoami,
+  users-by-username, tweets, create post/reply, like/unlike, follow/unfollow, and the liked_tweets
+  and following reads used for verification. Every HTTP status maps to a distinct category
+  (`X_AUTH_FAILED`, `X_PERMISSION_DENIED`, `X_RATE_LIMITED`, `X_NOT_FOUND`, …) instead of one
+  generic error.
+- **Multiple API configurations with encrypted credentials.** Client secrets and access/refresh
+  tokens are sealed with AES-256-GCM (key from `WALLET_VAULT_MASTER_KEY`, else derived from
+  `SECRET_KEY`), bound to their row id as AAD so a copied ciphertext fails to open, and refused
+  outright in production when only the public development key is available. No endpoint returns a
+  secret; the UI shows masks; activity rows store a SHA-256 prefix of post text, never the text.
+- **Bulk import with a validating dry run.** JSON or CSV through one parser, with per-row
+  reporting of invalid fields, duplicate names (in file and in database), conflicting defaults and
+  soft warnings. A malformed credential is rejected rather than silently accepted.
+- **Duplicate prevention.** Every write is fingerprinted as
+  `<operation>:<account>:sha256(target)[:32]>` and checked against recent history first. A prior
+  SUCCESS means the action is already done and nothing is sent; a prior UNCERTAIN refuses the
+  repeat and asks for `x_verify_action`. Timeouts and lost responses are reported as UNCERTAIN
+  and **non-retryable**, so the deterministic retry policy cannot resend them.
+- **New `x_api_configurations` and `x_activity_records` tables** (Alembic revision
+  `11_x_integration`), the X.com dashboard page at `/x`, endpoints under `/api/v1/x`, new
+  `x.read` / `x.write` tool permissions and an `x_credentials` endpoint scope, and
+  `docs/X_INTEGRATION.md`.
+- **Known limitation, documented rather than hidden:** deleting a configuration erases the tokens
+  from AirdropOS but does not call X's `/2/oauth2/revoke`, so the token stays valid at X until it
+  expires. Revocation is an outbound call inside a destructive endpoint and cannot be exercised
+  without a real authorized account.
+- **Operational note:** scopes are snapshotted into `UserSession.scopes` at login, so an operator
+  session created before this release has no `x_credentials` and the X credential endpoints
+  answer `403` until it is re-issued. It fails closed — a new scope never widens an existing
+  session.
+- **Security review outcomes, fixed before merge.** An adversarial review of the new code found
+  and the implementation now closes: browser-mode X operations did not take the controller's
+  per-session interaction lock (two tasks sharing a profile could type into each other's open
+  composer and publish the wrong text publicly); X tools navigated without `browser.navigate`,
+  so revoking that permission did not stop them; the rate-limit brake required a header X omits on
+  some 429s and had no reset time persisted, so it never engaged; and the duplicate fingerprint
+  included the method and the configuration *name*, so the browser fallback silently defeated the
+  guard and a rename reset the window. All four now have regression tests.
+- **Credential endpoints get a dedicated `x_credentials` scope**, matching `wallet_write`. An X
+  access token is a bearer secret that posts as the operator, so a session that may create tasks
+  cannot mint or destroy that identity. It is excluded from `READONLY_SCOPES`; every X read is
+  rate limited. OAuth `state` is now a random token compared in constant time, and the vault
+  refuses a placeholder `WALLET_VAULT_MASTER_KEY` in production, not only a default `SECRET_KEY`.
+### Fixed (independent source audit of the X integration)
+Verified against the official reference on 2026-10-18 (`docs.x.com`, OpenAPI `2.172`,
+`/x-api/getting-started/pricing`, `/x-api/fundamentals/rate-limits`). An adversarial re-review of
+the implementation found real defects; all are fixed and covered by regression tests.
+
+- **The declared OAuth scopes for like and follow were wrong.** The table listed `like.read` /
+  `follows.read`, which gate the *list* endpoints, and omitted the two scopes the endpoints
+  actually require. `POST /2/users/:id/likes` needs `like.write` + `tweet.read` + `users.read`;
+  `POST /2/users/:id/following` needs `users.read` + `tweet.read` + `follows.write`. Both were
+  surfaced to the operator on the X page and in the docs, so the operator was being told the
+  wrong thing.
+- **The "writes need a paid API tier" claim was factually wrong** and appeared in the operation
+  catalog, the overview table, the UI and the docs. X API v2 is pay-per-usage credits with no
+  subscriptions; the real constraints are credit balance and per-request cost. Replaced with the
+  actual unit costs and the per-user rate limits for the endpoints used.
+- **A 2xx write was reported as success without checking the body.** `POST /2/tweets` discarded
+  the `errors` array X sends alongside a created post; like/follow ignored the documented
+  `liked` / `following` / `pending_follow` booleans, so a follow of a protected account
+  (`pending_follow: true`) was reported as "you now follow them". Writes now require the
+  documented confirmation flag; an absent flag is an UNKNOWN outcome, never assumed success. A
+  created post with warnings keeps its id (failing it would invite a duplicate) and reports
+  `partial`.
+- **An incomplete verification read was reported as a definitive negative.** `liked_posts`
+  checked one page and answered `liked: false` flatly; `is_following` read up to 1000 entries.
+  Both are now page-bounded within the ranges X accepts, and a negative drawn from a
+  partially-read list is reported as `PARTIAL` with an explicit note.
+- **OAuth account binding was not enforced.** An authorization code can be exchanged for any
+  account; a token was stored without proving it belonged to the configured handle, so a
+  configuration could silently begin acting as the wrong identity. The identity is now resolved
+  and compared *before* the tokens are stored, and an unverifiable or mismatched token is
+  refused.
+- **The vault's placeholder-key check was dead code.** `_master_key()` returned a configured
+  `WALLET_VAULT_MASTER_KEY` without ever consulting `_unsafe_key()`, so a placeholder vault key
+  in production was accepted. The previous test passed for the wrong reason — it tripped the
+  64-hex length check, not the placeholder check — and now exercises a well-formed placeholder.
+- **A `mask()` helper revealed the last two characters of a secret.** It revealed no prefix or
+  suffix; the docstring's HKDF claim was corrected to the SHA-256 derivation actually used.
+- **A legitimate repeat publish had no recourse.** The duplicate window was hardcoded at six
+  hours and the one bypass is unreachable from any tool schema. It is now the stored setting
+  `x.duplicate_window_hours`; `0` relaxes deliberate repeats while still never repeating a write
+  whose outcome is unknown.
+- **X behaviour controls were gated on `task_write`.** The routing preference, preferred
+  account, browser-profile choice and duplicate window are identity and safety controls, not
+  task creation, and now require `x_credentials`.
+- `request: Request = None` in `/x/activity` (worked only by FastAPI's annotation, not by
+  default), `limit` was unbounded, a docstring was placed after the code it described, dead
+  constants and an unused `secrets` shadowing remain removed.
+
+### Fixed (pre-existing: context generation isolation test)
+`test_two_tasks_never_share_context_or_trace_metadata` was failing on the baseline commit
+`22c8f46` with no X code present. Traced to the test, not the production code: `context_generation`
+is a documented *content* digest, and the test inserted observations with `db.add`, bypassing
+`TaskContextService.record_observation` — which is what bumps `TaskContext.revision`, the
+component that distinguishes two contexts. The `obs()` fixture also pinned `created_at` to the
+same value for both tasks. Isolation is unaffected: the planning cache is keyed on `str(task.id)`
+with the generation only as a validity token, and `task_id` is recorded beside it. The test now
+writes through the real service (exercising the mechanism it means to test), and two tests were
+added: one asserting a recorded observation always bumps the generation on the same task, and one
+pinning that identical context legitimately shares a digest. No assertion was removed.
+
+### Changed (X integration)
+- Tests: `test_x_integration.py` (103), `test_x_api.py` (25) and 2 added context tests, plus 6
+  frontend tests. All external X calls are mocked — **no live X API functionality has been
+  verified with a real credential**; endpoint shapes, scopes and costs were written against the
+  official reference.
+
 ### Fixed (model errors: mid-run parking, verified resume, legacy parked requests)
 - **A user-fixable model error after planning started now reaches the Agent Inbox.** Auth, billing,
   endpoint/model and served-model-mismatch refusals raised inside an execution window used to end the

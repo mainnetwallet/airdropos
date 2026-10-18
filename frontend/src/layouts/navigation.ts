@@ -22,6 +22,7 @@ import {
   Send,
   Settings,
   Target,
+  Twitter,
   Wallet,
   Wrench,
   Zap,
@@ -64,6 +65,9 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
       { to: '/evidence', label: 'Evidence & Changes', icon: HardDrive },
       { to: '/memory', label: 'Memory & Learning', icon: Brain },
       { to: '/social', label: 'Social Monitors', icon: Radio },
+      // X.com is its own integration rather than a tab on Social Monitors: it has
+      // browser profiles, API credentials and a routing preference of its own.
+      { to: '/x', label: 'X.com Integration', icon: Twitter },
       { to: '/telegram', label: 'Telegram Integration', icon: Send },
     ],
   },
@@ -116,6 +120,7 @@ export const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
   ['/inbox', 'chat'],
   ['/airdrops', 'airdrops'],
   ['/telegram', 'airdrops'],
+  ['/x', 'airdrops'],
   ['/tasks', 'tasks'],
   ['/tools', 'tasks'],
   ['/goals', 'tasks'],

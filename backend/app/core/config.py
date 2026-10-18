@@ -602,6 +602,36 @@ class Settings(BaseSettings):
     TWITTER_AUTHORIZED_USER_IDS: List[int] = Field(default=[])
 
     # =========================================================================
+    # X.COM INTEGRATION (dual: persistent browser profiles + official X API v2)
+    # =========================================================================
+    # Master switch for the API half. The browser half is governed by the normal
+    # BROWSER_* settings; turning this off leaves browser-mode X work working and
+    # makes every API-backed operation report that the API is unavailable, rather
+    # than silently falling back to something else.
+    X_API_ENABLED: bool = True
+
+    # auto | api_preferred | browser_preferred. `auto` sends writes through the
+    # official API when an account is configured and authorized (because that
+    # produces a verifiable post id) and uses the browser for anything phrased as
+    # website work.
+    X_EXECUTION_PREFERENCE: str = "auto"
+
+    # Must exactly match a callback URL registered on the X developer app.
+    # A mismatch makes the authorization-code exchange fail with 401, so it is
+    # reported on the X page rather than being guessed.
+    X_OAUTH_REDIRECT_URI: str = ""
+
+    # The browser profile id the X page suggests for signing in to X. Empty means
+    # "the operator's default agent profile".
+    X_BROWSER_PROFILE_ID: str = ""
+
+    # Fallback duplicate-window, in hours. The live value is the stored setting
+    # `x.duplicate_window_hours`; this only applies when nothing is stored. 0
+    # allows a deliberate repeat of a KNOWN completed write, but never of one
+    # whose outcome is unknown.
+    X_DUPLICATE_WINDOW_HOURS: float = 6.0
+
+    # =========================================================================
     # BROWSER AUTOMATION (PLAYWRIGHT)
     # =========================================================================
     BROWSER_HEADLESS: bool = True

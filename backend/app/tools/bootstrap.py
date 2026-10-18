@@ -34,6 +34,7 @@ from backend.app.tools.telegram_user_tools import register_telegram_user_tools
 from backend.app.tools.transfer_tools import register_transfer_tools
 from backend.app.tools.wallet_tools import register_wallet_tools
 from backend.app.tools.web_tools import register_web_tools
+from backend.app.tools.x_tools import register_x_tools
 
 logger = logging.getLogger("airdropos.tools")
 
@@ -64,6 +65,10 @@ def bootstrap_tools() -> None:
     register_diagnostic_tools(registry)
     register_airdrop_tools(registry)
     register_transfer_tools(registry)
+    # X.com. Registered unconditionally: the tools themselves decide per task
+    # whether the API or a browser profile can run, and the permission policy
+    # below is what actually lets the agent use them.
+    register_x_tools(registry)
     telegram_user_enabled = register_telegram_user_tools(registry)
 
     # The rest of the Telegram family: session/account, bot discovery and commands,
@@ -111,6 +116,13 @@ def bootstrap_tools() -> None:
         "notify.send",
         "report.generate",
         "social.read",
+        # X.com reads (profile, post, and verifying whether a write landed) and
+        # X.com writes (post, reply, like, follow). The X tools also declare the
+        # browser permission they need, because a task can be routed to the
+        # signed-in x.com website at runtime; granting `x.*` alone is not enough
+        # to drive a browser.
+        "x.read",
+        "x.write",
         "wallet.read",
         "wallet.write",
         "task.read",

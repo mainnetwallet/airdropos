@@ -64,6 +64,11 @@ class Scope(str, Enum):
     SYSTEM_ADMIN = "system_admin"          # Settings, scheduler control, learning
     EMERGENCY_STOP = "emergency_stop"      # Engage and release the emergency stop
     AUDIT_READ = "audit_read"              # Audit log
+    # Managing the X.com API credentials. A separate scope for the same reason
+    # wallets have one: an X access token is a bearer secret that can post as the
+    # operator, exactly like a private key, so a session that may create and
+    # cancel tasks must not be able to mint or destroy the operator's X identity.
+    X_CREDENTIALS = "x_credentials"
 
 
 ALL_SCOPES = {s.value for s in Scope}
@@ -72,7 +77,13 @@ ALL_SCOPES = {s.value for s in Scope}
 DEFAULT_OPERATOR_SCOPES = set(ALL_SCOPES)
 
 # Scopes a read-only observer would hold, for example.
-READONLY_SCOPES = {Scope.READ.value, Scope.TOOL_READ.value, Scope.WALLET_READ.value}
+# Deliberately does NOT include `x_credentials`: viewing which accounts are
+# configured is a read, but adding, authorizing or deleting one is not.
+READONLY_SCOPES = {
+    Scope.READ.value,
+    Scope.TOOL_READ.value,
+    Scope.WALLET_READ.value,
+}
 
 
 class AuthError(Exception):
@@ -475,6 +486,7 @@ require_tool_read = require_scopes(Scope.TOOL_READ)
 require_system_admin = require_scopes(Scope.SYSTEM_ADMIN)
 require_emergency = require_scopes(Scope.EMERGENCY_STOP)
 require_audit_read = require_scopes(Scope.AUDIT_READ)
+require_x_credentials = require_scopes(Scope.X_CREDENTIALS)
 
 
 # ======================================================================

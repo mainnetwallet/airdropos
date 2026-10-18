@@ -37,6 +37,10 @@ from backend.app.models.memory import (
     LearningRecord,
     ImprovementProposal,
 )
+from backend.app.models.x_integration import (
+    XActivityRecord,
+    XApiConfiguration,
+)
 from backend.app.models.scheduler import (
     AutomationSchedule,
     ScheduledRun,
@@ -112,4 +116,6 @@ __all__ = [
     "AgentConversation",
     "ConversationMessage",
     "InterventionRequest",
+    "XApiConfiguration",
+    "XActivityRecord",
 ]

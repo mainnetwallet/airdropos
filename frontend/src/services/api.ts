@@ -42,6 +42,31 @@ import type {
   LiveSession,
 } from '@/types/live'
 import { takeSseFrames } from '@/services/sse'
+import type {
+  XActivityRecord,
+  XApiConfiguration,
+  XApiConfigurationInput,
+  XAuthorizeComplete,
+  XAuthorizeStart,
+  XBrowserStatus,
+  XCatalog,
+  XExecutionPreference,
+  XImportPreview,
+  XImportResult,
+  XOverview,
+  XTestResult,
+} from '@/types/x'
+
+/** Query-string builder shared by the list endpoints that take filters. */
+function buildQuery(params: Record<string, string | number | undefined | null>): string {
+  const search = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === null || value === '') continue
+    search.set(key, String(value))
+  }
+  const text = search.toString()
+  return text ? `?${text}` : ''
+}
 
 const API_BASE = import.meta.env.VITE_API_URL ?? '/api/v1'
 
@@ -550,6 +575,96 @@ export const api = {
       body: JSON.stringify({ reason, activated_by: activatedBy }),
     }),
   releaseStop: () => request<Record<string, unknown>>('/emergency-stop/resume', { method: 'POST' }),
+
+  // --- X.com integration ---------------------------------------------------
+  // Secrets are WRITE-ONLY. They are sent on create/patch and never read back:
+  // the backend returns masks, scopes and status, and nothing else.
+  xOverview: () => request<XOverview>('/x/overview'),
+  xConfigurations: () =>
+    request<{ configurations: XApiConfiguration[]; preference: XExecutionPreference }>('/x/configurations'),
+  createXConfiguration: (body: XApiConfigurationInput) =>
+    request<{ configuration: XApiConfiguration }>('/x/configurations', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateXConfiguration: (id: string, body: Partial<XApiConfigurationInput>) =>
+    request<{ configuration: XApiConfiguration }>(`/x/configurations/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  setXConfigurationEnabled: (id: string, enabled: boolean) =>
+    request<{ configuration: XApiConfiguration }>(
+      `/x/configurations/${encodeURIComponent(id)}/enabled`,
+      { method: 'POST', body: JSON.stringify({ enabled }) },
+    ),
+  setDefaultXConfiguration: (configId: string | null) =>
+    request<{ default_config_id: string }>('/x/configurations/default', {
+      method: 'POST',
+      body: JSON.stringify({ config_id: configId }),
+    }),
+  deleteXConfiguration: (id: string) =>
+    request<{ deleted: string; activity_history: string }>(
+      `/x/configurations/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
+  /** A real call to X. The response never contains a token value. */
+  testXConfiguration: (id: string) =>
+    request<XTestResult>(`/x/configurations/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+  /** OAuth 2.0 authorization-code + PKCE. Returns the URL the operator opens. */
+  startXAuthorization: (id: string) =>
+    request<XAuthorizeStart>(`/x/configurations/${encodeURIComponent(id)}/authorize`, { method: 'POST' }),
+  completeXAuthorization: (id: string, code: string, state: string) =>
+    request<XAuthorizeComplete>(`/x/configurations/${encodeURIComponent(id)}/authorize/complete`, {
+      method: 'POST',
+      body: JSON.stringify({ code, state }),
+    }),
+  /** Dry run. Writes nothing; reports what a commit would do. */
+  previewXImport: (content: string, filename = '') =>
+    request<XImportPreview>('/x/import/preview', {
+      method: 'POST',
+      body: JSON.stringify({ content, filename, commit: false }),
+    }),
+  importXConfigurations: (content: string, filename = '', rows: number[] = []) =>
+    request<XImportResult>('/x/import', {
+      method: 'POST',
+      body: JSON.stringify({ content, filename, commit: true, rows }),
+    }),
+  xPreference: () =>
+    request<{
+      preference: XExecutionPreference
+      options: XExecutionPreference[]
+      explanation: Record<string, string>
+      duplicate_window_hours: number
+    }>('/x/preference'),
+  setXPreference: (preference: XExecutionPreference) =>
+    request<{ preference: XExecutionPreference; options: XExecutionPreference[] }>('/x/preference', {
+      method: 'POST',
+      body: JSON.stringify({ preference }),
+    }),
+  /** Hours in which an identical completed write is refused as a duplicate. 0 relaxes it. */
+  setXDuplicateWindow: (hours: number) =>
+    request<{ duplicate_window_hours: number }>('/x/duplicate-window', {
+      method: 'POST',
+      body: JSON.stringify({ hours }),
+    }),
+  xBrowserProfile: () =>
+    request<{ browser_profile_id: string; pinned_profile_id: string; reason: string }>('/x/browser-profile'),
+  chooseXBrowserProfile: (profileId: string | null) =>
+    request<{ browser_profile_id: string }>('/x/browser-profile', {
+      method: 'POST',
+      body: JSON.stringify({ profile_id: profileId }),
+    }),
+  xBrowserStatus: (profileId?: string) =>
+    request<XBrowserStatus>(
+      `/x/browser-status${profileId ? `?profile_id=${encodeURIComponent(profileId)}` : ''}`,
+    ),
+  xActivity: (params: { limit?: number; method?: string; status?: string; config_id?: string } = {}) =>
+    request<{
+      activity: XActivityRecord[]
+      filters: { method: string; status: string; config_id: string }
+      note: string
+    }>(`/x/activity${buildQuery(params)}`),
+  xCatalog: () => request<XCatalog>('/x/catalog'),
 }
 
 // --- Live Broadcast ----------------------------------------------------------
