@@ -124,7 +124,18 @@ MACHINE_VERIFIABLE = frozenset(
         EXTENSION_INSTALL_REQUIRED,
         HUMAN_VERIFICATION,
         MISSING_CONFIGURATION,
+        LLM_AUTH_FAILURE,
+        LLM_BILLING_REFUSAL,
+        LLM_NOT_FOUND,
+        LLM_MODEL_MISMATCH,
     }
+)
+
+# Reasons that are cleared ONLY by a successful probe of the configured model. An operator's
+# reply is never accepted in place of the check: a reply that "I fixed it" resumed the task
+# straight into the same refusal, which is exactly what these reasons exist to prevent.
+MODEL_VERIFIED_ONLY = frozenset(
+    {LLM_AUTH_FAILURE, LLM_BILLING_REFUSAL, LLM_NOT_FOUND, LLM_MODEL_MISMATCH}
 )
 
 # Reasons that are a deliberate human decision: an operator pause or an approval. Only an
@@ -211,6 +222,42 @@ def classify_reason(error_text: str, error_category: Optional[str] = None) -> st
             return UNKNOWN_REASON
 
     return UNKNOWN_REASON
+
+
+# A request still open from before the LLM_* reasons existed. Between b93a82e (park instead of
+# retry) and 56b0e5f (LLM_* reasons) a model refusal was parked under whatever `classify_reason`
+# made of its text: AUTH_FAILURE as MISSING_AUTHENTICATION, the rest as UNKNOWN.
+_LEGACY_MODEL_REFUSAL_STORED = frozenset({MISSING_AUTHENTICATION, UNKNOWN_REASON})
+_MODEL_REFUSAL_WORDING = re.compile(r"^\s*The configured model refused this task \((?P<category>[A-Z_]+)\)")
+_OPEN_REQUEST_STATUS = "PENDING"
+
+
+def effective_reason_code(request: Any) -> str:
+    """The reason an operator and the reply router should treat a request as having.
+
+    Normally the stored reason. The one exception is a still-open request that the platform
+    parked for a model refusal before the LLM_* reasons existed. It is recognised from two
+    things the platform itself wrote when it parked it, and BOTH must agree: the model
+    client's category on the request, and the platform's own "The configured model refused
+    this task (<CATEGORY>)" wording, naming that same category.
+
+    Nothing is rewritten: this is a read-time interpretation of the stored row. A request that
+    is already resolved, cancelled, superseded or scheduled is history and is returned exactly
+    as recorded. A blocker raised by a tool keeps its own reason however similar its category.
+    """
+    stored = request.reason_code
+    if getattr(request, "status", None) != _OPEN_REQUEST_STATUS:
+        return stored
+    if stored not in _LEGACY_MODEL_REFUSAL_STORED:
+        return stored
+    category = (getattr(request, "error_category", None) or "").upper()
+    reason = LLM_REASON_BY_CATEGORY.get(category)
+    if reason is None:
+        return stored
+    match = _MODEL_REFUSAL_WORDING.match(getattr(request, "problem_summary", None) or "")
+    if match is None or match.group("category") != category:
+        return stored
+    return reason
 
 
 class ConversationService:
@@ -664,15 +711,27 @@ class InterventionService:
 
     @staticmethod
     def request_view(request: InterventionRequest) -> Dict[str, Any]:
+        reason_code = effective_reason_code(request)
+        required_action = request.required_action
+        instructions = list(request.instructions or [])
+        if reason_code != request.reason_code:
+            # An open request parked before the LLM_* reasons existed carries wallet or
+            # generic guidance that does not describe the model. Show the guidance for what
+            # it really is; the stored row is not touched.
+            from backend.app.inbox.raise_intervention import guidance_for
+
+            guidance = guidance_for(reason_code, request.problem_summary or "", request.integration_ref)
+            required_action = guidance["required_action"]
+            instructions = list(guidance["instructions"])
         return {
             "request_id": request.request_id,
             "task_id": str(request.task_id),
             "conversation_id": str(request.conversation_id),
-            "reason_code": request.reason_code,
+            "reason_code": reason_code,
             "problem_summary": request.problem_summary,
             "detailed_explanation": request.detailed_explanation,
-            "required_action": request.required_action,
-            "instructions": list(request.instructions or []),
+            "required_action": required_action,
+            "instructions": instructions,
             "integration_ref": request.integration_ref,
             "blocking_step": request.blocking_step,
             "error_category": request.error_category,
@@ -683,8 +742,8 @@ class InterventionService:
             "resolved_by": request.resolved_by,
             "verification_method": request.verification_method,
             "verification_outcome": request.verification_outcome,
-            "machine_verifiable": request.reason_code in MACHINE_VERIFIABLE,
-            "requires_explicit_authorization": request.reason_code in REQUIRES_EXPLICIT_AUTHORIZATION,
+            "machine_verifiable": reason_code in MACHINE_VERIFIABLE,
+            "requires_explicit_authorization": reason_code in REQUIRES_EXPLICIT_AUTHORIZATION,
         }
 
 

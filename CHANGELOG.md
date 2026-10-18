@@ -5,6 +5,31 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed (model errors: mid-run parking, verified resume, legacy parked requests)
+- **A user-fixable model error after planning started now reaches the Agent Inbox.** Auth, billing,
+  endpoint/model and served-model-mismatch refusals raised inside an execution window used to end the
+  run as FAILED and leave the task for the worker to retry, spending the retry budget on an error no
+  retry can fix. The same task is now parked (NEEDS_USER_ACTION) under the matching `LLM_*` reason with
+  its checkpoints intact and no retry used. Retryable errors and non-fixable non-retryable errors keep
+  their existing behaviour.
+- **A reply no longer resumes a task parked on a model error unless the model works.** The `LLM_*`
+  reasons had no verifier, so any reply counted as confirmation and the task resumed into the same
+  refusal. `inbox.verification._verify_llm_model` now makes one request through the configured model
+  client's own `health_check` (never another provider or model). Only a passing check resumes; a
+  refusal reports what is wrong *now*; an outage, timeout or raised error is inconclusive. In every
+  non-passing case the task, its retry count, checkpoints and the open request are left untouched.
+- **Requests parked before the `LLM_*` reasons existed are handled correctly.** An open request parked
+  as MISSING_AUTHENTICATION or UNKNOWN for a model refusal is recognised at read time
+  (`effective_reason_code`) from the model client's category plus the platform's own refusal wording,
+  and follows the same rules. Stored rows are never rewritten; resolved requests are shown as recorded.
+- **The configured API key is scrubbed from model-error logs, tracebacks, blockers, reports and inbox
+  text**, including the exact value when a provider echoes it back in a shape pattern redaction misses.
+- Tests: `test_llm_midrun_inbox_recovery.py`, `test_llm_inbox_fix_verification.py`,
+  `test_legacy_llm_parked_requests.py`. Two test-helper defects fixed (a string passed for a UUID
+  column; `TaskEvent.payload` misnamed `event_data`), the resume stub now keeps failing on later
+  iterations, and `test_llm_inbox_resume.py` stubs a working model because a reply alone no longer
+  resumes a model-parked task.
+
 ### Fixed (lease heartbeat, ownership loss and atomic recovery claims)
 - **A lease no longer expires under a long LLM or tool call.** It was renewed only after an
   iteration finished, so one call longer than the TTL let recovery or another worker take a task

@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.inbox.service import ConversationService
+from backend.app.inbox.service import ConversationService, effective_reason_code
 from backend.app.llm.client import LLMError, Message, llm
 from backend.app.llm.trace import llm_trace_scope
 from backend.app.llm.compaction import redact_secrets
@@ -322,7 +322,7 @@ async def build_context(
             "last_error": _clip(json.dumps(task.error_details or {}, default=str), MAX_FIELD_CHARS),
         },
         "intervention": {
-            "reason_code": request.reason_code,
+            "reason_code": effective_reason_code(request),
             "blocker": _clip(request.problem_summary, MAX_FIELD_CHARS),
             "details": _clip(request.detailed_explanation, MAX_FIELD_CHARS),
             "required_action": _clip(request.required_action, MAX_FIELD_CHARS),

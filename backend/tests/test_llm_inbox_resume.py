@@ -56,6 +56,27 @@ def planner(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def model_works(monkeypatch):
+    """The configured model answers its check, so a reply may resume the task.
+
+    A task parked on a model refusal now resumes only after a real probe of the configured
+    model passes (`inbox.verification._verify_llm_model`); replying alone is not enough. These
+    tests are about WHICH task resumes and how, so the probe reports a working model. What
+    happens when the model is still broken is covered by `test_llm_inbox_fix_verification.py`.
+    """
+    from backend.app.llm.client import llm
+
+    async def health_check():
+        return {
+            "status": "HEALTHY", "latency_ms": 1.0, "requested_model": "gpt-4o",
+            "served_model": "gpt-4o", "model_matches_request": True,
+            "detail": "Fixed model endpoint responding",
+        }
+
+    monkeypatch.setattr(llm, "health_check", health_check)
+
+
+@pytest.fixture(autouse=True)
 def interpreter_unavailable(monkeypatch):
     """The reply interpreter would call the model; make it unavailable (the router must cope)."""
     from backend.app.inbox import replies

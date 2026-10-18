@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import time
+import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -649,16 +650,31 @@ class AgentController:
                     task, report, started, iteration, exc.reason, in_flight=exc.in_flight
                 )
             except LLMError as exc:
+                # A provider can quote back the key it rejected, in any shape. Remove the
+                # configured value itself before the text reaches a log, a checkpoint, the
+                # blocker, the report or an inbox message. The traceback is logged scrubbed too
+                # (`exc_info=True` would print the raw exception text).
+                category = getattr(exc, "category", None) or "UNKNOWN"
+                retryable = bool(getattr(exc, "retryable", True))
+                safe_error = scrub_configured_secrets(str(exc))
                 logger.error(
-                    "RUN llm_error task=%s iteration=%s category=%s error=%s",
-                    task.task_id, iteration, getattr(exc, "category", "?"), clip(exc),
-                    exc_info=True,
+                    "RUN llm_error task=%s iteration=%s category=%s retryable=%s error=%s",
+                    task.task_id, iteration, category, retryable, clip(safe_error),
                 )
-                report.failures.append(f"LLM error ({exc.category}): {exc}")
+                logger.debug(
+                    "RUN llm_error traceback task=%s: %s", task.task_id,
+                    scrub_configured_secrets(traceback.format_exc()),
+                )
+                failure = f"LLM error ({category}): {safe_error}"
+                report.failures.append(failure)
                 report.outcome = LoopOutcome.FAILED
-                await self._record_blocker(task, f"LLM error ({exc.category}): {exc}")
+                await self._record_blocker(task, failure)
                 await self._checkpoint(task, iteration, "llm_error")
                 await self._flush_telemetry(task)
+                if not retryable and category in USER_FIXABLE_LLM_ERRORS:
+                    await self._park_on_model_refusal(
+                        task, report, iteration=iteration, category=category, safe_error=safe_error
+                    )
                 break
             except PlanningError as exc:
                 logger.error(
@@ -753,6 +769,47 @@ class AgentController:
         return report
 
     # ------------------------------------------------------------------
+    async def _park_on_model_refusal(
+        self,
+        task: Task,
+        report: LoopReport,
+        *,
+        iteration: int,
+        category: str,
+        safe_error: str,
+    ) -> None:
+        """Park the SAME task for the operator after a user-fixable model error mid-run.
+
+        Retrying cannot help and must not spend the retry budget (the worker would count the
+        failed run as an attempt). Everything done so far stays checkpointed, NEEDS_USER_ACTION
+        is not claimable, and the operator's reply is verified with a real probe of the model
+        before anything resumes (see `inbox.verification`).
+        """
+        if task.status != TaskStatus.IN_PROGRESS.value:
+            return
+        blocker = scrub_configured_secrets(
+            f"The configured model refused this task ({category}) while it was running: "
+            f"{clip(safe_error, 300)}. Fix the model settings or account, then resume the task. "
+            "Everything already done is preserved."
+        )
+        details = {"llm_category": category, "llm_retryable": False}
+        task.next_execution_at = None
+        task.error_details = details
+        await self._record_blocker(task, blocker)
+        parked = await self._request_operator_input(
+            task, iteration=iteration, error_text=blocker, error_category=category,
+            force_reason_code=classify_llm_reason(category),
+        )
+        if parked is None and task.status == TaskStatus.IN_PROGRESS.value:
+            # No inbox entry could be raised; still never leave the task IN_PROGRESS.
+            await self.tasks.transition(
+                task, TaskStatus.NEEDS_USER_ACTION, reason=blocker[:500],
+                next_planned_action="Fix the model settings or account, then resume the task.",
+                error_details=details,
+            )
+        report.outcome = LoopOutcome.NEEDS_USER_ACTION
+        report.blockers.append(blocker)
+
     async def _stop_on_lost_lease(
         self,
         task: Task,

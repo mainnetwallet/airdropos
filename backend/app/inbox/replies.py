@@ -41,6 +41,8 @@ from backend.app.inbox.interpretation import (
 from backend.app.inbox.service import (
     APPROVAL_GATED,
     INFORMATION_RESOLVABLE,
+    MODEL_VERIFIED_ONLY,
+    effective_reason_code,
     ConversationService,
     InterventionService,
     normalise_reply,
@@ -686,6 +688,15 @@ class ReplyRouter:
                 clarification=clarification, info_provided=info_saved, interpretation=view,
             )
 
+        # A model refusal is the one blocker the operator's word cannot clear. Their reply only
+        # triggers the probe; if the configured model does not work, the task stays parked,
+        # because resuming would run straight into the same refusal.
+        if effective_reason_code(request) in MODEL_VERIFIED_ONLY:
+            return await self._model_still_parked(
+                conversation, task, base, request, result,
+                clarification=clarification, info_saved=info_saved, view=view,
+            )
+
         # The automatic check could not confirm the blocker is gone (or said it is not). That
         # never holds the task back: the operator is the one running this agent, and their
         # reply is the confirmation. The check result is kept in the message as a note, and
@@ -695,7 +706,7 @@ class ReplyRouter:
         # effects) before anything is queued.
         if (
             not result.checkable
-            and request.reason_code in INFORMATION_RESOLVABLE
+            and effective_reason_code(request) in INFORMATION_RESOLVABLE
             and (info_saved or self._information_on_file(task, request))
         ):
             accepted = VerificationResult.satisfied(
@@ -745,6 +756,48 @@ class ReplyRouter:
         return await self._resume(
             conversation, task, owner_email, base, request, accepted,
             clarification=clarification, info_provided=info_saved, interpretation=view,
+        )
+
+    async def _model_still_parked(
+        self,
+        conversation: AgentConversation,
+        task: Task,
+        base: Dict[str, Any],
+        request,
+        result: VerificationResult,
+        *,
+        clarification: Optional[str],
+        info_saved: bool,
+        view: Optional[Dict[str, Any]],
+    ) -> ReplyOutcome:
+        """The configured model did not pass its check: say why and leave everything as it was.
+
+        Nothing is changed here -- not the task, its retry count, its checkpoints or the open
+        request -- so the operator can fix the setting and reply again as often as needed.
+        """
+        noted = ""
+        if info_saved:
+            noted = "I have saved the information you gave and will use it once the task can run.\n\n"
+        elif clarification:
+            noted = f"I have recorded your instruction to use {clarification} instead.\n\n"
+        if result.checkable:
+            lead = (
+                f"The configured model is still not working, so task {task.task_id} has not "
+                "been resumed."
+            )
+            tail = f"What to check: {result.question}\n\nReply here once it is fixed and I will check again."
+        else:
+            lead = (
+                f"I could not confirm that the configured model works, so task {task.task_id} "
+                "has not been resumed."
+            )
+            tail = result.question or "Please reply again and I will re-run the check."
+        return await self._reply_agent(
+            conversation, task, base,
+            f"{noted}{lead}\n\nCheck performed: {result.method}\nResult: {result.outcome}\n\n{tail}",
+            status="NEEDS_MORE_INFO",
+            verification=_verification_view(result),
+            interpretation=view,
         )
 
     def _record_operator_confirmation(self, task: Task, request, base: Dict[str, Any]) -> None:
@@ -1104,10 +1157,8 @@ class ReplyRouter:
         """
         if request is None:
             return False
-        return (
-            request.reason_code not in APPROVAL_GATED
-            and request.reason_code not in INFORMATION_RESOLVABLE
-        )
+        reason_code = effective_reason_code(request)
+        return reason_code not in APPROVAL_GATED and reason_code not in INFORMATION_RESOLVABLE
 
     @staticmethod
     def _information_on_file(task: Task, request) -> bool:

@@ -52,7 +52,11 @@ def _spec() -> ExecutionPlanSpec:
 
 
 def _stub_run(monkeypatch, failure, *, fail_on_iteration=2):
-    """Plan once; iteration 1 succeeds; the model fails on `fail_on_iteration`."""
+    """Plan once; iteration 1 succeeds; the model fails from `fail_on_iteration` onwards.
+
+    "From", not "on": iteration numbers keep counting up across runs, so a resumed run starts
+    after the iteration that failed. A model that is still broken must fail again there too.
+    """
     state = {"iterations": []}
 
     async def ensure_plan(self, task, report):
@@ -60,7 +64,7 @@ def _stub_run(monkeypatch, failure, *, fail_on_iteration=2):
 
     async def run_iteration(self, task, iteration, report, plan_spec):
         state["iterations"].append(iteration)
-        if iteration == fail_on_iteration:
+        if iteration >= fail_on_iteration:
             raise failure
         return StepResult(iteration, f"did {iteration}", "probe", {"ok": True}, True, "ok", 0), False, None
 

@@ -162,16 +162,16 @@ def guidance_for(reason_code: str, error_text: str, integration_ref: Optional[st
 
     # --- The single configured model refused the task. -------------------------------
     # Setting names are the real ones from core/config.py. Nothing here reads a setting's
-    # value, so no key can end up in the message. The model is never called to "test" a fix
-    # (the operator's reply is the confirmation), and a repeat refusal parks the task again
-    # with the new error, so nothing is retried behind the operator's back.
+    # value, so no key can end up in the message. A reply never resumes one of these on its
+    # own: the backend makes one small request to the one configured model and resumes only
+    # if that works. The model is never switched, and a repeat refusal is reported here.
     _llm_next = (
-        "I will resume this task from the state above. If the configured model refuses it "
-        "again, I will post the new error here."
+        "If the check passes I will resume this task from the state above, without using up a "
+        "retry. If it does not, I will tell you here what is still wrong and the task stays parked."
     )
     _llm_verified = (
-        "I do not call the model to test the fix. Your reply is recorded as the confirmation "
-        "and resuming does not use up a retry."
+        "I will make one small request to the configured model to check that it works now, and "
+        "resume only if it does. Replying alone does not resume this task."
     )
 
     if reason_code == LLM_AUTH_FAILURE:

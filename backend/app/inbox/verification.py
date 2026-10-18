@@ -23,12 +23,19 @@ from backend.app.inbox.service import (
     BROWSER_SESSION_UNAVAILABLE,
     EXTENSION_INSTALL_REQUIRED,
     HUMAN_VERIFICATION,
+    LLM_AUTH_FAILURE,
+    LLM_BILLING_REFUSAL,
+    LLM_MODEL_MISMATCH,
+    LLM_NOT_FOUND,
+    LLM_REASON_BY_CATEGORY,
     MISSING_AUTHENTICATION,
     MISSING_CONFIGURATION,
     TELEGRAM_SESSION_UNAVAILABLE,
     UNKNOWN_REASON,
     InterventionRequest,
     classify_reason,
+    effective_reason_code,
+    scrub_configured_secrets,
 )
 from backend.app.models import Task
 
@@ -36,6 +43,8 @@ logger = logging.getLogger(__name__)
 
 # A verifier that reports "I could not check" rather than "it is fine".
 NOT_CHECKED = "NOT_CHECKED"
+
+_MODEL_REASONS = frozenset({LLM_AUTH_FAILURE, LLM_BILLING_REFUSAL, LLM_NOT_FOUND, LLM_MODEL_MISMATCH})
 
 # How long a single verifier may take before we treat it as inconclusive.
 VERIFY_TIMEOUT_SECONDS = 15.0
@@ -87,7 +96,9 @@ async def verify(
     db: AsyncSession, task: Task, request: InterventionRequest
 ) -> VerificationResult:
     """Run the verifier registered for this request's reason code."""
-    reason_code = request.reason_code
+    # The effective reason, so a request parked as MISSING_AUTHENTICATION / UNKNOWN before the
+    # LLM_* reasons existed is checked against the model it was really about.
+    reason_code = effective_reason_code(request)
     if reason_code == UNKNOWN_REASON and verifier_for(reason_code) is None:
         # A request raised before extension installs had their own reason was stored as
         # UNKNOWN even though its text names the blocker precisely. Re-derive that one case
@@ -111,14 +122,22 @@ async def verify(
         return VerificationResult.unchecked(
             method=reason_code,
             outcome=f"The check did not finish within {VERIFY_TIMEOUT_SECONDS:.0f}s.",
-            question="The check timed out. Please confirm the condition is resolved, or tell me what is still failing.",
+            question=(
+                _INCONCLUSIVE_QUESTION if reason_code in _MODEL_REASONS
+                else "The check timed out. Please confirm the condition is resolved, or tell me what is still failing."
+            ),
         )
     except Exception as exc:
-        logger.warning("Verification for %s failed: %s", request.request_id, exc)
+        # Type only: the text of an exception raised while talking to a provider can echo the
+        # credential it was given.
+        logger.warning("Verification for %s failed: %s", request.request_id, type(exc).__name__)
         return VerificationResult.unchecked(
             method=reason_code,
             outcome=f"The check could not run: {type(exc).__name__}.",
-            question="I could not run the check. Please tell me the current state of the thing that is blocking this task.",
+            question=(
+                _INCONCLUSIVE_QUESTION if reason_code in _MODEL_REASONS
+                else "I could not run the check. Please tell me the current state of the thing that is blocking this task."
+            ),
         )
     return result
 
@@ -581,6 +600,97 @@ async def _verify_configuration(
     )
 
 
+# ----------------------------------------------------------------------
+# The configured model
+# ----------------------------------------------------------------------
+_PROBE_DETAIL_CHARS = 300
+
+# What to tell the operator for each category the probe can report NOW. Keyed by the probe's own
+# category, not by the reason the request was parked under: the key may now be fine while the
+# model ID is wrong, and the operator must be sent to what is wrong at this moment.
+_MODEL_FIX_HINT = {
+    "AUTH_FAILURE": (
+        "Check that LLM_API_KEY holds a valid, current key for the endpoint in LLM_BASE_URL, and "
+        "restart AirdropOS if you changed .env."
+    ),
+    "BILLING_REFUSAL": (
+        "Check the credit, spending limit and quota on the provider account that owns LLM_API_KEY."
+    ),
+    "NOT_FOUND": (
+        "Check that LLM_BASE_URL is the provider's API base URL and that LLM_MODEL_ID is exactly a "
+        "model this endpoint serves and your account can use."
+    ),
+    "MODEL_MISMATCH": (
+        "The endpoint answered with a different model from LLM_MODEL_ID while "
+        "LLM_REQUIRE_SERVED_MODEL_MATCH is on. Check that LLM_BASE_URL serves the model in "
+        "LLM_MODEL_ID."
+    ),
+}
+
+_INCONCLUSIVE_QUESTION = (
+    "I could not confirm whether the configured model works, so this task has not been resumed. "
+    "Please reply again in a moment and I will re-run the check."
+)
+
+
+def _probe_text(value: object) -> str:
+    """Provider text, safe to show and to store: the configured key removed, then clipped."""
+    return scrub_configured_secrets(str(value or "")).strip()[:_PROBE_DETAIL_CHARS]
+
+
+async def _verify_llm_model(
+    db: AsyncSession, task: Task, request: InterventionRequest
+) -> VerificationResult:
+    """Ask the ONE configured model client whether it works right now.
+
+    One small request through the client's own `health_check`. It takes no arguments, so it
+    cannot be pointed at another provider or model, and nothing here reads or changes a
+    setting. It confirms only what it saw: a healthy answer is `ok`; a refusal the operator
+    can fix is a conclusive failure naming what is wrong now; anything else (an outage, a
+    timeout, a bad request) is inconclusive, never a pass.
+    """
+    from backend.app.core.config import settings
+    from backend.app.llm.client import is_health_status_healthy, llm
+
+    probe = await llm.health_check()
+    if is_health_status_healthy(probe.get("status")):
+        if probe.get("model_matches_request") is False and getattr(
+            settings, "LLM_REQUIRE_SERVED_MODEL_MATCH", False
+        ):
+            return VerificationResult.failed(
+                method="llm_probe",
+                outcome="The endpoint answered with a different model from the configured one.",
+                question=_MODEL_FIX_HINT["MODEL_MISMATCH"],
+                error_category="MODEL_MISMATCH",
+            )
+        return VerificationResult.satisfied(
+            method="llm_probe",
+            outcome="The configured model answered a test request, so the problem is fixed.",
+            latency_ms=probe.get("latency_ms"),
+        )
+
+    category = str(probe.get("error_category") or "").upper()
+    detail = _probe_text(probe.get("detail"))
+    if category in LLM_REASON_BY_CATEGORY and not probe.get("retryable"):
+        return VerificationResult.failed(
+            method="llm_probe",
+            outcome=(
+                f"The configured model is still refusing requests ({category})"
+                + (f": {detail}" if detail else ".")
+            ),
+            question=_MODEL_FIX_HINT[category],
+            error_category=category,
+        )
+    return VerificationResult.unchecked(
+        method="llm_probe",
+        outcome=(
+            f"The check was inconclusive ({category or 'no category reported'})"
+            + (f": {detail}" if detail else ".")
+        ),
+        question=_INCONCLUSIVE_QUESTION,
+    )
+
+
 def register_default_verifiers() -> None:
     """Install the built-in verifiers. Safe to call more than once."""
     register(TELEGRAM_SESSION_UNAVAILABLE, _verify_telegram_session)
@@ -589,6 +699,8 @@ def register_default_verifiers() -> None:
     register(HUMAN_VERIFICATION, _verify_live_session)
     register(MISSING_AUTHENTICATION, _verify_authentication)
     register(MISSING_CONFIGURATION, _verify_configuration)
+    for _reason in (LLM_AUTH_FAILURE, LLM_BILLING_REFUSAL, LLM_NOT_FOUND, LLM_MODEL_MISMATCH):
+        register(_reason, _verify_llm_model)
 
 
 register_default_verifiers()

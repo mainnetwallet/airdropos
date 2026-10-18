@@ -13,6 +13,7 @@ The path under test is production: HTTP reply -> scope and ownership checks -> `
 
 import asyncio
 import logging
+import uuid
 
 import httpx
 import pytest
@@ -214,6 +215,8 @@ async def _post(client, conversation_id, text=RESUME, token=None):
 
 
 async def _agent_texts(factory, conversation_id):
+    # The conversation id arrives as the string the API returns; the UUID column needs a UUID.
+    conversation_id = uuid.UUID(str(conversation_id))
     async with factory() as db:
         rows = (await db.scalars(
             select(ConversationMessage)
@@ -466,7 +469,7 @@ async def test_a_duplicate_submission_probes_and_resumes_once(factory, client, p
     assert probe["calls"] == 1
     async with factory() as db:
         to_ready = (await db.scalars(select(TaskEvent).where(TaskEvent.task_id == pk))).all()
-        assert len([e for e in to_ready if (e.event_data or {}).get("to") == "READY"]) == 1
+        assert len([e for e in to_ready if (e.payload or {}).get("to") == "READY"]) == 1
 
 
 async def test_a_second_reply_after_the_resume_does_not_queue_another_run(factory, client, probe, monkeypatch):
@@ -480,7 +483,7 @@ async def test_a_second_reply_after_the_resume_does_not_queue_another_run(factor
     assert second.json()["resumed"] is False
     async with factory() as db:
         events = (await db.scalars(select(TaskEvent).where(TaskEvent.task_id == pk))).all()
-        assert len([e for e in events if (e.event_data or {}).get("to") == "READY"]) == 1
+        assert len([e for e in events if (e.payload or {}).get("to") == "READY"]) == 1
     assert (await _snapshot(factory, pk))["retry_count"] == 0
 
 
