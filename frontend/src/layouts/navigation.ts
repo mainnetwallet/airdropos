@@ -53,7 +53,6 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
       { to: '/worker', label: 'Live Worker', icon: Activity },
       { to: '/goals', label: 'Goals & Strategy', icon: Target },
       { to: '/automation', label: '24/7 Automation', icon: Zap },
-      { to: '/browser-profiles', label: 'Browser Profiles', icon: AppWindow },
     ],
   },
   {
@@ -64,14 +63,6 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
       { to: '/evidence', label: 'Evidence & Changes', icon: HardDrive },
       { to: '/memory', label: 'Memory & Learning', icon: Brain },
       { to: '/social', label: 'Social Monitors', icon: Radio },
-      // X.com is its own integration rather than a tab on Social Monitors: it has
-      // browser profiles, API credentials and a routing preference of its own.
-      { to: '/x', label: 'X.com Integration', icon: Twitter },
-      // Discord is its own page rather than a tab on Social Monitors: it runs on
-      // persistent browser profiles with their own accounts, and it has a login
-      // recovery flow the other social pages do not have.
-      { to: '/discord', label: 'Discord Integration', icon: MessagesSquare },
-      { to: '/telegram', label: 'Telegram Integration', icon: Send },
     ],
   },
   {
@@ -80,6 +71,20 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
       { to: '/wallets', label: 'Wallets', icon: Wallet },
       { to: '/transactions', label: 'Transactions', icon: Activity },
       { to: '/tools', label: 'Tool Registry', icon: Wrench },
+    ],
+  },
+  {
+    label: 'Automation',
+    items: [
+      { to: '/browser-profiles', label: 'Browser Profiles', icon: AppWindow },
+      // X.com is its own integration rather than a tab on Social Monitors: it has
+      // browser profiles, API credentials and a routing preference of its own.
+      { to: '/x', label: 'X.com Integration', icon: Twitter },
+      // Discord is its own page rather than a tab on Social Monitors: it runs on
+      // persistent browser profiles with their own accounts, and it has a login
+      // recovery flow the other social pages do not have.
+      { to: '/discord', label: 'Discord Integration', icon: MessagesSquare },
+      { to: '/telegram', label: 'Telegram Integration', icon: Send },
     ],
   },
   {
