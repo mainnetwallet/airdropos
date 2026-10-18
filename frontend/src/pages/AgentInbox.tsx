@@ -76,6 +76,10 @@ const REASON_LABELS: Record<string, string> = {
   AMBIGUOUS_INSTRUCTION: 'Instruction unclear',
   OPERATOR_PAUSE: 'Paused by operator',
   HUMAN_APPROVAL: 'Approval required',
+  LLM_AUTH_FAILURE: 'Model credentials rejected',
+  LLM_BILLING_REFUSAL: 'Model account out of credit',
+  LLM_NOT_FOUND: 'Model endpoint or ID not found',
+  LLM_MODEL_MISMATCH: 'Wrong model served',
   UNKNOWN: 'Unclassified blocker',
 }
 

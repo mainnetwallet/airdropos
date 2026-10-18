@@ -30,6 +30,10 @@ from backend.app.inbox.service import (
     EXTENSION_INSTALL_REQUIRED,
     HUMAN_APPROVAL,
     HUMAN_VERIFICATION,
+    LLM_AUTH_FAILURE,
+    LLM_BILLING_REFUSAL,
+    LLM_MODEL_MISMATCH,
+    LLM_NOT_FOUND,
     MISSING_AUTHENTICATION,
     MISSING_CONFIGURATION,
     OPERATOR_PAUSE,
@@ -154,6 +158,95 @@ def guidance_for(reason_code: str, error_text: str, integration_ref: Optional[st
                 "I will re-read the configuration and confirm the subsystem reports ready "
                 "before resuming."
             ),
+        }
+
+    # --- The single configured model refused the task. -------------------------------
+    # Setting names are the real ones from core/config.py. Nothing here reads a setting's
+    # value, so no key can end up in the message. The model is never called to "test" a fix
+    # (the operator's reply is the confirmation), and a repeat refusal parks the task again
+    # with the new error, so nothing is retried behind the operator's back.
+    _llm_next = (
+        "I will resume this task from the state above. If the configured model refuses it "
+        "again, I will post the new error here."
+    )
+    _llm_verified = (
+        "I do not call the model to test the fix. Your reply is recorded as the confirmation "
+        "and resuming does not use up a retry."
+    )
+
+    if reason_code == LLM_AUTH_FAILURE:
+        return {
+            "required_action": (
+                "Check the API credentials of the configured model, then tell me to resume."
+            ),
+            "where_to_act": "the server .env file for this deployment, and your model provider's dashboard",
+            "instructions": [
+                "Check that LLM_API_KEY holds a valid, current key for the endpoint in LLM_BASE_URL.",
+                "Confirm in your provider's dashboard that the key is active and has access to "
+                "the model in LLM_MODEL_ID. Do not paste the key into this chat.",
+                "Restart AirdropOS if you changed .env so the new value is picked up.",
+                "Reply here when it is fixed.",
+            ],
+            "how_verified": _llm_verified,
+            "what_happens_next": _llm_next,
+        }
+
+    if reason_code == LLM_BILLING_REFUSAL:
+        return {
+            "required_action": (
+                "Check the credit, billing or quota on your model provider account, then "
+                "tell me to resume."
+            ),
+            "where_to_act": "your model provider's billing or usage dashboard",
+            "instructions": [
+                "Open the billing or usage page of the account that owns the key in LLM_API_KEY "
+                "(the endpoint is LLM_BASE_URL).",
+                "Check the remaining credit, the spending limit and any quota for the model.",
+                "Add credit, raise the limit, or wait for the quota to reset.",
+                "Reply here when the account can be charged again.",
+            ],
+            "how_verified": _llm_verified,
+            "what_happens_next": _llm_next,
+        }
+
+    if reason_code == LLM_NOT_FOUND:
+        return {
+            "required_action": (
+                "Check the model endpoint and model ID this deployment is configured with, "
+                "then tell me to resume."
+            ),
+            "where_to_act": "the server .env file for this deployment",
+            "instructions": [
+                "Check that LLM_BASE_URL is the API base URL your provider documents, with "
+                "no typo and no missing path.",
+                "Check that LLM_MODEL_ID is exactly the ID of a model this endpoint serves "
+                "and your account can use. AirdropOS runs the one model set there.",
+                "Restart AirdropOS if you changed .env so the new values are picked up.",
+                "Reply here when it is fixed.",
+            ],
+            "how_verified": _llm_verified,
+            "what_happens_next": _llm_next,
+        }
+
+    if reason_code == LLM_MODEL_MISMATCH:
+        return {
+            "required_action": (
+                "Check that the endpoint serves the model this deployment is configured to "
+                "use, then tell me to resume."
+            ),
+            "where_to_act": "the server .env file for this deployment",
+            "instructions": [
+                "The endpoint reported serving a different model from the configured one "
+                "(LLM_MODEL_ID), and LLM_REQUIRE_SERVED_MODEL_MATCH makes that a refusal. "
+                "The error above names both.",
+                "Check that LLM_BASE_URL points at an endpoint that serves the model in "
+                "LLM_MODEL_ID. A gateway or router may be answering with another model.",
+                "Check the spelling and version of LLM_MODEL_ID. A dated variant of the same "
+                "ID is accepted.",
+                "Restart AirdropOS if you changed .env, then reply here.",
+            ],
+            "how_verified": _llm_verified,
+            "what_happens_next": _llm_next,
         }
 
     if reason_code == OPERATOR_PAUSE:
@@ -328,7 +421,7 @@ async def park_for_intervention(
             instructions=guidance["instructions"],
             where_to_act=guidance.get("where_to_act") or None,
             how_verified=guidance["how_verified"],
-            what_happens_next=(
+            what_happens_next=guidance.get("what_happens_next") or (
                 "I will re-check the condition, and resume this task from the state above "
                 "only if it passes. If it has not, I will tell you here what is still wrong."
             ),

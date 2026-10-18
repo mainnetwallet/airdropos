@@ -298,7 +298,7 @@ class InterventionRequest(Base):
 
     # MISSING_AUTHENTICATION, TELEGRAM_SESSION_UNAVAILABLE, BROWSER_SESSION_UNAVAILABLE,
     # HUMAN_VERIFICATION, MISSING_CONFIGURATION, AMBIGUOUS_INSTRUCTION, OPERATOR_PAUSE,
-    # HUMAN_APPROVAL, UNKNOWN
+    # HUMAN_APPROVAL, LLM_AUTH_FAILURE, LLM_BILLING_REFUSAL, LLM_NOT_FOUND, LLM_MODEL_MISMATCH, UNKNOWN
     reason_code: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     problem_summary: Mapped[str] = mapped_column(String(500), nullable=False)
     detailed_explanation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

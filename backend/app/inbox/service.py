@@ -22,6 +22,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.config import settings
 from backend.app.models import (
     AgentConversation,
     ConversationMessage,
@@ -55,6 +56,13 @@ class InterventionReason(str, Enum):
     AMBIGUOUS_INSTRUCTION = "AMBIGUOUS_INSTRUCTION"
     OPERATOR_PAUSE = "OPERATOR_PAUSE"
     HUMAN_APPROVAL = "HUMAN_APPROVAL"
+    # The single configured model refused the task for a reason only the operator can fix.
+    # Named for the model so they are never mistaken for a tool, wallet or Telegram blocker
+    # (tools raise AUTH_FAILURE / NOT_FOUND of their own).
+    LLM_AUTH_FAILURE = "LLM_AUTH_FAILURE"
+    LLM_BILLING_REFUSAL = "LLM_BILLING_REFUSAL"
+    LLM_NOT_FOUND = "LLM_NOT_FOUND"
+    LLM_MODEL_MISMATCH = "LLM_MODEL_MISMATCH"
     UNKNOWN = "UNKNOWN"
 
 
@@ -69,6 +77,42 @@ AMBIGUOUS_INSTRUCTION = InterventionReason.AMBIGUOUS_INSTRUCTION.value
 OPERATOR_PAUSE = InterventionReason.OPERATOR_PAUSE.value
 HUMAN_APPROVAL = InterventionReason.HUMAN_APPROVAL.value
 UNKNOWN_REASON = InterventionReason.UNKNOWN.value
+LLM_AUTH_FAILURE = InterventionReason.LLM_AUTH_FAILURE.value
+LLM_BILLING_REFUSAL = InterventionReason.LLM_BILLING_REFUSAL.value
+LLM_NOT_FOUND = InterventionReason.LLM_NOT_FOUND.value
+LLM_MODEL_MISMATCH = InterventionReason.LLM_MODEL_MISMATCH.value
+
+# `LLMError.category` values (llm/client.py) that the operator can fix, and the inbox reason
+# each one is raised under. Keyed by the model client's own category, which is authoritative:
+# the same words ("401", "not found") also come from tools, so the failure text is never used
+# to decide that a failure is about the model.
+LLM_REASON_BY_CATEGORY = {
+    "AUTH_FAILURE": LLM_AUTH_FAILURE,
+    "BILLING_REFUSAL": LLM_BILLING_REFUSAL,
+    "NOT_FOUND": LLM_NOT_FOUND,
+    "MODEL_MISMATCH": LLM_MODEL_MISMATCH,
+}
+
+
+def classify_llm_reason(category: Optional[str]) -> Optional[str]:
+    """The inbox reason for a non-retryable model error, or None when it is not operator-fixable.
+
+    Call this only for an error raised by the model client. Anything else (a tool's own
+    AUTH_FAILURE or NOT_FOUND, say) must go through `classify_reason`.
+    """
+    return LLM_REASON_BY_CATEGORY.get((category or "").upper())
+
+
+def scrub_configured_secrets(text: str) -> str:
+    """Remove the configured model API key from text that may echo it back.
+
+    Pattern-based redaction only catches keys that look like keys. A provider can quote the
+    exact value it rejected in any shape, so this removes that value itself.
+    """
+    secret = getattr(settings, "LLM_API_KEY", None) or ""
+    if text and len(secret) >= 8 and secret in text:
+        return text.replace(secret, "[REDACTED]")
+    return text
 
 # Reasons whose blocking condition can be checked by the backend. Anything outside this set is
 # resolved by explicit operator intent, never by an informational message.

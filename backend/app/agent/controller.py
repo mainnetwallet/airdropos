@@ -235,14 +235,17 @@ from backend.app.inbox.raise_intervention import park_for_intervention  # noqa: 
 from backend.app.inbox.service import (  # noqa: E402
     AMBIGUOUS_INSTRUCTION,
     HUMAN_VERIFICATION,
+    LLM_REASON_BY_CATEGORY,
     OPERATOR_FALLBACK_EMAIL,
     OPERATOR_PAUSE,
+    classify_llm_reason,
+    scrub_configured_secrets,
 )
 
 
 # Non-retryable model errors a person can fix (credentials, billing, endpoint/model settings).
 # Every other non-retryable error settles the task as FAILED.
-USER_FIXABLE_LLM_ERRORS = frozenset({"AUTH_FAILURE", "BILLING_REFUSAL", "NOT_FOUND", "MODEL_MISMATCH"})
+USER_FIXABLE_LLM_ERRORS = frozenset(LLM_REASON_BY_CATEGORY)
 
 
 class LoopOutcome(str, Enum):
@@ -498,6 +501,9 @@ class AgentController:
                     f"The configured model returned an error that retrying cannot fix "
                     f"({category}): {clip(exc, 300)}. No step ran; the task was stopped."
                 )
+            # A provider can quote back the key it rejected; the generic redaction only knows
+            # key-shaped strings, so remove the configured value itself.
+            blocker = scrub_configured_secrets(blocker)
             logger.error("RUN pre_plan_failed task=%s category=%s retryable=%s", task.task_id, category, retryable)
             report.outcome = LoopOutcome.FAILED
             report.blockers.append(blocker)
@@ -524,7 +530,10 @@ class AgentController:
                     task.next_execution_at = None
                     task.error_details = details
                     parked = await self._request_operator_input(
-                        task, iteration=iteration, error_text=blocker, error_category=category
+                        task, iteration=iteration, error_text=blocker, error_category=category,
+                        # The model client's category names the reason; the failure text must
+                        # not, because tools raise the same words.
+                        force_reason_code=classify_llm_reason(category),
                     )
                     if parked is None and task.status == TaskStatus.IN_PROGRESS.value:
                         # No inbox entry could be raised; still never leave the task IN_PROGRESS.
