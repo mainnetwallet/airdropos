@@ -301,14 +301,12 @@ async def _record_health(db: AsyncSession, subsystem: str, status: str, detail: 
 # ----------------------------------------------------------------------
 # Task execution loop
 # ----------------------------------------------------------------------
-RETRY_BACKOFF_BASE_SECONDS = 30
-RETRY_BACKOFF_MAX_SECONDS = 600
-
-
-def retry_delay_seconds(retry_count: int) -> int:
-    """Exponential backoff for the next attempt, bounded by RETRY_BACKOFF_MAX_SECONDS."""
-    exponent = max(0, min(int(retry_count), 20))
-    return min(RETRY_BACKOFF_BASE_SECONDS * (2 ** exponent), RETRY_BACKOFF_MAX_SECONDS)
+# The backoff lives in tasks.recovery so the controller and the worker schedule retries identically.
+from backend.app.tasks.recovery import (  # noqa: E402
+    RETRY_BACKOFF_BASE_SECONDS,
+    RETRY_BACKOFF_MAX_SECONDS,
+    retry_delay_seconds,
+)
 
 
 async def _release_task_leases(db: AsyncSession, task_pk: Any, reason: str) -> None:

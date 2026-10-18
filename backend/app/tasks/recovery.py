@@ -263,5 +263,15 @@ def _sanitize_diagnostics(data: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
+RETRY_BACKOFF_BASE_SECONDS = 30
+RETRY_BACKOFF_MAX_SECONDS = 600
+
+
+def retry_delay_seconds(retry_count: int) -> int:
+    """Exponential backoff for the next attempt, bounded by RETRY_BACKOFF_MAX_SECONDS."""
+    exponent = max(0, min(int(retry_count), 20))
+    return min(RETRY_BACKOFF_BASE_SECONDS * (2 ** exponent), RETRY_BACKOFF_MAX_SECONDS)
+
+
 def next_retry_at(backoff_seconds: int) -> datetime:
     return datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)

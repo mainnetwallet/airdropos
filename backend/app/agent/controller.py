@@ -67,7 +67,7 @@ from backend.app.tasks.concurrency import (
     new_run_worker_id,
 )
 from backend.app.tasks.manager import TaskManager
-from backend.app.tasks.recovery import FailureDiagnosisEngine, next_retry_at
+from backend.app.tasks.recovery import FailureDiagnosisEngine, next_retry_at, retry_delay_seconds
 from backend.app.tasks.state_machine import CompletionProof, TaskStatus
 from backend.app.tasks.telemetry import registry as task_usage_registry
 from backend.app.tools.context import task_context
@@ -486,6 +486,9 @@ class AgentController:
             await self._checkpoint(task, iteration, "pre_plan_failed")
             await self._flush_telemetry(task)
             if task.status == TaskStatus.IN_PROGRESS.value:
+                # Back off like every other retry path. Without a schedule the task was claimable
+                # at once, so a short outage spent the whole retry budget within seconds.
+                task.next_execution_at = next_retry_at(retry_delay_seconds(task.retry_count))
                 await self.tasks.transition(
                     task,
                     TaskStatus.RETRYING,
