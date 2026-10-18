@@ -47,15 +47,27 @@
 
 ```mermaid
 flowchart LR
-    D[Dashboard<br/>React] -- REST + WebSocket --> A[API<br/>FastAPI]
-    A --> DB[(PostgreSQL / SQLite)]
-    W[Worker<br/>scheduler + agent] --> DB
-    A -- internal gateway --> W
-    W --> B[Playwright<br/>browsers]
-    W --> T[Telegram, Discord, X]
-    W --> C[EVM chains]
-    W --> L[Your LLM]
+    D["Dashboard<br/>React"] -- "REST + WebSocket" --> A["API<br/>FastAPI"]
+
+    subgraph Backend
+        A
+        W["Worker<br/>task runner + scheduler"]
+    end
+
+    A -- "creates tasks, schedules" --> DB[("PostgreSQL / SQLite")]
+    W -- "claims and runs tasks" --> DB
+    A -- "internal gateway<br/>(live view and control)" --> W
+
+    A -- "agent chat" --> L["Your LLM"]
+    W -- "plans tasks" --> L
+    W --> B["Playwright browsers<br/>Chrome profiles, Discord, X"]
+    W --> T["Telegram account<br/>X API"]
+    W --> C["EVM chains<br/>RPC"]
 ```
+
+- **API** handles login, the dashboard, agent chat and operator actions. A new task is saved to the database and executed by the worker, not by the API.
+- **Worker** picks tasks up from the database and runs them. It also fires your schedules, and it owns the browsers and the Telegram client, so the API reaches them only through the internal gateway.
+- **Database** is the single source of truth. There is no separate queue.
 
 One LLM, one API key, one model. No routing and no fallback model. The LLM plans, and fixed code does the rest.
 
