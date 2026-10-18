@@ -134,6 +134,16 @@ class Settings(BaseSettings):
             "gone on the next call. 0 disables the retry."
         ),
     )
+    LLM_SEND_RESPONSE_FORMAT: bool = Field(
+        default=True,
+        description=(
+            "Send response_format={'type':'json_object'} on JSON-mode requests. Some routers "
+            "and reasoning models answer that with reasoning only and an empty body "
+            "(EMPTY_CONTENT). Set false to never send it: the system prompt already requires "
+            "JSON and the client's parser tolerates fences and prose. When left true, the "
+            "client still drops it automatically on the retry after an empty reply."
+        ),
+    )
     # Retries after the first attempt. Capped at 1 by the client: one retry on error, then fail.
     LLM_STREAM_INCLUDE_USAGE: bool = Field(
         default=True,

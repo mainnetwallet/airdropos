@@ -306,7 +306,7 @@ class FixedLLMClient:
         limit = self._output_limit(max_tokens)
         if limit is not None:
             payload["max_tokens"] = limit
-        if json_mode:
+        if json_mode and settings.LLM_SEND_RESPONSE_FORMAT:
             payload["response_format"] = {"type": "json_object"}
         if stop:
             payload["stop"] = stop
@@ -614,12 +614,17 @@ class FixedLLMClient:
 
         attempts = 0
         empty_retries = 0
+        # After an empty (reasoning-only) reply the retry is sent WITHOUT response_format.
+        # The system prompt still demands JSON and `parse_json` tolerates fences/prose, but
+        # many routers return no body at all for reasoning models under json_object mode,
+        # so repeating the identical request just repeats the failure.
+        wire_json_mode = json_mode
         while True:
             payload = self._build_payload(
                 prepared,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                json_mode=json_mode,
+                json_mode=wire_json_mode,
                 stop=stop,
             )
             estimated = count_request_tokens(prepared)
@@ -685,9 +690,12 @@ class FixedLLMClient:
                     self._record_task_usage(
                         raw.get("usage"), raw.get("model") or None
                     )
+                    if wire_json_mode:
+                        wire_json_mode = False
+                        trace.warnings.append("empty_content_retry_without_response_format")
                     logger.warning(
                         "llm.empty_content the model returned reasoning but no answer; "
-                        "retrying the same request (%s/%s)",
+                        "retrying without response_format (%s/%s)",
                         empty_retries,
                         settings.LLM_EMPTY_CONTENT_MAX_RETRIES,
                     )

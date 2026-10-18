@@ -215,6 +215,24 @@ async def test_empty_content_retry_is_counted_and_resends_the_same_request(trans
     assert trace["outcome"] == "ok"
 
 
+async def test_empty_content_retry_drops_response_format_in_json_mode(transport):
+    reasoning_only = ok_body(content="")
+    reasoning_only["choices"][0]["message"]["reasoning"] = "thought, never answered"
+    transport.replies = [reasoning_only, ok_body(content='{"reply": "hi"}')]
+    response = await FixedLLMClient().complete([Message("user", "q")], json_mode=True)
+
+    assert response.content == '{"reply": "hi"}'
+    assert transport.payloads[0]["response_format"] == {"type": "json_object"}
+    assert "response_format" not in transport.payloads[1]
+
+
+async def test_response_format_can_be_disabled_by_setting(transport, monkeypatch):
+    monkeypatch.setattr(settings, "LLM_SEND_RESPONSE_FORMAT", False)
+    transport.replies = [ok_body(content='{"reply": "hi"}')]
+    await FixedLLMClient().complete([Message("user", "q")], json_mode=True)
+    assert "response_format" not in transport.payloads[0]
+
+
 # -------------------------------------------------------------- compaction
 def small_budget(monkeypatch, trigger=400):
     monkeypatch.setattr(settings, "LLM_CONTEXT_COMPACTION_TRIGGER_TOKENS", trigger)
