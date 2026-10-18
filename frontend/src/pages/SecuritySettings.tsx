@@ -11,13 +11,11 @@ import { NAV_SECTIONS } from '@/layouts/navigation'
 
 /** Pages that are not in the bottom tab bar; the phone's "More" list links to them. */
 const MORE_ROUTES = new Set([
-  '/goals',
   '/tools',
   '/transactions',
   '/worker',
   '/diagnostics',
   '/memory',
-  '/evidence',
   '/social',
   '/automation',
   '/telegram',

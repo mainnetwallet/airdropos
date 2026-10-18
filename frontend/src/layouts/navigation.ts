@@ -9,7 +9,6 @@ import {
   Compass,
   Gauge,
   GitBranch,
-  HardDrive,
   Hexagon,
   Home,
   Inbox,
@@ -21,7 +20,6 @@ import {
   RadioTower,
   Send,
   Settings,
-  Target,
   Twitter,
   Wallet,
   Wrench,
@@ -51,7 +49,6 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
       { to: '/inbox', label: 'Agent Inbox', icon: Inbox, badge: 'inboxNeedsReply' },
       { to: '/live', label: 'Live Broadcast', icon: RadioTower },
       { to: '/worker', label: 'Live Worker', icon: Activity },
-      { to: '/goals', label: 'Goals & Strategy', icon: Target },
       { to: '/automation', label: '24/7 Automation', icon: Zap },
     ],
   },
@@ -60,7 +57,6 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
     items: [
       { to: '/airdrops', label: 'Airdrop Explorer', icon: Compass },
       { to: '/tasks', label: 'Task Manager', icon: Layers },
-      { to: '/evidence', label: 'Evidence & Changes', icon: HardDrive },
       { to: '/memory', label: 'Memory & Learning', icon: Brain },
       { to: '/social', label: 'Social Monitors', icon: Radio },
     ],
@@ -116,7 +112,7 @@ export const BOTTOM_TABS: BottomTab[] = [
 ]
 
 /**
- * Secondary pages highlight the tab they belong to (Tools, Goals and the
+ * Secondary pages highlight the tab they belong to (Tools and the
  * automation pages sit under Tasks; Telegram under Airdrops; Transactions and
  * the worker/diagnostics screens under Wallets, as drawn in the reference).
  * Pages with no natural tab (Settings, Memory, ...) highlight nothing.
@@ -132,7 +128,6 @@ export const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
   ['/discord', 'airdrops'],
   ['/tasks', 'tasks'],
   ['/tools', 'tasks'],
-  ['/goals', 'tasks'],
   ['/automation', 'tasks'],
   ['/browser-profiles', 'tasks'],
   ['/live', 'tasks'],

@@ -1,197 +1,25 @@
 /** Remaining dashboard pages, grouped to keep the router simple. */
 
-import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Activity,
   Brain,
   Compass,
   GitBranch,
-  LifeBuoy,
-  Plus,
   Radio,
   Search,
-  Target,
   Zap,
 } from 'lucide-react'
-import clsx from 'clsx'
 import { api } from '@/services/api'
 import {
   Card,
   Chips,
   EmptyState,
   ErrorState,
-  IconTile,
   Loading,
   PageHeader,
-  ProgressBar,
-  SegmentedTabs,
 } from '@/components/ui'
-
-// ==================================================================== Goals
-type GoalsTab = 'goals' | 'strategies' | 'progress'
-
-export function Goals() {
-  const { data, isLoading, error, refetch } = useQuery({ queryKey: ['goals'], queryFn: api.listGoals })
-  const { data: overview } = useQuery({ queryKey: ['overview'], queryFn: api.overview, refetchInterval: 10000 })
-  const queryClient = useQueryClient()
-  const navigate = useNavigate()
-  const [tab, setTab] = useState<GoalsTab>('goals')
-  const pause = useMutation({
-    mutationFn: (id: string) => api.pauseGoal(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['goals'] }),
-  })
-  const resume = useMutation({
-    mutationFn: (id: string) => api.resumeGoal(id),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['goals'] }),
-  })
-
-  if (isLoading) return <Loading label="Loading goals" />
-  if (error) return <ErrorState error={error} onRetry={() => refetch()} />
-
-  const goals = data?.goals ?? []
-  const active = goals.filter((g) => g.status === 'ACTIVE').length
-  const average = goals.length ? goals.reduce((sum, g) => sum + g.progress, 0) / goals.length : 0
-
-  return (
-    <div className="space-y-4 pt-1 lg:space-y-6 lg:pt-0">
-      <PageHeader
-        title={
-          <>
-            <span className="lg:hidden">Goals & Planning</span>
-            <span className="hidden lg:inline">Goals & Strategy</span>
-          </>
-        }
-        subtitle={
-          <>
-            <span className="lg:hidden">Set goals and track progress</span>
-            <span className="hidden lg:inline">Persistent long-term objectives</span>
-          </>
-        }
-        action={
-          // Goals are defined by the agent, so this opens Chat with a draft (nothing is sent).
-          <button
-            type="button"
-            aria-label="Define a new goal with the agent"
-            onClick={() => navigate('/agent', { state: { prompt: 'Define a new long-term goal: ' } })}
-            className="flex h-11 w-11 items-center justify-center rounded-full border border-accent/40 bg-accent/10 text-accent lg:hidden"
-          >
-            <Plus className="h-5 w-5" />
-          </button>
-        }
-      />
-
-      <SegmentedTabs
-        value={tab}
-        onChange={setTab}
-        items={[
-          { id: 'goals', label: 'Goals' },
-          { id: 'strategies', label: 'Strategies' },
-          { id: 'progress', label: 'Progress' },
-        ]}
-      />
-
-      {/* Goals */}
-      <div className={clsx(tab !== 'goals' && 'hidden lg:block')}>
-        {goals.length === 0 ? (
-          <EmptyState
-            title="No goals defined"
-            description="Ask the agent to define a long-term goal, e.g. 'Continuously discover and complete legitimate airdrops.'"
-            icon={<Target className="h-8 w-8" />}
-          />
-        ) : (
-          <div className="grid gap-3 lg:grid-cols-2 lg:gap-4">
-            {goals.map((goal) => (
-              <Card key={goal.id}>
-                <div className="flex items-start gap-3">
-                  <IconTile tone={goal.status === 'ACTIVE' ? 'orange' : 'slate'} className="lg:hidden">
-                    <Target />
-                  </IconTile>
-                  <div className="flex min-w-0 flex-1 items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="font-mono text-xs text-slate-500">{goal.goal_code}</p>
-                      <h3 className="mt-0.5 font-medium text-slate-100">{goal.title}</h3>
-                    </div>
-                    <span
-                      className={`badge shrink-0 ${goal.status === 'ACTIVE' ? 'bg-green-900 text-green-300' : 'bg-slate-800 text-slate-400'}`}
-                    >
-                      {goal.status}
-                    </span>
-                  </div>
-                </div>
-                <ProgressBar value={goal.progress} className="mt-3" />
-                <p className="mt-1 text-xs text-slate-500">{Math.round(goal.progress * 100)}% complete</p>
-                {goal.next_planned_action && (
-                  <p className="mt-3 text-xs text-slate-400">
-                    <span className="text-slate-500">Next:</span> {goal.next_planned_action}
-                  </p>
-                )}
-                {goal.blockers.length > 0 && (
-                  <ul className="mt-2 space-y-1">
-                    {goal.blockers.map((b, i) => (
-                      <li key={i} className="text-xs text-status-warning">• {b}</li>
-                    ))}
-                  </ul>
-                )}
-                <div className="mt-4 flex gap-2 border-t border-surface-300 pt-3">
-                  {goal.status === 'ACTIVE' ? (
-                    <button onClick={() => pause.mutate(goal.id)} className="btn-ghost flex-1 justify-center">
-                      Pause
-                    </button>
-                  ) : (
-                    <button onClick={() => resume.mutate(goal.id)} className="btn-primary flex-1 justify-center">
-                      Resume
-                    </button>
-                  )}
-                </div>
-              </Card>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Strategies (phone tab): the backend does not expose these yet */}
-      {tab === 'strategies' && (
-        <div className="lg:hidden">
-          <EmptyState
-            title="No strategy data"
-            description="Strategies are not exposed by the backend yet. Goals carry their next planned action."
-            icon={<Compass className="h-8 w-8" />}
-          />
-        </div>
-      )}
-
-      {/* Progress (phone tab): computed from real goals and task counts */}
-      {tab === 'progress' && (
-        <div className="space-y-3 lg:hidden">
-          <Card>
-            <p className="stat-label">Average goal progress</p>
-            <p className="stat-value mt-1">{Math.round(average * 100)}%</p>
-            <ProgressBar value={average} className="mt-3" />
-            <p className="mt-2 text-xs text-slate-500">
-              {goals.length} {goals.length === 1 ? 'goal' : 'goals'}, {active} active
-            </p>
-          </Card>
-          {overview && (
-            <div className="grid grid-cols-3 gap-2 text-center">
-              {[
-                { label: 'Active tasks', value: overview.active_tasks },
-                { label: 'Completed', value: overview.completed_tasks },
-                { label: 'Failed', value: overview.failed_tasks },
-              ].map((item) => (
-                <Card key={item.label} className="px-2">
-                  <p className="text-xl font-bold text-slate-100">{item.value}</p>
-                  <p className="text-xs text-slate-500">{item.label}</p>
-                </Card>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
 
 // ==================================================================== Memory
 export function Memory() {
@@ -489,15 +317,6 @@ export const Automation = () => (
     description="Schedules, recurring jobs, and monitoring intervals"
     icon={<Zap className="h-8 w-8" />}
     note="The scheduler and worker daemon are implemented. A schedule-management API is not yet exposed."
-  />
-)
-
-export const Evidence = () => (
-  <Placeholder
-    title="Evidence & Changes"
-    description="Source claims, verification history, and change records"
-    icon={<LifeBuoy className="h-8 w-8" />}
-    note="The change detector and source verifier exist in backend/app/airdrops/verifier.py; a query endpoint is not yet exposed."
   />
 )
 

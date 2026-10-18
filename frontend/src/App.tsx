@@ -27,8 +27,6 @@ const named = (pick: string) => lazy(() => import('@/pages').then((m) => ({ defa
 const Airdrops = named('Airdrops')
 const Automation = named('Automation')
 const Diagnostics = named('Diagnostics')
-const Evidence = named('Evidence')
-const Goals = named('Goals')
 const Improvements = named('Improvements')
 const Memory = named('Memory')
 const Social = named('Social')
@@ -53,7 +51,6 @@ const router = createBrowserRouter([
       { path: 'agent', element: <AgentChat /> },
       { path: 'inbox', element: <AgentInbox /> },
       { path: 'worker', element: <WorkerLive /> },
-      { path: 'goals', element: <Goals /> },
       { path: 'automation', element: <Automation /> },
       { path: 'browser-profiles', element: <BrowserProfiles /> },
       { path: 'live', element: <LiveBroadcast /> },
@@ -61,7 +58,6 @@ const router = createBrowserRouter([
       { path: 'telegram', element: <Telegram /> },
       { path: 'airdrops', element: <Airdrops /> },
       { path: 'tasks', element: <TaskManagerPage /> },
-      { path: 'evidence', element: <Evidence /> },
       { path: 'memory', element: <Memory /> },
       { path: 'social', element: <Social /> },
       { path: 'x', element: <XIntegration /> },
