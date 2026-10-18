@@ -6,6 +6,7 @@ import {
   AppWindow,
   Bot,
   Brain,
+  CalendarClock,
   Compass,
   Gauge,
   GitBranch,
@@ -72,6 +73,7 @@ export const NAV_SECTIONS: Array<{ label: string; items: NavItem[] }> = [
   {
     label: 'Automation',
     items: [
+      { to: '/scheduler', label: 'Scheduler', icon: CalendarClock },
       { to: '/browser-profiles', label: 'Browser Profiles', icon: AppWindow },
       // X.com is its own integration rather than a tab on Social Monitors: it has
       // browser profiles, API credentials and a routing preference of its own.
@@ -129,6 +131,7 @@ export const ROUTE_TABS: Array<[prefix: string, tab: TabId]> = [
   ['/tasks', 'tasks'],
   ['/tools', 'tasks'],
   ['/automation', 'tasks'],
+  ['/scheduler', 'tasks'],
   ['/browser-profiles', 'tasks'],
   ['/live', 'tasks'],
   ['/wallets', 'wallets'],

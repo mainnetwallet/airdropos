@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.database.session import AsyncSessionLocal, engine
 from backend.app.models import IntegrationHealth, Task
 from backend.app.notifications.dispatcher import Severity, dispatcher
+from backend.app.scheduler import user_tasks
 from backend.app.scheduler.scheduler import DEFAULT_JOBS, scheduler
 from backend.app.browser.controller import controller as browser_controller
 from backend.app.live import gateway as live_gateway
@@ -802,6 +803,9 @@ async def main() -> None:
             logger.error("No handler for job type '%s' (%s); it will not run.", job_type, job_name)
             continue
         scheduler.register_job(job_name, job_type, interval, handler)
+
+    # User-defined schedules (Scheduler page) are rows of one job type, created at runtime.
+    scheduler.register_job_type(user_tasks.JOB_TYPE, user_tasks.run_schedule)
 
     async with AsyncSessionLocal() as db:
         for job_name, job_type, interval in DEFAULT_JOBS:

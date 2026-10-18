@@ -5,6 +5,23 @@ All notable changes to the AirdropOS project are documented below.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added (Scheduler: run your own tasks on a schedule)
+- **New Scheduler page** (`/scheduler`, under the Automation menu). Create a schedule that starts a
+  task automatically: every N minutes/hours/days, on a 5-field cron expression in a chosen
+  timezone, or once at a set time. Each schedule can be edited, paused, resumed, run immediately
+  ("Run now") or deleted, and shows its next run, last run, run count and per-run history. The form
+  previews the next five run times using the backend, so the browser never reimplements cron.
+- **Backend:** `GET/POST /api/v1/scheduled-tasks`, `PATCH/DELETE /{id}`, `POST /{id}/pause`,
+  `/resume`, `/run-now`, `GET /{id}/runs` and `POST /preview`. Schedules are `AutomationSchedule`
+  rows of type `USER_TASK` (no migration needed); system jobs are never listed or editable here.
+  Every fire creates and queues a normal task, so it appears in Task Manager.
+- **Scheduler:** the persistent scheduler now supports `CRON` and `ONCE` triggers (a finished
+  one-time schedule deactivates itself) and handlers bound to a job type, so runtime-created rows
+  fire without a restart. Existing system jobs are unchanged. A run is recorded as `SKIPPED` when
+  "skip if previous run unfinished" applies. Schedules only fire while the worker is running; the
+  page warns when it is not.
+- **Safety limits:** at least 5 minutes between runs (a cron expression that can fire more often
+  is rejected), at most 100 schedules, DST-gap times are skipped rather than invented.
 ### Added (X.com integration: browser profiles + official X API v2)
 - **X.com is now one capability with two methods, and the agent picks per task.** A new
   `backend/app/integrations/x/` package holds the API transport, credential store, routing

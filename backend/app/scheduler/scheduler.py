@@ -17,12 +17,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.app.core.config import settings
 from backend.app.database.session import AsyncSessionLocal
 from backend.app.models import AutomationSchedule, ScheduledRun
+from backend.app.scheduler.user_tasks import compute_next_run
 from backend.app.security.emergency_stop import emergency_stop
 from backend.app.terminal.events import publish_success
 
 logger = logging.getLogger(__name__)
 
 JobHandler = Callable[[AsyncSession, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+# Handlers bound to a job TYPE rather than a fixed job name. They receive the whole schedule
+# row, because the many rows of one type (user-defined schedules) differ only by payload.
+ScheduleHandler = Callable[[AsyncSession, AutomationSchedule], Awaitable[Dict[str, Any]]]
 
 
 class Scheduler:
@@ -30,6 +34,7 @@ class Scheduler:
 
     def __init__(self) -> None:
         self._jobs: Dict[str, JobHandler] = {}
+        self._type_handlers: Dict[str, ScheduleHandler] = {}
         self._tasks: Dict[str, asyncio.Task] = {}
         self._running = False
 
@@ -44,6 +49,11 @@ class Scheduler:
         # count, which is the number an operator actually wants; the per-job detail
         # (name, interval) stays one `LOG_LEVEL=DEBUG` away.
         logger.debug("Registered scheduler job '%s' every %smin", job_name, interval_minutes)
+
+    def register_job_type(self, job_type: str, handler: ScheduleHandler) -> None:
+        """Bind a handler to every schedule of ``job_type`` (rows created at runtime)."""
+        self._type_handlers[job_type] = handler
+        logger.debug("Registered scheduler handler for job type '%s'", job_type)
 
     # ------------------------------------------------------------------
     async def ensure_schedule(self, db: AsyncSession, job_name: str, job_type: str, interval_minutes: int) -> AutomationSchedule:
@@ -123,28 +133,65 @@ class Scheduler:
         ).scalars().all()
 
         for schedule in due:
-            handler = self._jobs.get(schedule.job_name)
+            handler = self._resolve_handler(schedule)
             if handler is None:
                 logger.warning("No handler registered for schedule '%s'", schedule.job_name)
             else:
                 await self._run_job(db, schedule, handler)
 
             # Reschedule regardless of outcome so one failure does not kill the job.
-            interval = schedule.interval_minutes or 60
-            schedule.next_run_at = now + timedelta(minutes=interval)
             schedule.last_run_at = now
             schedule.total_runs += 1
+            self._advance(schedule, now)
             await db.commit()
 
-    async def _run_job(self, db: AsyncSession, schedule: AutomationSchedule, handler: JobHandler) -> None:
+    def _resolve_handler(self, schedule: AutomationSchedule) -> Optional[ScheduleHandler]:
+        by_name = self._jobs.get(schedule.job_name)
+        if by_name is not None:
+            payload_handler = by_name
+
+            async def _call(db: AsyncSession, sched: AutomationSchedule) -> Dict[str, Any]:
+                return await payload_handler(db, sched.payload or {})
+
+            return _call
+        return self._type_handlers.get(schedule.job_type)
+
+    @staticmethod
+    def _advance(schedule: AutomationSchedule, now: datetime) -> None:
+        """Set the next fire time. A finished one-time schedule deactivates itself."""
+        trigger = (schedule.trigger_type or "INTERVAL").upper()
+        if trigger == "INTERVAL":
+            schedule.next_run_at = now + timedelta(minutes=schedule.interval_minutes or 60)
+            return
+        payload = schedule.payload or {}
+        try:
+            nxt = compute_next_run(
+                trigger,
+                after=now,
+                interval_minutes=schedule.interval_minutes,
+                cron_expression=schedule.cron_expression,
+                timezone_name=payload.get("timezone"),
+                run_at=payload.get("run_at"),
+            )
+        except Exception:
+            logger.exception("Cannot compute the next run of '%s'; deactivating it", schedule.job_name)
+            nxt = None
+        if nxt is None:
+            schedule.is_active = False
+            schedule.next_run_at = None
+        else:
+            schedule.next_run_at = nxt
+
+    async def _run_job(self, db: AsyncSession, schedule: AutomationSchedule, handler: ScheduleHandler) -> None:
         run = ScheduledRun(schedule_id=schedule.id, status="RUNNING")
         db.add(run)
         await db.commit()
         started = datetime.now(timezone.utc)
 
         try:
-            result = await handler(db, schedule.payload or {})
-            run.status = "SUCCESS"
+            result = await handler(db, schedule)
+            # A handler can decline to act (for example, the previous run is still going).
+            run.status = "SKIPPED" if isinstance(result, dict) and result.get("skipped") else "SUCCESS"
             run.result_summary = result
         except asyncio.CancelledError:
             run.status = "CANCELLED"

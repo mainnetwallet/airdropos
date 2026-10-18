@@ -316,7 +316,7 @@ export const Automation = () => (
     title="24/7 Automation"
     description="Schedules, recurring jobs, and monitoring intervals"
     icon={<Zap className="h-8 w-8" />}
-    note="The scheduler and worker daemon are implemented. A schedule-management API is not yet exposed."
+    note="The scheduler and worker daemon are implemented. To run your own tasks on a schedule, use the Scheduler page; a management API for the built-in system jobs is not yet exposed."
   />
 )
 

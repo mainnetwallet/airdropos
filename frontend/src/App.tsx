@@ -19,6 +19,7 @@ const Wallets = lazy(() => import('@/pages/Wallets'))
 const SecuritySettings = lazy(() => import('@/pages/SecuritySettings'))
 const Telegram = lazy(() => import('@/pages/Telegram'))
 const BrowserProfiles = lazy(() => import('@/pages/BrowserProfiles'))
+const Scheduler = lazy(() => import('@/pages/Scheduler'))
 const XIntegration = lazy(() => import('@/pages/XIntegration'))
 const Discord = lazy(() => import('@/pages/Discord'))
 const LiveBroadcast = lazy(() => import('@/pages/LiveBroadcast'))
@@ -53,6 +54,7 @@ const router = createBrowserRouter([
       { path: 'worker', element: <WorkerLive /> },
       { path: 'automation', element: <Automation /> },
       { path: 'browser-profiles', element: <BrowserProfiles /> },
+      { path: 'scheduler', element: <Scheduler /> },
       { path: 'live', element: <LiveBroadcast /> },
       { path: 'live/:integration/:key', element: <LiveSessionPage /> },
       { path: 'telegram', element: <Telegram /> },

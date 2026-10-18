@@ -41,6 +41,12 @@ import type {
   LiveOverview,
   LiveSession,
 } from '@/types/live'
+import type {
+  ScheduledTask,
+  ScheduledTaskInput,
+  ScheduledTaskList,
+  ScheduleRun,
+} from '@/types/scheduler'
 import { takeSseFrames } from '@/services/sse'
 import type {
   XActivityRecord,
@@ -433,6 +439,43 @@ export const api = {
       `/agent/conversations/${encodeURIComponent(conversationId)}`,
       { method: 'DELETE' },
     ),
+
+  // --- Scheduled tasks --------------------------------------------------
+  listScheduledTasks: () => request<ScheduledTaskList>('/scheduled-tasks'),
+  createScheduledTask: (body: ScheduledTaskInput & { is_active?: boolean }) =>
+    request<ScheduledTask>('/scheduled-tasks', { method: 'POST', body: JSON.stringify(body) }),
+  updateScheduledTask: (id: string, body: Partial<ScheduledTaskInput>) =>
+    request<ScheduledTask>(`/scheduled-tasks/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  pauseScheduledTask: (id: string) =>
+    request<ScheduledTask>(`/scheduled-tasks/${encodeURIComponent(id)}/pause`, { method: 'POST' }),
+  resumeScheduledTask: (id: string) =>
+    request<ScheduledTask>(`/scheduled-tasks/${encodeURIComponent(id)}/resume`, { method: 'POST' }),
+  runScheduledTaskNow: (id: string) =>
+    request<{ task_id: string; status: string; schedule: ScheduledTask }>(
+      `/scheduled-tasks/${encodeURIComponent(id)}/run-now`,
+      { method: 'POST' },
+    ),
+  deleteScheduledTask: (id: string) =>
+    request<{ deleted: string }>(`/scheduled-tasks/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  scheduledTaskRuns: (id: string, limit = 20) =>
+    request<{ schedule_id: string; runs: ScheduleRun[] }>(
+      `/scheduled-tasks/${encodeURIComponent(id)}/runs?limit=${limit}`,
+    ),
+  previewSchedule: (body: {
+    trigger_type: string
+    interval_minutes?: number | null
+    cron_expression?: string | null
+    run_at?: string | null
+    timezone: string
+    count?: number
+  }) =>
+    request<{ next_runs: string[] }>('/scheduled-tasks/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   // --- Tasks ------------------------------------------------------------
   listTasks: (params?: { status?: string; limit?: number; offset?: number }) => {
