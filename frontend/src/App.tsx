@@ -18,7 +18,6 @@ const WorkerLive = lazy(() => import('@/pages/WorkerLive'))
 const Wallets = lazy(() => import('@/pages/Wallets'))
 const SecuritySettings = lazy(() => import('@/pages/SecuritySettings'))
 const Telegram = lazy(() => import('@/pages/Telegram'))
-const BrowserAutomation = lazy(() => import('@/pages/BrowserAutomation'))
 const BrowserProfiles = lazy(() => import('@/pages/BrowserProfiles'))
 const XIntegration = lazy(() => import('@/pages/XIntegration'))
 const Discord = lazy(() => import('@/pages/Discord'))
@@ -56,7 +55,6 @@ const router = createBrowserRouter([
       { path: 'worker', element: <WorkerLive /> },
       { path: 'goals', element: <Goals /> },
       { path: 'automation', element: <Automation /> },
-      { path: 'browser', element: <BrowserAutomation /> },
       { path: 'browser-profiles', element: <BrowserProfiles /> },
       { path: 'live', element: <LiveBroadcast /> },
       { path: 'live/:integration/:key', element: <LiveSessionPage /> },

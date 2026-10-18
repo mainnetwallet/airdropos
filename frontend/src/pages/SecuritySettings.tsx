@@ -20,7 +20,6 @@ const MORE_ROUTES = new Set([
   '/evidence',
   '/social',
   '/automation',
-  '/browser',
   '/telegram',
   '/improvements',
 ])
