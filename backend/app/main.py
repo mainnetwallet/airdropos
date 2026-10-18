@@ -135,6 +135,24 @@ app.add_middleware(
 )
 
 
+_DEFAULT_CSP = "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+
+# FastAPI's built-in Swagger UI and ReDoc pages load their scripts and styles from
+# cdn.jsdelivr.net and start with an inline script. Under the strict default policy
+# the browser blocks all of that and the page renders blank. Only these two
+# documentation pages get the relaxed policy; every other response keeps the strict one.
+_DOCS_PATHS = frozenset({"/docs", "/redoc"})
+_DOCS_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com data:; "
+    "img-src 'self' data: https://fastapi.tiangolo.com https://cdn.redoc.ly; "
+    "worker-src 'self' blob:; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+)
+
+
 @app.middleware("http")
 async def security_headers_middleware(request: Request, call_next):
     """Attach security headers and measure latency."""
@@ -144,7 +162,7 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
+        _DOCS_CSP if request.url.path in _DOCS_PATHS else _DEFAULT_CSP
     )
     response.headers["X-Process-Time"] = f"{(time.perf_counter() - started) * 1000:.2f}ms"
     return response
